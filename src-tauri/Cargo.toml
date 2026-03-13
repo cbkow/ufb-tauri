@@ -1,6 +1,6 @@
 [package]
 name = "ufb-tauri"
-version = "0.1.2"
+version = "0.1.3"
 description = "Union File Browser - Tauri Edition"
 authors = ["Chris"]
 edition = "2021"

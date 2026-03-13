@@ -114,7 +114,7 @@
 }
 
 .item-row.selected {
-  background: rgba(var(--accent-color-rgb, 60, 130, 220), 0.2);
+  background: var(--bg-selected);
 }
 
 .item-row-track {

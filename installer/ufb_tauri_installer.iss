@@ -5,7 +5,7 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.1.2"
+#define MyAppVersion "0.1.3"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"

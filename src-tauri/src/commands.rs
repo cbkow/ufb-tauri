@@ -6,7 +6,7 @@ use crate::project_config::{FolderTypeConfig, ProjectConfig};
 use crate::settings::AppSettings;
 use crate::subscription::{Subscription, TrackedItemRecord};
 use chrono::Local;
-use tauri::State;
+use tauri::{Emitter, State};
 
 // ── Subscriptions ──
 
@@ -234,19 +234,237 @@ pub fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
     crate::file_ops::rename_path(&old_path, &new_path)
 }
 
-#[tauri::command]
-pub fn delete_to_trash(paths: Vec<String>) -> Result<(), String> {
-    crate::file_ops::delete_to_trash(&paths)
+/// Generate a unique operation ID for progress tracking.
+fn new_op_id(prefix: &str) -> String {
+    format!(
+        "{}_{}",
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    )
+}
+
+/// Run a copy operation on a blocking thread with progress events.
+async fn do_copy_with_progress(
+    app: &tauri::AppHandle,
+    sources: Vec<String>,
+    dest: String,
+) -> Result<(), String> {
+    let op_id = new_op_id("copy");
+    let _ = app.emit(
+        "fileop:started",
+        serde_json::json!({ "id": &op_id, "operation": "copy", "itemsTotal": sources.len() }),
+    );
+
+    let app2 = app.clone();
+    let op_id2 = op_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let dest_path = std::path::Path::new(&dest);
+        let total = sources.len();
+        let mut last_emit = std::time::Instant::now();
+
+        for (i, src) in sources.iter().enumerate() {
+            let src_path = std::path::Path::new(src);
+            let file_name = src_path
+                .file_name()
+                .ok_or_else(|| format!("Invalid source path: {}", src))?;
+            let target = dest_path.join(file_name);
+
+            if src_path.is_dir() {
+                let mut options = fs_extra::dir::CopyOptions::new();
+                options.overwrite = false;
+                options.copy_inside = true;
+                let app3 = app2.clone();
+                let op_id3 = op_id2.clone();
+                fs_extra::dir::copy_with_progress(src_path, &target, &options, |info| {
+                    if last_emit.elapsed().as_millis() >= 100 {
+                        let _ = app3.emit(
+                            "fileop:progress",
+                            serde_json::json!({
+                                "id": &op_id3,
+                                "totalBytes": info.total_bytes,
+                                "copiedBytes": info.copied_bytes,
+                                "currentFile": &info.file_name,
+                                "itemsTotal": total,
+                                "itemsDone": i,
+                            }),
+                        );
+                        last_emit = std::time::Instant::now();
+                    }
+                    fs_extra::dir::TransitProcessResult::ContinueOrAbort
+                })
+                .map_err(|e| format!("Failed to copy dir '{}': {}", src, e))?;
+            } else {
+                let options = fs_extra::file::CopyOptions::new();
+                let app3 = app2.clone();
+                let op_id3 = op_id2.clone();
+                let fname = file_name.to_string_lossy().to_string();
+                fs_extra::file::copy_with_progress(src_path, &target, &options, |info| {
+                    if last_emit.elapsed().as_millis() >= 100 {
+                        let _ = app3.emit(
+                            "fileop:progress",
+                            serde_json::json!({
+                                "id": &op_id3,
+                                "totalBytes": info.total_bytes,
+                                "copiedBytes": info.copied_bytes,
+                                "currentFile": &fname,
+                                "itemsTotal": total,
+                                "itemsDone": i,
+                            }),
+                        );
+                        last_emit = std::time::Instant::now();
+                    }
+                })
+                .map_err(|e| format!("Failed to copy file '{}': {}", src, e))?;
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Copy task failed: {}", e))?;
+
+    match &result {
+        Ok(()) => {
+            let _ = app.emit(
+                "fileop:completed",
+                serde_json::json!({ "id": &op_id }),
+            );
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "fileop:error",
+                serde_json::json!({ "id": &op_id, "error": e }),
+            );
+        }
+    }
+
+    result
+}
+
+/// Run a move operation on a blocking thread with progress events.
+async fn do_move_with_progress(
+    app: &tauri::AppHandle,
+    sources: Vec<String>,
+    dest: String,
+) -> Result<(), String> {
+    let op_id = new_op_id("move");
+    let _ = app.emit(
+        "fileop:started",
+        serde_json::json!({ "id": &op_id, "operation": "move", "itemsTotal": sources.len() }),
+    );
+
+    let app2 = app.clone();
+    let op_id2 = op_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let dest_path = std::path::Path::new(&dest);
+        let total = sources.len();
+        let mut last_emit = std::time::Instant::now();
+
+        for (i, src) in sources.iter().enumerate() {
+            let src_path = std::path::Path::new(src);
+            let file_name = src_path
+                .file_name()
+                .ok_or_else(|| format!("Invalid source path: {}", src))?;
+            let target = dest_path.join(file_name);
+
+            if src_path.is_dir() {
+                let mut options = fs_extra::dir::CopyOptions::new();
+                options.overwrite = false;
+                options.copy_inside = true;
+                let app3 = app2.clone();
+                let op_id3 = op_id2.clone();
+                fs_extra::dir::move_dir_with_progress(src_path, &target, &options, |info| {
+                    if last_emit.elapsed().as_millis() >= 100 {
+                        let _ = app3.emit(
+                            "fileop:progress",
+                            serde_json::json!({
+                                "id": &op_id3,
+                                "totalBytes": info.total_bytes,
+                                "copiedBytes": info.copied_bytes,
+                                "currentFile": &info.file_name,
+                                "itemsTotal": total,
+                                "itemsDone": i,
+                            }),
+                        );
+                        last_emit = std::time::Instant::now();
+                    }
+                    fs_extra::dir::TransitProcessResult::ContinueOrAbort
+                })
+                .map_err(|e| format!("Failed to move dir '{}': {}", src, e))?;
+            } else {
+                let options = fs_extra::file::CopyOptions::new();
+                let app3 = app2.clone();
+                let op_id3 = op_id2.clone();
+                let fname = file_name.to_string_lossy().to_string();
+                fs_extra::file::move_file_with_progress(src_path, &target, &options, |info| {
+                    if last_emit.elapsed().as_millis() >= 100 {
+                        let _ = app3.emit(
+                            "fileop:progress",
+                            serde_json::json!({
+                                "id": &op_id3,
+                                "totalBytes": info.total_bytes,
+                                "copiedBytes": info.copied_bytes,
+                                "currentFile": &fname,
+                                "itemsTotal": total,
+                                "itemsDone": i,
+                            }),
+                        );
+                        last_emit = std::time::Instant::now();
+                    }
+                })
+                .map_err(|e| format!("Failed to move file '{}': {}", src, e))?;
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Move task failed: {}", e))?;
+
+    match &result {
+        Ok(()) => {
+            let _ = app.emit(
+                "fileop:completed",
+                serde_json::json!({ "id": &op_id }),
+            );
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "fileop:error",
+                serde_json::json!({ "id": &op_id, "error": e }),
+            );
+        }
+    }
+
+    result
 }
 
 #[tauri::command]
-pub fn copy_files(sources: Vec<String>, dest: String) -> Result<(), String> {
-    crate::file_ops::copy_files(&sources, &dest)
+pub async fn delete_to_trash(paths: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::file_ops::delete_to_trash(&paths))
+        .await
+        .map_err(|e| format!("Delete task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn move_files(sources: Vec<String>, dest: String) -> Result<(), String> {
-    crate::file_ops::move_files(&sources, &dest)
+pub async fn copy_files(
+    app: tauri::AppHandle,
+    sources: Vec<String>,
+    dest: String,
+) -> Result<(), String> {
+    do_copy_with_progress(&app, sources, dest).await
+}
+
+#[tauri::command]
+pub async fn move_files(
+    app: tauri::AppHandle,
+    sources: Vec<String>,
+    dest: String,
+) -> Result<(), String> {
+    do_move_with_progress(&app, sources, dest).await
 }
 
 #[tauri::command]
@@ -255,10 +473,17 @@ pub fn clipboard_copy_paths(paths: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn clipboard_paste(dest: String) -> Result<Vec<String>, String> {
-    let paths = crate::file_ops::clipboard_paste_paths()?;
+pub async fn clipboard_paste(
+    app: tauri::AppHandle,
+    dest: String,
+) -> Result<Vec<String>, String> {
+    // Read clipboard paths (fast — usually instant)
+    let paths = tokio::task::spawn_blocking(|| crate::file_ops::clipboard_paste_paths())
+        .await
+        .map_err(|e| format!("Clipboard task failed: {}", e))??;
+
     if !paths.is_empty() {
-        crate::file_ops::copy_files(&paths, &dest)?;
+        do_copy_with_progress(&app, paths.clone(), dest).await?;
     }
     Ok(paths)
 }

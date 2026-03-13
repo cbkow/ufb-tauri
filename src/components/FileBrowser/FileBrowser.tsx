@@ -502,6 +502,7 @@ export function FileBrowser(props: FileBrowserProps) {
       ref={containerRef}
       tabIndex={0}
       onClick={closeCtxMenu}
+      onMouseDown={() => containerRef?.focus()}
       data-browser-id={store().id}
     >
       <NavigationBar

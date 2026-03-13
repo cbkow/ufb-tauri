@@ -10,6 +10,7 @@ import { TrackerView } from "./components/TrackerView/TrackerView";
 import { TranscodeQueue } from "./components/TranscodeQueue/TranscodeQueue";
 import { createBrowserStore } from "./stores/fileStore";
 import { FileBrowser } from "./components/FileBrowser/FileBrowser";
+import { FileOpsProgress } from "./components/FileOpsProgress/FileOpsProgress";
 import { SettingsDialog } from "./components/Settings/SettingsDialog";
 import { initDeepLinkListener, setDeepLinkNavigate } from "./lib/deepLink";
 import { listDirectory } from "./lib/tauri";
@@ -80,6 +81,7 @@ export default function App() {
 
   return (
     <Show when={ready()} fallback={<div class="loading">Loading...</div>}>
+      <div class="app-root">
       <Splitter
         direction="horizontal"
         initialSize={220}
@@ -170,6 +172,8 @@ export default function App() {
           </div>
         }
       />
+      <FileOpsProgress />
+      </div>
 
       <Show when={showSettings()}>
         <SettingsDialog onClose={() => setShowSettings(false)} />

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"tauri-plugin-drag\" /c/Users/Chris/Documents/GitHub/ufb-tauri/src* --include=\"*.ts\" --include=\"*.tsx\" --include=\"*.rs\" 2>/dev/null | head -20)",
+      "Bash(cd C:/Users/Chris/Documents/GitHub/ufb-tauri/src-tauri && cargo check 2>&1)",
+      "Bash(cd C:/Users/Chris/Documents/GitHub/ufb-tauri && npx tsc --noEmit 2>&1 | head -30)"
+    ]
+  }
+}
