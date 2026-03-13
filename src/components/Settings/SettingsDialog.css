@@ -1,0 +1,433 @@
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.settings-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: 700px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.settings-close {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-close:hover {
+  color: var(--text-primary);
+}
+
+.settings-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.settings-nav {
+  width: 160px;
+  border-right: 1px solid var(--border-color);
+  padding: var(--spacing-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-item {
+  text-align: left;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.settings-nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.settings-nav-item.active {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.settings-content {
+  flex: 1;
+  padding: var(--spacing-lg);
+  overflow-y: auto;
+}
+
+.settings-section h3 {
+  font-size: 14px;
+  margin-bottom: var(--spacing-md);
+  color: var(--text-primary);
+}
+
+.settings-section h3:not(:first-child) {
+  margin-top: var(--spacing-xl);
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0 0 var(--spacing-md) 0;
+}
+
+.accent-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+}
+
+.accent-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+}
+
+.accent-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.accent-swatch.active {
+  border-color: white;
+  box-shadow: 0 0 0 1px var(--bg-primary);
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  margin-bottom: var(--spacing-md);
+}
+
+.settings-field > span,
+.settings-field-header span:first-child {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.settings-field input {
+  width: 100%;
+  min-height: 28px;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  box-sizing: border-box;
+}
+
+.settings-field input:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+/* ── Field header with help icon ── */
+.settings-field-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.settings-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--bg-tertiary);
+  color: var(--text-disabled);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: help;
+  flex-shrink: 0;
+  border: 1px solid var(--border-color);
+}
+
+.settings-help:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+/* ── Field row (input + button side by side) ── */
+.settings-field-row {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+.settings-field-row input {
+  flex: 1;
+}
+
+/* ── Toggle row ── */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+}
+
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.settings-toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent-color);
+  cursor: pointer;
+}
+
+.settings-warning {
+  font-size: 12px;
+  color: var(--warning);
+}
+
+/* ── Settings button ── */
+.settings-btn {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.settings-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.settings-btn-primary {
+  background: var(--accent-color, #3c82dc);
+  border-color: var(--accent-color, #3c82dc);
+  color: #fff;
+}
+
+.settings-btn-primary:hover:not(:disabled) {
+  opacity: 0.85;
+  background: var(--accent-color, #3c82dc);
+}
+
+.settings-restart-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-xl);
+  padding-top: var(--spacing-md);
+  border-top: 1px solid var(--border-color);
+}
+
+.settings-btn:disabled {
+  color: var(--text-disabled);
+  cursor: not-allowed;
+}
+
+/* ── Mesh status panel ── */
+.mesh-status-panel {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.mesh-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  font-size: 12px;
+}
+
+.mesh-status-label {
+  width: 100px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.mesh-status-msg {
+  color: var(--text-disabled);
+  font-style: italic;
+}
+
+.mesh-pending {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.mesh-status-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-sm);
+  padding-top: var(--spacing-sm);
+  border-top: 1px solid var(--border-color);
+}
+
+.settings-hint-inline {
+  font-size: 11px;
+  color: var(--text-disabled);
+}
+
+/* ── Setup hint ── */
+.mesh-setup-hint {
+  margin-top: var(--spacing-md);
+  padding: var(--spacing-md);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.mesh-hint-warn {
+  font-size: 12px;
+  color: var(--warning);
+  margin-bottom: var(--spacing-xs);
+}
+
+.mesh-hint-info {
+  font-size: 12px;
+  color: var(--text-disabled);
+}
+
+/* ── Path Mappings Table ── */
+.path-mappings-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.path-mappings-header {
+  display: flex;
+  gap: 1px;
+  background: var(--border-color);
+}
+
+.path-mappings-header .pm-cell {
+  background: var(--bg-tertiary);
+}
+
+.path-mappings-row {
+  display: flex;
+  gap: 1px;
+  background: var(--border-color);
+  border-top: 1px solid var(--border-color);
+}
+
+.pm-cell {
+  flex: 1;
+  min-width: 0;
+}
+
+.pm-header {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pm-input {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: none;
+  border-radius: 0;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  outline: none;
+  min-height: 28px;
+  box-sizing: border-box;
+}
+
+.pm-input:focus {
+  background: var(--bg-secondary);
+  outline: 1px solid var(--border-focus);
+  outline-offset: -1px;
+}
+
+.pm-actions-cell {
+  width: 28px;
+  flex-shrink: 0;
+  background: var(--bg-tertiary);
+}
+
+.pm-delete-btn {
+  width: 28px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-primary);
+  border: none;
+  border-radius: 0;
+  color: var(--text-disabled);
+  cursor: pointer;
+  padding: 0;
+}
+
+.pm-delete-btn .icon {
+  font-size: 16px;
+}
+
+.pm-delete-btn:hover {
+  color: var(--error);
+  background: var(--bg-hover);
+}
+
+.path-mappings-example code {
+  background: var(--bg-tertiary);
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}

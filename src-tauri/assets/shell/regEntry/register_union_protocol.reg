@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CLASSES_ROOT\union]
+@="URL:Union Protocol"
+"URL Protocol"=""
+
+[HKEY_CLASSES_ROOT\union\shell]
+
+[HKEY_CLASSES_ROOT\union\shell\open]
+
+[HKEY_CLASSES_ROOT\union\shell\open\command]
+@="\"C:\\Windows\\System32\\wscript.exe\" \"C:\\Program Files\\ufb\\assets\\shell\\open_union_link.vbs\" \"%1\""

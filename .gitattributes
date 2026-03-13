@@ -1,0 +1,3 @@
+src-tauri/external/ffmpeg/**/*.dll filter=lfs diff=lfs merge=lfs -text
+src-tauri/binaries/*.dll filter=lfs diff=lfs merge=lfs -text
+src-tauri/binaries/*.exe filter=lfs diff=lfs merge=lfs -text

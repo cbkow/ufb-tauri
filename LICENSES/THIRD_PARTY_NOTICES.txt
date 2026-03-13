@@ -1,0 +1,46 @@
+THIRD PARTY NOTICES
+===================
+
+This software incorporates material from third parties. The applicable license
+terms are listed below, and the full license texts can be found in the
+individual LICENSE files in this directory.
+
+===============================================================================
+
+1. Tauri
+   Copyright (c) 2019-2025 Tauri Programme within The Commons Conservancy
+   License: MIT / Apache 2.0
+   https://github.com/tauri-apps/tauri
+
+2. SolidJS
+   Copyright (c) 2016-2025 Ryan Carniato
+   License: MIT
+   https://github.com/solidjs/solid
+
+3. FFmpeg
+   Copyright (c) 2000-2025 FFmpeg developers
+   License: LGPL 2.1+ (with GPL components)
+   File: FFmpeg-LICENSE.txt
+
+4. SQLite
+   Public Domain
+   File: SQLite-LICENSE.txt
+
+5. Material Symbols
+   Copyright (c) Google LLC
+   License: Apache 2.0
+   File: MaterialSymbols-LICENSE.txt
+
+6. ExifTool
+   Copyright (c) 2003-2025 Phil Harvey
+   License: Perl Artistic License / GPL
+   File: ExifTool-LICENSE.txt
+
+7. OpenEXR (exr crate - pure Rust implementation)
+   License: BSD-3-Clause
+   File: OpenEXR-LICENSE.txt
+
+===============================================================================
+
+All Rust dependencies are managed via Cargo and subject to their respective
+licenses. Run `cargo license` in the src-tauri directory for a complete list.

@@ -1,0 +1,196 @@
+.tracker-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ── Header ── */
+.tracker-view-header {
+  display: flex;
+  align-items: center;
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  gap: var(--spacing-sm);
+}
+
+.tracker-view-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.tracker-view-count {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tracker-view-filter-btn,
+.tracker-view-refresh-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+}
+
+.tracker-view-filter-btn:hover,
+.tracker-view-refresh-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tracker-view-filter-btn.active {
+  background: var(--accent-color);
+  color: white;
+}
+
+/* ── Filter bar ── */
+.tracker-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  align-items: center;
+}
+
+.tracker-filter-group {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.tracker-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-right: 2px;
+}
+
+.tracker-filter-check {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.tracker-filter-check input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.tracker-filter-select {
+  font-size: 12px;
+  padding: 1px 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
+/* ── Column headers ── */
+.tracker-columns {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+  min-width: fit-content;
+}
+
+.tracker-col-header {
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.tracker-col-header:hover {
+  color: var(--text-primary);
+}
+
+.tracker-col-header.col-type { width: 70px; min-width: 70px; }
+.tracker-col-header.col-project { width: 120px; min-width: 80px; }
+.tracker-col-header.col-name { flex: 1; min-width: 120px; }
+.tracker-col-header.col-meta { flex-shrink: 0; }
+.tracker-col-header.col-modified { width: 80px; min-width: 80px; }
+
+.col-resize-handle {
+  width: 4px;
+  cursor: col-resize;
+  flex-shrink: 0;
+}
+
+.col-resize-handle:hover {
+  background: var(--accent-color);
+}
+
+/* ── Rows ── */
+.tracker-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+}
+
+.tracker-row {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  border-bottom: 1px solid var(--border-color);
+  min-width: fit-content;
+}
+
+.tracker-row:hover {
+  background: var(--bg-hover);
+  cursor: pointer;
+}
+
+.tracker-row-type { width: 70px; min-width: 70px; padding: 0 8px; flex-shrink: 0; }
+.tracker-row-project { width: 120px; min-width: 80px; padding: 0 8px; font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+.tracker-row-name { flex: 1; min-width: 120px; padding: 0 8px; font-size: 13px; }
+.tracker-row-meta { flex-shrink: 0; padding: 0 4px; font-size: 12px; overflow: hidden; }
+.tracker-row-modified { width: 80px; min-width: 80px; padding: 0 8px; font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+
+/* ── Type badge ── */
+.tracker-type-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  color: white;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Sort arrow ── */
+.sort-arrow {
+  font-size: 9px;
+  margin-left: 2px;
+}
+
+/* ── Loading / Empty ── */
+.tracker-view-loading,
+.tracker-view-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-xl);
+  color: var(--text-disabled);
+  font-style: italic;
+}

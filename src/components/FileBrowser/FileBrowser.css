@@ -1,0 +1,609 @@
+.file-browser {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  outline: none;
+}
+
+.file-browser-content {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+}
+
+.file-browser-statusbar {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-lg);
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  min-height: 24px;
+}
+
+/* ── Navigation bar wrapper (two rows) ── */
+.nav-bar-wrapper {
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  flex-shrink: 0;
+}
+
+/* Row 1: buttons + breadcrumb + view toggle */
+.nav-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  min-height: 38px;
+}
+
+/* Row 2: search + grid slider */
+.nav-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: 0 var(--spacing-md) var(--spacing-sm);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.nav-btn {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-size: 15px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  border-radius: var(--radius-md);
+}
+
+.nav-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.nav-btn.muted {
+  color: var(--text-disabled);
+}
+
+.nav-btn.muted:hover {
+  color: var(--text-primary);
+}
+
+.nav-btn:disabled {
+  color: var(--text-disabled);
+}
+
+/* ── Breadcrumb (clickable segments) ── */
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  overflow: hidden;
+  gap: 1px;
+  min-height: 30px;
+  padding: 0 var(--spacing-md);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--border-color);
+  cursor: text;
+}
+
+/* Inner wrapper scrolls to keep the rightmost (deepest) segment visible */
+.breadcrumb-scroll {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  overflow-x: auto;
+  flex: 1;
+  white-space: nowrap;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.breadcrumb-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.breadcrumb:hover {
+  border-color: var(--text-disabled);
+}
+
+.breadcrumb-segment {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.breadcrumb-segment:hover {
+  background: var(--bg-hover);
+}
+
+.breadcrumb-separator {
+  color: var(--text-disabled);
+  display: flex;
+  align-items: center;
+}
+
+.breadcrumb-separator .icon {
+  font-size: 18px;
+}
+
+/* ── Editable path input (replaces breadcrumb on double-click) ── */
+.path-input {
+  flex: 1;
+  height: 30px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-md);
+  padding: 0 var(--spacing-md);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+/* ── Search input ── */
+.search-input {
+  flex: 1;
+  height: 30px;
+  border-radius: var(--radius-md);
+  padding: 0 var(--spacing-md);
+  background: var(--border-color);
+  border: 1px solid var(--border-color);
+}
+
+.search-input:hover {
+  border-color: var(--text-disabled);
+}
+
+.search-input:focus {
+  background: var(--bg-primary);
+  border-color: var(--border-focus);
+}
+
+/* ── View toggle ── */
+.view-toggle {
+  display: flex;
+  gap: 2px;
+}
+
+.view-toggle .nav-btn.active {
+  background: var(--bg-hover);
+  color: var(--accent-color);
+}
+
+/* ── Sort control (grid mode) ── */
+.sort-control {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+
+.sort-control .nav-btn.active {
+  background: var(--bg-hover);
+  color: var(--accent-color);
+}
+
+/* ── Grid size slider ── */
+.grid-size-control {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-shrink: 0;
+}
+
+.grid-size-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.grid-size-slider {
+  width: 100px;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--bg-hover);
+  border: none;
+  border-radius: 2px;
+  outline: none;
+  padding: 0;
+  margin: 0;
+}
+
+.grid-size-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--bg-hover);
+  border-radius: 2px;
+}
+
+.grid-size-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent-color);
+  cursor: pointer;
+  margin-top: -4px;
+}
+
+.grid-size-slider::-webkit-slider-thumb:hover {
+  background: var(--accent-hover);
+}
+
+/* ── File list view ── */
+.file-list {
+  width: 100%;
+}
+
+.file-list-header {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.file-list-header-cell {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  user-select: none;
+}
+
+.file-list-header-cell:hover {
+  background: var(--bg-hover);
+}
+
+.col-icon { width: 28px; flex-shrink: 0; }
+.col-name { flex: 1; min-width: 200px; }
+.col-size { width: 100px; text-align: right; }
+.col-modified { width: 160px; }
+.col-ext { width: 80px; }
+
+.sort-arrow {
+  font-size: 10px;
+  color: var(--accent-color);
+}
+
+/* ── Column resize handles ── */
+.col-resize-handle {
+  width: 6px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  align-self: stretch;
+}
+.col-resize-handle:hover,
+.col-resize-handle:active {
+  background: var(--accent-color);
+  opacity: 0.4;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  min-height: 26px;
+  cursor: default;
+}
+
+.file-row:hover {
+  background: var(--bg-hover);
+}
+
+.file-row.selected {
+  background: var(--bg-selected);
+}
+
+.file-cell {
+  padding: 0 var(--spacing-md);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-icon {
+  font-size: 14px;
+  text-align: center;
+}
+
+.file-name {
+  flex: 1;
+  min-width: 200px;
+}
+
+.file-size {
+  width: 100px;
+  text-align: right;
+  color: var(--text-secondary);
+}
+
+.file-modified {
+  width: 160px;
+  color: var(--text-secondary);
+}
+
+.file-ext {
+  width: 80px;
+  color: var(--text-secondary);
+}
+
+/* ── File grid view ── */
+.file-grid {
+  display: grid;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+}
+
+.grid-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: var(--spacing-md);
+  border-radius: var(--radius-md);
+  cursor: default;
+  gap: var(--spacing-sm);
+}
+
+.grid-item:hover {
+  background: var(--bg-hover);
+}
+
+.grid-item.selected {
+  background: var(--bg-selected);
+}
+
+.grid-thumbnail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+}
+
+.grid-thumbnail img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.grid-name {
+  font-size: 12px;
+  text-align: center;
+  word-break: break-word;
+  max-height: 2.4em;
+  overflow: hidden;
+  line-height: 1.2;
+}
+
+/* ── Rubber-band selection ── */
+.rubber-band {
+  position: absolute;
+  border: 1px solid var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 15%, transparent);
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* ── Drag overlay (shared by DualBrowserView and FolderTabView) ── */
+.drag-overlay {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  padding: 4px 10px;
+  background: var(--accent-color);
+  color: #fff;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Drag-and-drop ── */
+.file-browser-content.drop-zone-active {
+  outline: 2px dashed var(--accent-color);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent-color) 5%, transparent);
+}
+
+.file-row.drop-target {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent-color) 15%, transparent) !important;
+}
+
+.grid-item.drop-target {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent-color) 15%, transparent) !important;
+  border-radius: var(--radius-md);
+}
+
+/* ── Synced column (project folder mode) ── */
+.col-synced {
+  width: 60px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.synced-cell {
+  width: 60px;
+  text-align: center;
+}
+
+.synced-check {
+  color: var(--accent-color);
+  font-weight: bold;
+  font-size: 14px;
+}
+
+/* ── Grid synced badge (overlay on thumbnail) ── */
+.grid-thumbnail {
+  position: relative;
+}
+
+.grid-synced-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-color);
+  color: #fff;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: bold;
+  line-height: 1;
+}
+
+/* ── Toolbar action buttons ── */
+.toolbar-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.toolbar-btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar-btn .icon {
+  font-size: 16px;
+}
+
+.toolbar-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Browser context menu ── */
+.browser-ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-xs) 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.ctx-item {
+  padding: var(--spacing-xs) var(--spacing-xl);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-primary);
+}
+
+.ctx-item:hover {
+  background: var(--bg-hover);
+}
+
+.ctx-danger {
+  color: var(--error);
+}
+
+.ctx-accent {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.ctx-subscribed {
+  color: var(--success);
+  cursor: default;
+}
+
+.ctx-sep {
+  height: 1px;
+  background: var(--border-color);
+  margin: var(--spacing-xs) 0;
+}
+
+/* ── Browser modals (rename, new folder) ── */
+.browser-modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: 360px;
+  max-width: 90vw;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.browser-modal-title {
+  padding: var(--spacing-lg) var(--spacing-xl);
+  font-size: 14px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.browser-modal-body {
+  padding: var(--spacing-lg) var(--spacing-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+}
+
+.browser-modal-hint {
+  font-size: 11px;
+  color: var(--text-disabled);
+  font-family: var(--font-mono);
+}
+
+.browser-modal-input {
+  width: 100%;
+  height: 28px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--spacing-sm);
+  font-size: 13px;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.browser-modal-input:focus {
+  border-color: var(--border-focus);
+}
+
+.browser-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md) var(--spacing-xl);
+  border-top: 1px solid var(--border-color);
+}

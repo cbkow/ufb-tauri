@@ -1,0 +1,123 @@
+[package]
+name = "ufb-tauri"
+version = "0.1.2"
+description = "Union File Browser - Tauri Edition"
+authors = ["Chris"]
+edition = "2021"
+
+[lib]
+name = "ufb_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server (mesh sync)
+axum = "0.7"
+
+# File operations
+trash = "5"
+fs_extra = "1.3"
+
+# Clipboard
+arboard = "3"
+
+# Open files/URLs with default app
+opener = { version = "0.7", features = ["reveal"] }
+
+# UUID for device IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Cross-platform directories
+dirs = "5"
+
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# URL encoding
+urlencoding = "2"
+
+# Base64
+base64 = "0.22"
+
+# Chrono for timestamps
+chrono = "0.4"
+
+# Shared state
+once_cell = "1"
+
+# Async channel
+flume = "0.11"
+
+# Glob patterns
+glob = "0.3"
+
+# Path normalization
+dunce = "1"
+
+# Thumbnail generation
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff", "webp", "ico", "avif"] }
+
+# SVG rendering (cross-platform)
+resvg = "0.44"
+
+# PSD/PSB parsing (cross-platform)
+psd = "0.3"
+
+# OpenEXR reading (pure Rust)
+exr = "1.74"
+
+# PDF rendering (for PDF + AI thumbnails)
+pdfium-render = "0.8"
+
+# Hostname detection
+hostname = "0.4"
+
+# Mesh sync: multicast socket construction
+socket2 = { version = "0.5", features = ["all"] }
+
+# Mesh sync: HTTP client for peer polling
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Native file dialogs
+rfd = "0.15"
+
+# Drag plugin (for now, may replace with custom OLE)
+tauri-plugin-drag = "2.1.0"
+
+# Windows APIs (OLE drag-drop)
+[target.'cfg(windows)'.dependencies]
+# Windows clipboard (CF_HDROP for Explorer paste)
+clipboard-win = "5"
+windows = { version = "0.58", features = [
+  "implement",
+  "Win32_System_Ole",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Memory",
+  "Win32_Foundation",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_SystemServices",
+] }
+windows-core = "0.58"

@@ -1,0 +1,134 @@
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  font-size: 16px;
+}
+
+.app-layout {
+  height: 100%;
+  width: 100%;
+}
+
+.main-content {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* ── Tab bar ── */
+.tab-bar {
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-secondary);
+  height: 36px;
+  min-height: 36px;
+  flex-shrink: 0;
+  user-select: none;
+  padding: 0 4px;
+  gap: 2px;
+}
+
+.tab-bar-tabs {
+  display: flex;
+  align-items: flex-end;
+  overflow-x: auto;
+  flex: 1;
+  gap: 2px;
+}
+
+.tab-bar-tabs::-webkit-scrollbar {
+  height: 0;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  min-width: 0;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: var(--bg-secondary);
+  transition: background 0.1s;
+}
+
+.tab-item:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.tab-item.active {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.tab-icon {
+  font-size: 16px;
+  color: var(--text-secondary);
+}
+
+.tab-item.active .tab-icon {
+  color: var(--text-primary);
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+.tab-close {
+  font-size: 10px;
+  color: var(--text-disabled);
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  line-height: 1;
+}
+
+.tab-close:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.tab-settings-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.tab-settings-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Tab content ── */
+.tab-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.tab-panel {
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+}

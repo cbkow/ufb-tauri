@@ -1,0 +1,90 @@
+.splitter-container {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.splitter-h {
+  flex-direction: row;
+}
+
+.splitter-v {
+  flex-direction: column;
+}
+
+.splitter-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+}
+
+.splitter-first {
+  flex-shrink: 0;
+}
+
+.splitter-second {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The grabbable divider */
+.splitter-handle {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-secondary);
+  position: relative;
+  z-index: 2;
+}
+
+.splitter-handle-h {
+  width: 5px;
+  cursor: col-resize;
+}
+
+.splitter-handle-v {
+  height: 5px;
+  cursor: row-resize;
+}
+
+.splitter-handle-line {
+  background: var(--border-color);
+  border-radius: 1px;
+}
+
+.splitter-handle-h .splitter-handle-line {
+  width: 1px;
+  height: 32px;
+}
+
+.splitter-handle-v .splitter-handle-line {
+  height: 1px;
+  width: 32px;
+}
+
+.splitter-handle:hover .splitter-handle-line,
+.splitter-handle-active .splitter-handle-line {
+  background: var(--accent-color);
+}
+
+.splitter-handle:hover,
+.splitter-handle-active {
+  background: var(--bg-tertiary);
+}
+
+.splitter-handle-h:hover .splitter-handle-line,
+.splitter-handle-h.splitter-handle-active .splitter-handle-line {
+  width: 2px;
+  height: 48px;
+}
+
+.splitter-handle-v:hover .splitter-handle-line,
+.splitter-handle-v.splitter-handle-active .splitter-handle-line {
+  height: 2px;
+  width: 48px;
+}

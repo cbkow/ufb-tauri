@@ -1,0 +1,107 @@
+.console-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.console-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+}
+
+.console-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.console-filter {
+  width: 120px;
+  height: 24px;
+  font-size: 12px;
+}
+
+.console-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.console-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.console-btn.active {
+  color: var(--accent-color);
+}
+
+.console-content {
+  flex: 1;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.console-line {
+  display: flex;
+  gap: var(--spacing-sm);
+  padding: 1px var(--spacing-md);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.console-line:hover {
+  background: var(--bg-hover);
+}
+
+.console-time {
+  color: var(--text-disabled);
+  flex-shrink: 0;
+}
+
+.console-level {
+  width: 40px;
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.level-info .console-level { color: var(--info); }
+.level-warn .console-level { color: var(--warning); }
+.level-error .console-level { color: var(--error); }
+.level-error { background: rgba(224, 108, 117, 0.05); }
+.level-warn { background: rgba(229, 192, 123, 0.03); }
+
+.console-source {
+  color: var(--text-disabled);
+  flex-shrink: 0;
+}
+
+.console-message {
+  flex: 1;
+  word-break: break-all;
+}
+
+.console-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-xl);
+  color: var(--text-disabled);
+  font-style: italic;
+  font-family: var(--font-family);
+}

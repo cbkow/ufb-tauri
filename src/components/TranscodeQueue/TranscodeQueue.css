@@ -1,0 +1,151 @@
+.transcode-queue {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.transcode-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+}
+
+.transcode-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.transcode-count {
+  font-weight: normal;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.transcode-clear-btn {
+  background: none;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  padding: 2px var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  cursor: pointer;
+}
+.transcode-clear-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.transcode-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-sm);
+}
+
+.transcode-job {
+  padding: var(--spacing-md);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--spacing-sm);
+}
+
+.transcode-job-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+}
+
+.transcode-job-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-shrink: 0;
+}
+
+.transcode-filename {
+  font-size: 13px;
+  flex: 1;
+}
+
+.transcode-status {
+  font-size: 11px;
+  padding: 1px var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.status-queued { color: var(--text-secondary); }
+.status-processing { color: var(--info); }
+.status-copyingMetadata { color: var(--info); }
+.status-completed { color: var(--success); }
+.status-failed { color: var(--error); }
+.status-cancelled { color: var(--text-disabled); }
+
+.transcode-cancel-btn,
+.transcode-remove-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-sm);
+}
+.transcode-cancel-btn { color: var(--error); opacity: 0.7; }
+.transcode-cancel-btn:hover { opacity: 1; background: rgba(255, 80, 80, 0.1); }
+.transcode-remove-btn { color: var(--text-secondary); }
+.transcode-remove-btn:hover { color: var(--text-primary); }
+.transcode-cancel-btn .icon,
+.transcode-remove-btn .icon { font-size: 18px; }
+
+.transcode-progress-bar {
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: 2px;
+  margin-top: var(--spacing-sm);
+  overflow: hidden;
+}
+
+.transcode-progress-fill {
+  height: 100%;
+  background: var(--accent-color);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.transcode-progress-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: var(--spacing-xs);
+  display: block;
+}
+
+.transcode-error {
+  font-size: 11px;
+  color: var(--error);
+  margin-top: var(--spacing-xs);
+}
+
+.transcode-output {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: var(--spacing-xs);
+}
+
+.transcode-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-xl);
+  color: var(--text-disabled);
+  font-style: italic;
+  text-align: center;
+}

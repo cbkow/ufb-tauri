@@ -1,0 +1,192 @@
+pub mod app_state;
+pub mod backup;
+pub mod drag_out;
+pub mod bookmarks;
+pub mod columns;
+pub mod commands;
+pub mod db;
+pub mod file_ops;
+pub mod http_server;
+pub mod mesh_sync;
+pub mod metadata;
+pub mod peer_manager;
+pub mod project_config;
+pub mod search;
+pub mod settings;
+pub mod subscription;
+pub mod thumbnails;
+pub mod udp_notify;
+pub mod transcode;
+pub mod utils;
+
+use app_state::AppState;
+use settings::AppSettings;
+use tauri::Emitter;
+use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Initialize app state
+    let state = AppState::initialize().expect("Failed to initialize app state");
+
+    // Load settings and init mesh sync (sync part — creates manager)
+    // init_mesh_sync auto-populates nodeId/port and saves back to disk
+    let mut settings = AppSettings::load();
+    state.init_mesh_sync(&mut settings);
+
+    // Clone settings for async startup
+    let settings_for_startup = settings.clone();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // argv[1] is the deep-link URI from the OS
+            if let Some(uri) = argv.get(1) {
+                if uri.starts_with("ufb://") {
+                    let _ = app.emit("deep-link-uri", uri.clone());
+                }
+            }
+            // Focus existing window
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_drag::init())
+        .manage(state)
+        .setup(move |app| {
+            // Deep-link listener for URIs arriving while app is running
+            let handle_dl = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                if let Some(url) = event.urls().first() {
+                    let uri = url.to_string();
+                    if uri.starts_with("ufb://") {
+                        let _ = handle_dl.emit("deep-link-uri", uri);
+                    }
+                }
+            });
+
+            // Cold-start: app launched directly via ufb:// link (first instance)
+            if let Some(uri) = std::env::args().nth(1) {
+                if uri.starts_with("ufb://") {
+                    // Store in AppState so frontend can fetch it on mount
+                    let state: tauri::State<'_, AppState> = app.state();
+                    *state.pending_deep_link.lock().unwrap() = Some(uri.clone());
+
+                    // Also emit after a short delay for the event listener
+                    let handle_cs = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let _ = handle_cs.emit("deep-link-uri", uri);
+                    });
+                }
+            }
+
+            // Enable mesh sync after the async runtime is available
+            let app_handle = app.handle().clone();
+            let settings = settings_for_startup;
+            tauri::async_runtime::spawn(async move {
+                let state: tauri::State<'_, AppState> = app_handle.state();
+                state.set_mesh_app_handle(app_handle.clone()).await;
+                state.enable_mesh_sync_if_configured(&settings).await;
+                state.set_transcode_app_handle(app_handle.clone()).await;
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            // Subscriptions
+            commands::subscribe_to_job,
+            commands::unsubscribe_from_job,
+            commands::get_subscriptions,
+            // Metadata
+            commands::get_item_metadata,
+            commands::upsert_item_metadata,
+            commands::get_tracked_items,
+            commands::get_all_tracked_items,
+            commands::get_folder_metadata,
+            commands::flush_metadata_writes,
+            // Columns
+            commands::get_column_defs,
+            commands::add_column,
+            commands::update_column,
+            commands::delete_column,
+            // Column Presets
+            commands::get_column_presets,
+            commands::save_column_preset,
+            commands::delete_column_preset,
+            commands::add_preset_column,
+            // Bookmarks
+            commands::get_bookmarks,
+            commands::add_bookmark,
+            commands::remove_bookmark,
+            // File operations
+            commands::list_directory,
+            commands::create_directory,
+            commands::rename_path,
+            commands::delete_to_trash,
+            commands::copy_files,
+            commands::move_files,
+            commands::clipboard_copy_paths,
+            commands::clipboard_paste,
+            commands::reveal_in_file_manager,
+            commands::open_file,
+            // Search
+            commands::search_files,
+            // Config
+            commands::load_project_config,
+            commands::get_folder_type_config,
+            commands::load_settings,
+            commands::save_settings,
+            // Mesh sync
+            commands::get_mesh_status,
+            commands::set_mesh_enabled,
+            commands::trigger_flush_edits,
+            commands::trigger_snapshot,
+            commands::get_mesh_peers,
+            // URI / Links
+            commands::build_ufb_uri,
+            commands::build_union_uri,
+            commands::resolve_ufb_uri,
+            // Special paths
+            commands::get_special_paths,
+            commands::get_drives,
+            // Dialogs
+            commands::pick_folder,
+            // Drag
+            commands::start_native_drag,
+            // Backup
+            commands::list_backups,
+            commands::restore_backup,
+            // Thumbnails
+            commands::get_thumbnail,
+            // Item creation
+            commands::get_folder_add_mode,
+            commands::detect_folder_layout_mode,
+            commands::create_item_from_template,
+            commands::create_date_prefixed_item,
+            commands::create_job_from_template,
+            // Transcode
+            commands::transcode_add_jobs,
+            commands::transcode_get_queue,
+            commands::transcode_cancel_job,
+            commands::transcode_remove_job,
+            commands::transcode_clear_completed,
+            // App lifecycle
+            commands::relaunch_app,
+            // Deep link
+            commands::get_pending_deep_link,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Graceful mesh sync shutdown
+                let state: tauri::State<'_, AppState> = app_handle.state();
+                tauri::async_runtime::block_on(async {
+                    state.shutdown_mesh_sync().await;
+                });
+            }
+        });
+}

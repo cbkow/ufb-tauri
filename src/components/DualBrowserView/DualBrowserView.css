@@ -1,0 +1,14 @@
+.dual-browser-view {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+.browser-pair-single {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}

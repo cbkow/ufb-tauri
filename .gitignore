@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Rust / Cargo
+src-tauri/target/
+
+# Tauri generated schemas
+src-tauri/gen/
+
+# Inno Setup output
+installer/*.exe
+
+# Sidecar binaries (copied by build.rs, not checked in)
+src-tauri/binaries/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+log.txt
+
+# NPM debug
+npm-debug.log*
