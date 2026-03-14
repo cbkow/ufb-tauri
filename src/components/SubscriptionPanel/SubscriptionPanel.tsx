@@ -1,6 +1,7 @@
 import { createSignal, createMemo, onMount, For, Show } from "solid-js";
 import { subscriptionStore } from "../../stores/subscriptionStore";
 import { workspaceStore } from "../../stores/workspaceStore";
+import { mountStore } from "../../stores/mountStore";
 import { buildUfbUri, buildUnionUri, revealInFileManager, pickFolder, getSpecialPaths, getDrives } from "../../lib/tauri";
 import type { Subscription } from "../../lib/types";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
@@ -31,6 +32,12 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
     x: number;
     y: number;
     sub: Subscription;
+  } | null>(null);
+
+  const [mountCtxMenu, setMountCtxMenu] = createSignal<{
+    x: number;
+    y: number;
+    mountId: string;
   } | null>(null);
 
   // ── Confirm Delete (bookmarks) ──
@@ -204,10 +211,49 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
     setConfirmUnsub(null);
   }
 
+  // ── Mount context menu handlers ──
+
+  function onMountContextMenu(e: MouseEvent, mountId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu(null);
+    setSubCtxMenu(null);
+    setMountCtxMenu({ x: e.clientX, y: e.clientY, mountId });
+  }
+
+  function closeMountCtxMenu() {
+    setMountCtxMenu(null);
+  }
+
+  function mountCtxRestart() {
+    const menu = mountCtxMenu();
+    if (menu) mountStore.restart(menu.mountId);
+    closeMountCtxMenu();
+  }
+
+  function mountCtxFlushRestart() {
+    const menu = mountCtxMenu();
+    if (menu) mountStore.flushAndRestart(menu.mountId);
+    closeMountCtxMenu();
+  }
+
+  function mountCtxSwitchSmb() {
+    const menu = mountCtxMenu();
+    if (menu) mountStore.switchToSmb(menu.mountId);
+    closeMountCtxMenu();
+  }
+
+  function mountCtxForceRclone() {
+    const menu = mountCtxMenu();
+    if (menu) mountStore.forceRclone(menu.mountId);
+    closeMountCtxMenu();
+  }
+
   // Close any open context menu when clicking anywhere
   function onPanelClick() {
     if (ctxMenu()) closeCtxMenu();
     if (subCtxMenu()) closeSubCtxMenu();
+    if (mountCtxMenu()) closeMountCtxMenu();
   }
 
   return (
@@ -241,6 +287,61 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
           <button class="section-add-btn" onClick={openAddModal} title="Add bookmark"><span class="icon">add</span></button>
         </div>
         <div class="section-content">
+          {/* Mount junction paths as dynamic bookmarks with live state */}
+          <Show when={mountStore.configs.length > 0 && !mountStore.connected}>
+            <For each={mountStore.configs}>
+              {(cfg) => (
+                <div
+                  class="panel-item mount-item-disconnected"
+                  onClick={() => mountStore.launchAgent()}
+                  title="Agent not running — click to launch"
+                >
+                  <span class="item-icon"><span class="icon">cloud_off</span></span>
+                  <span class="item-label truncate">{cfg.displayName}</span>
+                  <span class="item-tag">Launch</span>
+                </div>
+              )}
+            </For>
+          </Show>
+          <Show when={mountStore.connected}>
+            <For each={mountStore.configs}>
+              {(cfg) => {
+                const ms = () => mountStore.states[cfg.id];
+                const stateClass = () => {
+                  const s = ms()?.state;
+                  if (!s || s === "rclone_healthy") return "mount-healthy";
+                  if (s === "rclone_starting" || s === "initializing" || s === "recovering_to_rclone" || s === "smb_recovering") return "mount-starting";
+                  if (s === "rclone_degraded") return "mount-warn";
+                  if (s === "smb_active" || s === "falling_back_to_smb") return "mount-fallback";
+                  return "mount-error";
+                };
+                const stateLabel = () => {
+                  const s = ms()?.state;
+                  if (!s || s === "rclone_healthy") return "Healthy";
+                  if (s === "rclone_starting" || s === "initializing") return "Starting";
+                  if (s === "rclone_degraded") return "Degraded";
+                  if (s === "smb_active" || s === "falling_back_to_smb") return "SMB";
+                  if (s === "smb_recovering" || s === "recovering_to_rclone") return "Recovering";
+                  if (s === "error") return "Error";
+                  return s ?? "Unknown";
+                };
+                return (
+                  <div
+                    class="panel-item"
+                    onClick={() => navigate(cfg.junctionPath)}
+                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(cfg.junctionPath); } }}
+                    onContextMenu={(e) => onMountContextMenu(e, cfg.id)}
+                    title={ms()?.stateDetail ?? cfg.junctionPath}
+                  >
+                    <span class={`mount-status-dot ${stateClass()}`} />
+                    <span class="item-label truncate">{cfg.displayName}</span>
+                    <span class="item-tag">Jobs</span>
+                    <span class={`mount-state-label ${stateClass()}`}>{stateLabel()}</span>
+                  </div>
+                );
+              }}
+            </For>
+          </Show>
           <For each={customBookmarks()}>
             {(bookmark) => (
               <div
@@ -260,7 +361,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
               </div>
             )}
           </For>
-          <Show when={customBookmarks().length === 0}>
+          <Show when={customBookmarks().length === 0 && mountStore.configs.length === 0}>
             <div class="empty-message">No bookmarks</div>
           </Show>
         </div>
@@ -293,19 +394,36 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
         <div class="section-header">Subscriptions</div>
         <div class="section-content">
           <For each={subscriptionStore.subscriptions}>
-            {(sub) => (
-              <div
-                class="panel-item"
-                onClick={() => workspaceStore.openJobTab(sub.jobPath, sub.jobName)}
-                onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(sub.jobPath); } }}
-                onContextMenu={(e) => onSubContextMenu(e, sub)}
-                title={sub.jobPath}
-              >
-                <span class={`sync-indicator sync-${sub.syncStatus.toLowerCase()}`} />
-                <span class="item-label truncate">{sub.jobName}</span>
-                <span class="item-badge">{sub.shotCount}</span>
-              </div>
-            )}
+            {(sub) => {
+              const mount = () => mountStore.getMountForPath(sub.jobPath);
+              const mountIssue = () => {
+                const m = mount();
+                if (!m) return null;
+                if (m.state === "rclone_healthy" || m.state === "initializing" || m.state === "rclone_starting") return null;
+                return m;
+              };
+              return (
+                <div
+                  class="panel-item"
+                  onClick={() => workspaceStore.openJobTab(sub.jobPath, sub.jobName)}
+                  onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(sub.jobPath); } }}
+                  onContextMenu={(e) => onSubContextMenu(e, sub)}
+                  title={mountIssue() ? `${sub.jobPath}\nMount: ${mountIssue()!.stateDetail}` : sub.jobPath}
+                >
+                  <span class={`sync-indicator sync-${sub.syncStatus.toLowerCase()}`} />
+                  <span class="item-label truncate">{sub.jobName}</span>
+                  <Show when={mountIssue()}>
+                    <span
+                      class={`mount-badge mount-badge-${mountIssue()!.state === "error" ? "error" : "warn"}`}
+                      title={mountIssue()!.stateDetail}
+                    >
+                      <span class="icon">{mountIssue()!.state === "error" ? "error" : mountIssue()!.isSmbActive ? "swap_horiz" : "warning"}</span>
+                    </span>
+                  </Show>
+                  <span class="item-badge">{sub.shotCount}</span>
+                </div>
+              );
+            }}
           </For>
           <Show when={subscriptionStore.subscriptions.length === 0}>
             <div class="empty-message">No subscriptions</div>
@@ -352,6 +470,42 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
             <div class="ctx-menu-item ctx-menu-danger" onClick={subCtxUnsubscribe}><span class="icon">remove_circle_outline</span> Unsubscribe</div>
           </div>
         )}
+      </Show>
+
+      {/* ── Mount Context Menu ── */}
+      <Show when={mountCtxMenu()}>
+        {(menu) => {
+          const ms = () => mountStore.states[menu().mountId];
+          const cfg = () => mountStore.configs.find((c) => c.id === menu().mountId);
+          const mountPath = () => cfg()?.junctionPath ?? "";
+          return (
+            <div
+              class="ctx-menu"
+              style={{ left: `${menu().x}px`, top: `${menu().y}px` }}
+              ref={adjustMenuPosition}
+            >
+              <div class="ctx-menu-header truncate">{cfg()?.displayName ?? menu().mountId}</div>
+              <Show when={ms()?.stateDetail}>
+                <div class="ctx-menu-item ctx-menu-disabled"><span class="icon">info</span> {ms()!.stateDetail}</div>
+              </Show>
+              <div class="ctx-menu-separator" />
+              <div class="ctx-menu-item" onClick={() => { navigate(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_back</span> Open in Left Browser</div>
+              <div class="ctx-menu-item" onClick={() => { navigateRight(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_forward</span> Open in Right Browser</div>
+              <div class="ctx-menu-item" onClick={async () => { await revealInFileManager(mountPath()); closeMountCtxMenu(); }}><span class="icon">folder_open</span> Reveal in Explorer</div>
+              <div class="ctx-menu-separator" />
+              <div class="ctx-menu-item" onClick={mountCtxRestart}><span class="icon">refresh</span> Restart</div>
+              <div class="ctx-menu-item" onClick={mountCtxFlushRestart}><span class="icon">delete_sweep</span> Flush Cache & Restart</div>
+              <Show when={ms()?.isRcloneActive}>
+                <div class="ctx-menu-separator" />
+                <div class="ctx-menu-item" onClick={mountCtxSwitchSmb}><span class="icon">swap_horiz</span> Switch to SMB</div>
+              </Show>
+              <Show when={ms()?.isSmbActive}>
+                <div class="ctx-menu-separator" />
+                <div class="ctx-menu-item" onClick={mountCtxForceRclone}><span class="icon">speed</span> Force rclone</div>
+              </Show>
+            </div>
+          );
+        }}
       </Show>
 
       {/* ── Add Bookmark Modal ── */}

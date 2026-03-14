@@ -16,6 +16,7 @@ pub mod settings;
 pub mod subscription;
 pub mod thumbnails;
 pub mod udp_notify;
+pub mod mount_client;
 pub mod transcode;
 pub mod utils;
 
@@ -92,6 +93,7 @@ pub fn run() {
                 state.set_mesh_app_handle(app_handle.clone()).await;
                 state.enable_mesh_sync_if_configured(&settings).await;
                 state.set_transcode_app_handle(app_handle.clone()).await;
+                state.mount_client.start(app_handle.clone());
             });
             Ok(())
         })
@@ -173,6 +175,19 @@ pub fn run() {
             commands::transcode_cancel_job,
             commands::transcode_remove_job,
             commands::transcode_clear_completed,
+            // Mount (MediaMount Agent)
+            commands::mount_get_states,
+            commands::mount_is_connected,
+            commands::mount_restart,
+            commands::mount_flush_and_restart,
+            commands::mount_switch_to_smb,
+            commands::mount_force_rclone,
+            commands::mount_save_config,
+            commands::mount_get_config,
+            commands::mount_launch_agent,
+            commands::mount_store_credentials,
+            commands::mount_has_credentials,
+            commands::mount_delete_credentials,
             // App lifecycle
             commands::relaunch_app,
             // Deep link

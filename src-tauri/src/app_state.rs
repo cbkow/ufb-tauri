@@ -4,6 +4,7 @@ use crate::columns::ColumnConfigManager;
 use crate::db::Database;
 use crate::mesh_sync::MeshSyncManager;
 use crate::metadata::MetadataManager;
+use crate::mount_client::MountClient;
 use crate::subscription::SubscriptionManager;
 use crate::thumbnails::ThumbnailManager;
 use crate::transcode::TranscodeManager;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub thumbnail_manager: ThumbnailManager,
     pub mesh_sync_manager: Mutex<Option<MeshSyncManager>>,
     pub transcode_manager: Arc<TranscodeManager>,
+    pub mount_client: Arc<MountClient>,
     pub device_id: String,
     /// Stores a deep-link URI from cold start so the frontend can fetch it on mount.
     pub pending_deep_link: StdMutex<Option<String>>,
@@ -58,6 +60,9 @@ impl AppState {
         // Transcode manager — resolve binary paths
         let transcode_manager = Arc::new(Self::init_transcode_manager());
 
+        // Mount client — connects to mediamount-agent
+        let mount_client = Arc::new(MountClient::new());
+
         log::info!("App state initialized (device_id: {})", device_id);
 
         Ok(Self {
@@ -70,6 +75,7 @@ impl AppState {
             thumbnail_manager,
             mesh_sync_manager,
             transcode_manager,
+            mount_client,
             device_id,
             pending_deep_link: StdMutex::new(None),
         })

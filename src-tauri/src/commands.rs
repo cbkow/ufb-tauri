@@ -1143,3 +1143,263 @@ pub fn create_date_prefixed_item(
     ))
 }
 
+// ── Mount (MediaMount Agent) ──
+
+#[tauri::command]
+pub async fn mount_get_states(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, crate::mount_client::MountStateUpdateMsg>, String> {
+    Ok(state.mount_client.get_states().await)
+}
+
+#[tauri::command]
+pub async fn mount_is_connected(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.mount_client.is_connected().await)
+}
+
+#[tauri::command]
+pub async fn mount_restart(state: State<'_, AppState>, mount_id: String) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::RestartMount(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
+pub async fn mount_flush_and_restart(
+    state: State<'_, AppState>,
+    mount_id: String,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::FlushAndRestart(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
+pub async fn mount_switch_to_smb(
+    state: State<'_, AppState>,
+    mount_id: String,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::SwitchToSmb(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
+pub async fn mount_force_rclone(
+    state: State<'_, AppState>,
+    mount_id: String,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::ForceRclone(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
+pub async fn mount_save_config(
+    state: State<'_, AppState>,
+    config: crate::mount_client::MountsConfig,
+) -> Result<(), String> {
+    crate::mount_client::save_mount_config(&config)?;
+    // Tell agent to reload
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::ReloadConfig)
+        .await
+}
+
+#[tauri::command]
+pub fn mount_get_config() -> Result<crate::mount_client::MountsConfig, String> {
+    Ok(crate::mount_client::load_mount_config())
+}
+
+#[tauri::command]
+pub fn mount_launch_agent() -> Result<(), String> {
+    let agent_name = if cfg!(target_os = "windows") {
+        "mediamount-agent.exe"
+    } else {
+        "mediamount-agent"
+    };
+
+    // Search order: next to UFB exe, then dev build path, then PATH
+    let mut agent_path = std::path::PathBuf::from(agent_name);
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Production: next to UFB exe
+            let sidecar = dir.join(agent_name);
+            if sidecar.exists() {
+                agent_path = sidecar;
+            } else {
+                // Dev: UFB is in src-tauri/target/debug/,
+                // agent is in mediamount-agent/target/debug/
+                let dev_path = dir.join("../../../mediamount-agent/target/debug").join(agent_name);
+                if let Ok(canon) = std::fs::canonicalize(&dev_path) {
+                    agent_path = canon;
+                }
+            }
+        }
+    }
+
+    log::info!("Launching agent: {}", agent_path.display());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        std::process::Command::new(&agent_path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("Failed to launch agent at {}: {}", agent_path.display(), e))?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(&agent_path)
+            .spawn()
+            .map_err(|e| format!("Failed to launch agent at {}: {}", agent_path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn mount_store_credentials(
+    key: String,
+    username: String,
+    password: String,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        store_credentials_windows(&key, &username, &password)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (key, username, password);
+        Err("Credential storage not supported on this platform".into())
+    }
+}
+
+#[tauri::command]
+pub fn mount_has_credentials(key: String) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        has_credentials_windows(&key)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = key;
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+pub fn mount_delete_credentials(key: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        delete_credentials_windows(&key)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = key;
+        Err("Credential storage not supported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+fn store_credentials_windows(key: &str, username: &str, password: &str) -> Result<(), String> {
+    use windows::Win32::Security::Credentials::{
+        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+
+    let target: Vec<u16> = format!("{}\0", key).encode_utf16().collect();
+    let user: Vec<u16> = format!("{}\0", username).encode_utf16().collect();
+    let pass_bytes: Vec<u8> = password.as_bytes().to_vec();
+
+    let cred = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: windows::core::PWSTR(target.as_ptr() as *mut _),
+        UserName: windows::core::PWSTR(user.as_ptr() as *mut _),
+        CredentialBlobSize: pass_bytes.len() as u32,
+        CredentialBlob: pass_bytes.as_ptr() as *mut _,
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        ..Default::default()
+    };
+
+    unsafe {
+        CredWriteW(&cred, 0)
+            .map_err(|e| format!("Failed to store credentials: {}", e))?;
+    }
+
+    log::info!("Stored credentials for key: {}", key);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn has_credentials_windows(key: &str) -> Result<bool, String> {
+    use windows::Win32::Security::Credentials::{
+        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+
+    let target: Vec<u16> = format!("{}\0", key).encode_utf16().collect();
+    let mut cred_ptr: *mut CREDENTIALW = std::ptr::null_mut();
+
+    let result = unsafe {
+        CredReadW(
+            windows::core::PCWSTR(target.as_ptr()),
+            CRED_TYPE_GENERIC,
+            0,
+            &mut cred_ptr,
+        )
+    };
+
+    match result {
+        Ok(()) => {
+            unsafe { CredFree(cred_ptr as *const _) };
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(windows)]
+fn delete_credentials_windows(key: &str) -> Result<(), String> {
+    use windows::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
+
+    let target: Vec<u16> = format!("{}\0", key).encode_utf16().collect();
+
+    unsafe {
+        CredDeleteW(
+            windows::core::PCWSTR(target.as_ptr()),
+            CRED_TYPE_GENERIC,
+            0,
+        )
+        .map_err(|e| format!("Failed to delete credentials: {}", e))?;
+    }
+
+    Ok(())
+}
+

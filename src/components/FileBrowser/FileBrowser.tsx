@@ -2,6 +2,7 @@ import { createSignal, createMemo, Show, onMount, onCleanup } from "solid-js";
 import type { BrowserStore } from "../../stores/fileStore";
 import type { FileEntry } from "../../lib/types";
 import { subscriptionStore } from "../../stores/subscriptionStore";
+import { mountStore } from "../../stores/mountStore";
 import {
   openFile,
   revealInFileManager,
@@ -44,8 +45,14 @@ export function FileBrowser(props: FileBrowserProps) {
     const currentPath = store().currentPath();
     if (!currentPath) return false;
     const normalized = currentPath.replace(/[\\/]+$/, "").toLowerCase();
-    return subscriptionStore.bookmarks.some(
+    // Check bookmarks marked as project folders
+    const isBookmarkProject = subscriptionStore.bookmarks.some(
       (b) => b.isProjectFolder && b.path.replace(/[\\/]+$/, "").toLowerCase() === normalized
+    );
+    if (isBookmarkProject) return true;
+    // Mount junction paths are always treated as Jobs folders
+    return mountStore.configs.some(
+      (c) => c.junctionPath.replace(/[\\/]+$/, "").toLowerCase() === normalized
     );
   });
 

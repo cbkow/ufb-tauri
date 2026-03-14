@@ -160,7 +160,7 @@ fn search_walkdir(query: &str, scope_path: Option<&str>) -> Result<Vec<FileEntry
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.to_lowercase().contains(query) {
-                    if let Ok(metadata) = entry.metadata() {
+                    if let Ok(metadata) = std::fs::metadata(entry.path()).or_else(|_| entry.metadata()) {
                         let path_str = entry.path().to_string_lossy().to_string();
                         let extension = entry
                             .path()

@@ -1,6 +1,7 @@
-import { createSignal, createResource, For, Show, onCleanup } from "solid-js";
+import { createSignal, createResource, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials } from "../../lib/tauri";
+import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
 import "./SettingsDialog.css";
 
@@ -40,6 +41,110 @@ function SettingsInput(props: {
   );
 }
 
+/** Credential editor for a mount — lets users store/check/clear NAS credentials. */
+function MountCredentialEditor(props: { credentialKey: string }) {
+  const [hasStored, setHasStored] = createSignal<boolean | null>(null);
+  const [username, setUsername] = createSignal("");
+  const [password, setPassword] = createSignal("");
+  const [status, setStatus] = createSignal("");
+
+  const checkStored = async () => {
+    if (!props.credentialKey) {
+      setHasStored(null);
+      return;
+    }
+    try {
+      const result = await mountHasCredentials(props.credentialKey);
+      setHasStored(result);
+    } catch {
+      setHasStored(false);
+    }
+  };
+
+  onMount(() => checkStored());
+
+  // Re-check when key changes
+  const prevKey = { v: props.credentialKey };
+  // Use a simple check approach
+  const checkKeyChange = () => {
+    if (props.credentialKey !== prevKey.v) {
+      prevKey.v = props.credentialKey;
+      checkStored();
+    }
+  };
+
+  return (
+    <div class="mount-credentials-section">
+      <div class="mount-credentials-status">
+        {checkKeyChange()}
+        <Show when={!props.credentialKey}>
+          <span class="settings-help-text">Set a credential key above to manage credentials</span>
+        </Show>
+        <Show when={props.credentialKey}>
+          <Show when={hasStored() === true}>
+            <span class="mount-cred-badge mount-cred-stored">Credentials stored</span>
+            <button
+              class="settings-btn settings-btn-small settings-btn-danger"
+              onClick={async () => {
+                try {
+                  await mountDeleteCredentials(props.credentialKey);
+                  setHasStored(false);
+                  setStatus("Credentials removed");
+                } catch (e) {
+                  setStatus("Failed to remove: " + e);
+                }
+              }}
+            >Remove</button>
+          </Show>
+          <Show when={hasStored() === false}>
+            <span class="mount-cred-badge mount-cred-missing">No credentials stored</span>
+          </Show>
+        </Show>
+      </div>
+      <Show when={props.credentialKey && hasStored() !== true}>
+        <div class="mount-editor-row">
+          <label class="settings-field" style={{ flex: 1 }}>
+            <span>Username</span>
+            <input
+              type="text"
+              value={username()}
+              placeholder="admin"
+              onInput={(e) => setUsername(e.currentTarget.value)}
+            />
+          </label>
+          <label class="settings-field" style={{ flex: 1 }}>
+            <span>Password</span>
+            <input
+              type="password"
+              value={password()}
+              placeholder="password"
+              onInput={(e) => setPassword(e.currentTarget.value)}
+            />
+          </label>
+        </div>
+        <button
+          class="settings-btn"
+          disabled={!username() || !password()}
+          onClick={async () => {
+            try {
+              await mountStoreCredentials(props.credentialKey, username(), password());
+              setHasStored(true);
+              setUsername("");
+              setPassword("");
+              setStatus("Credentials saved");
+            } catch (e) {
+              setStatus("Failed to save: " + e);
+            }
+          }}
+        >Save Credentials</button>
+      </Show>
+      <Show when={status()}>
+        <span class="settings-help-text">{status()}</span>
+      </Show>
+    </div>
+  );
+}
+
 export function SettingsDialog(props: SettingsDialogProps) {
   const [activeSection, setActiveSection] = createSignal("appearance");
 
@@ -47,8 +152,18 @@ export function SettingsDialog(props: SettingsDialogProps) {
     { id: "appearance", label: "Appearance" },
     { id: "paths", label: "Path Mappings" },
     { id: "sync", label: "Sync" },
+    { id: "mounts", label: "Mounts" },
     { id: "integrations", label: "Integrations" },
   ];
+
+  // Mount state
+  const [mountConfig, setMountConfig] = createSignal<MountsConfig>({ version: 1, mounts: [] });
+
+  onMount(async () => {
+    mountStore.loadStates();
+    const cfg = await mountStore.loadConfig();
+    setMountConfig(cfg);
+  });
 
   // Poll mesh sync status every 3s while on the sync tab
   const [meshStatusTick, setMeshStatusTick] = createSignal(0);
@@ -429,6 +544,11 @@ export function SettingsDialog(props: SettingsDialogProps) {
               </div>
             </Show>
 
+            {/* ── Mounts ── */}
+            <Show when={activeSection() === "mounts"}>
+              <MountsSection mountConfig={mountConfig} setMountConfig={setMountConfig} />
+            </Show>
+
             {/* ── Integrations ── */}
             <Show when={activeSection() === "integrations"}>
               <div class="settings-section">
@@ -469,6 +589,368 @@ export function SettingsDialog(props: SettingsDialogProps) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Default values for a new mount config */
+function defaultMountConfig(): MountConfig {
+  return {
+    id: "",
+    enabled: true,
+    displayName: "",
+    nasSharePath: "",
+    credentialKey: "",
+    rcloneDriveLetter: "R",
+    smbDriveLetter: "S",
+    junctionPath: "",
+    cacheDirPath: "",
+    cacheMaxSize: "1T",
+    cacheMaxAge: "72h",
+    vfsWriteBack: "10s",
+    vfsReadChunkSize: "64M",
+    vfsReadChunkStreams: 8,
+    vfsReadAhead: "2G",
+    bufferSize: "512M",
+    probeIntervalSecs: 15,
+    probeTimeoutMs: 3000,
+    fallbackThreshold: 3,
+    recoveryThreshold: 5,
+    maxRcloneStartAttempts: 3,
+    healthcheckFileName: ".healthcheck",
+    extraRcloneFlags: [],
+  };
+}
+
+function MountsSection(props: {
+  mountConfig: () => MountsConfig;
+  setMountConfig: (cfg: MountsConfig) => void;
+}) {
+  const [editingMount, setEditingMount] = createSignal<MountConfig | null>(null);
+  const [isNew, setIsNew] = createSignal(false);
+  const [confirmRemove, setConfirmRemove] = createSignal<string | null>(null);
+
+  function startAdd() {
+    setEditingMount(defaultMountConfig());
+    setIsNew(true);
+  }
+
+  function startEdit(cfg: MountConfig) {
+    setEditingMount({ ...cfg });
+    setIsNew(false);
+  }
+
+  function cancelEdit() {
+    setEditingMount(null);
+  }
+
+  async function saveMount() {
+    const m = editingMount();
+    if (!m || !m.id.trim() || !m.nasSharePath.trim()) return;
+
+    const cfg = props.mountConfig();
+    let mounts: MountConfig[];
+    if (isNew()) {
+      mounts = [...cfg.mounts, m];
+    } else {
+      mounts = cfg.mounts.map((existing) => (existing.id === m.id ? m : existing));
+    }
+    const newCfg = { ...cfg, mounts };
+    props.setMountConfig(newCfg);
+    await mountStore.saveConfig(newCfg);
+    setEditingMount(null);
+  }
+
+  async function removeMount(id: string) {
+    const cfg = props.mountConfig();
+    const newCfg = { ...cfg, mounts: cfg.mounts.filter((m) => m.id !== id) };
+    props.setMountConfig(newCfg);
+    await mountStore.saveConfig(newCfg);
+    setConfirmRemove(null);
+  }
+
+  function updateField<K extends keyof MountConfig>(key: K, value: MountConfig[K]) {
+    const m = editingMount();
+    if (m) setEditingMount({ ...m, [key]: value });
+  }
+
+  return (
+    <div class="settings-section">
+      <h3>MediaMount Agent</h3>
+      <div class="settings-field">
+        <div class={`mount-connection-status ${mountStore.connected ? "connected" : "disconnected"}`}>
+          <span class="icon" style={{ "font-size": "14px" }}>
+            {mountStore.connected ? "check_circle" : "cancel"}
+          </span>
+          <span>{mountStore.connected ? "Connected to agent" : "Agent not connected"}</span>
+        </div>
+      </div>
+
+      {/* Live mount status */}
+      <Show when={Object.keys(mountStore.states).length > 0}>
+        <h3>Live Status</h3>
+        <For each={Object.values(mountStore.states) as MountStateUpdate[]}>
+          {(ms) => {
+            const cachePercent = () =>
+              ms.cacheMaxBytes > 0
+                ? Math.round((ms.cacheUsedBytes / ms.cacheMaxBytes) * 100)
+                : 0;
+            const cacheUsedGB = () => (ms.cacheUsedBytes / (1024 * 1024 * 1024)).toFixed(1);
+            const cacheMaxGB = () => (ms.cacheMaxBytes / (1024 * 1024 * 1024)).toFixed(0);
+
+            return (
+              <div class="mount-item">
+                <div class="mount-item-header">
+                  <span class={`mount-state-dot ${ms.isRcloneActive ? "healthy" : ms.isSmbActive ? "fallback" : ms.state === "error" ? "error" : "neutral"}`} />
+                  <span class="mount-item-name">{ms.mountId}</span>
+                  <span class="mount-item-state">{ms.stateDetail}</span>
+                </div>
+                <div class="mount-cache-bar">
+                  <div class="mount-cache-fill" style={{ width: `${cachePercent()}%` }} />
+                </div>
+                <div class="mount-cache-label">
+                  Cache: {cacheUsedGB()} GB / {cacheMaxGB()} GB
+                  <Show when={ms.dirtyFiles > 0}>
+                    <span class="mount-dirty"> | {ms.dirtyFiles} dirty</span>
+                  </Show>
+                </div>
+                <div class="mount-controls">
+                  <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
+                  <button onClick={() => mountStore.flushAndRestart(ms.mountId)}>Flush & Restart</button>
+                  <Show when={ms.isRcloneActive}>
+                    <button onClick={() => mountStore.switchToSmb(ms.mountId)}>Switch to SMB</button>
+                  </Show>
+                  <Show when={ms.isSmbActive}>
+                    <button onClick={() => mountStore.forceRclone(ms.mountId)}>Force rclone</button>
+                  </Show>
+                </div>
+              </div>
+            );
+          }}
+        </For>
+      </Show>
+
+      {/* Mount configurations */}
+      <h3>Configuration</h3>
+      <Show when={!editingMount()}>
+        <For each={props.mountConfig().mounts}>
+          {(cfg) => (
+            <div class="mount-config-item">
+              <div class="mount-config-header">
+                <span class={`mount-state-dot ${cfg.enabled ? "healthy" : "neutral"}`} />
+                <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
+                <span class="mount-config-detail">{cfg.nasSharePath} → {cfg.junctionPath}</span>
+              </div>
+              <div class="mount-config-actions">
+                <button class="settings-btn" onClick={() => startEdit(cfg)}>Edit</button>
+                <button class="settings-btn" onClick={() => setConfirmRemove(cfg.id)}>Remove</button>
+              </div>
+            </div>
+          )}
+        </For>
+        <Show when={props.mountConfig().mounts.length === 0}>
+          <p class="settings-hint">No mounts configured. Add a mount to manage NAS access with rclone VFS caching.</p>
+        </Show>
+        <button
+          class="settings-btn"
+          style={{ "margin-top": "var(--spacing-md)" }}
+          onClick={startAdd}
+        >
+          + Add Mount
+        </button>
+      </Show>
+
+      {/* Mount editor */}
+      <Show when={editingMount()}>
+        {(m) => (
+          <div class="mount-editor">
+            <div class="mount-editor-title">
+              {isNew() ? "Add Mount" : `Edit: ${m().displayName || m().id}`}
+            </div>
+
+            <label class="settings-field">
+              <span>Mount ID</span>
+              <SettingsInput
+                value={m().id}
+                placeholder="primary-nas"
+                onCommit={(v) => updateField("id", v.replace(/\s+/g, "-").toLowerCase())}
+              />
+            </label>
+
+            <label class="settings-field">
+              <span>Display Name</span>
+              <SettingsInput
+                value={m().displayName}
+                placeholder="Studio NAS"
+                onCommit={(v) => updateField("displayName", v)}
+              />
+            </label>
+
+            <div class="settings-row">
+              <label class="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={m().enabled}
+                  onChange={(e) => updateField("enabled", e.currentTarget.checked)}
+                />
+                <span>Enabled</span>
+              </label>
+            </div>
+
+            <h3>Network</h3>
+
+            <div class="settings-field">
+              <div class="settings-field-header">
+                <span>NAS Share Path</span>
+                <span class="settings-help" title="UNC path to the network share, e.g. \\\\nas\\media">?</span>
+              </div>
+              <SettingsInput
+                value={m().nasSharePath}
+                placeholder="\\\\nas\\media"
+                onCommit={(v) => updateField("nasSharePath", v)}
+              />
+            </div>
+
+            <label class="settings-field">
+              <div class="settings-field-header">
+                <span>Credential Key</span>
+                <span class="settings-help" title="Key used to store/retrieve NAS credentials in Windows Credential Manager">?</span>
+              </div>
+              <SettingsInput
+                value={m().credentialKey}
+                placeholder="mediamount_primary-nas"
+                onCommit={(v) => updateField("credentialKey", v)}
+              />
+            </label>
+
+            <MountCredentialEditor credentialKey={m().credentialKey} />
+
+            <h3>Drive Letters</h3>
+
+            <div class="mount-editor-row">
+              <label class="settings-field" style={{ flex: 1 }}>
+                <div class="settings-field-header">
+                  <span>rclone Drive</span>
+                  <span class="settings-help" title="Drive letter for the rclone VFS mount">?</span>
+                </div>
+                <SettingsInput
+                  value={m().rcloneDriveLetter}
+                  placeholder="R"
+                  onCommit={(v) => updateField("rcloneDriveLetter", v.toUpperCase().charAt(0))}
+                />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <div class="settings-field-header">
+                  <span>SMB Drive</span>
+                  <span class="settings-help" title="Drive letter for the SMB fallback mount">?</span>
+                </div>
+                <SettingsInput
+                  value={m().smbDriveLetter}
+                  placeholder="S"
+                  onCommit={(v) => updateField("smbDriveLetter", v.toUpperCase().charAt(0))}
+                />
+              </label>
+            </div>
+
+            <div class="settings-field">
+              <div class="settings-field-header">
+                <span>Junction Path</span>
+                <span class="settings-help" title="NTFS junction that switches between rclone and SMB drives transparently">?</span>
+              </div>
+              <SettingsInput
+                value={m().junctionPath}
+                placeholder="M:\\media"
+                onCommit={(v) => updateField("junctionPath", v)}
+              />
+            </div>
+
+            <h3>Cache</h3>
+
+            <div class="settings-field">
+              <div class="settings-field-header">
+                <span>Cache Directory</span>
+                <span class="settings-help" title="Local directory for the rclone VFS cache. Use a fast SSD.">?</span>
+              </div>
+              <div class="settings-field-row">
+                <SettingsInput
+                  value={m().cacheDirPath}
+                  placeholder="D:\\rclone-cache\\primary-nas"
+                  onCommit={(v) => updateField("cacheDirPath", v)}
+                />
+                <button class="settings-btn" onClick={async () => {
+                  try {
+                    const selected = await pickFolder("Select Cache Directory");
+                    if (selected) updateField("cacheDirPath", selected);
+                  } catch (e) { console.error(e); }
+                }}>Browse...</button>
+              </div>
+            </div>
+
+            <div class="mount-editor-row">
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Max Size</span>
+                <SettingsInput value={m().cacheMaxSize} placeholder="1T" onCommit={(v) => updateField("cacheMaxSize", v)} />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Max Age</span>
+                <SettingsInput value={m().cacheMaxAge} placeholder="72h" onCommit={(v) => updateField("cacheMaxAge", v)} />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Write-Back</span>
+                <SettingsInput value={m().vfsWriteBack} placeholder="10s" onCommit={(v) => updateField("vfsWriteBack", v)} />
+              </label>
+            </div>
+
+            <h3>Performance</h3>
+
+            <div class="mount-editor-row">
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Chunk Size</span>
+                <SettingsInput value={m().vfsReadChunkSize} placeholder="64M" onCommit={(v) => updateField("vfsReadChunkSize", v)} />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Streams</span>
+                <SettingsInput type="number" value={m().vfsReadChunkStreams} onCommit={(v) => updateField("vfsReadChunkStreams", parseInt(v) || 8)} />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Read Ahead</span>
+                <SettingsInput value={m().vfsReadAhead} placeholder="2G" onCommit={(v) => updateField("vfsReadAhead", v)} />
+              </label>
+              <label class="settings-field" style={{ flex: 1 }}>
+                <span>Buffer</span>
+                <SettingsInput value={m().bufferSize} placeholder="512M" onCommit={(v) => updateField("bufferSize", v)} />
+              </label>
+            </div>
+
+            <div class="mount-editor-actions">
+              <button class="settings-btn" onClick={cancelEdit}>Cancel</button>
+              <button
+                class="settings-btn settings-btn-primary"
+                onClick={saveMount}
+                disabled={!m().id.trim() || !m().nasSharePath.trim()}
+              >
+                {isNew() ? "Add" : "Save"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Show>
+
+      {/* Confirm remove dialog */}
+      <Show when={confirmRemove()}>
+        <div class="modal-overlay">
+          <div class="modal">
+            <div class="modal-title">Remove Mount</div>
+            <div class="modal-body">
+              <p>Remove mount <strong>{confirmRemove()}</strong>? The agent will stop managing this mount.</p>
+            </div>
+            <div class="modal-actions">
+              <button class="modal-btn" onClick={() => setConfirmRemove(null)}>Cancel</button>
+              <button class="modal-btn modal-btn-danger" onClick={() => removeMount(confirmRemove()!)}>Remove</button>
+            </div>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 }

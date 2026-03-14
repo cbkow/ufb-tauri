@@ -5,14 +5,17 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.1.3"
+#define MyAppVersion "0.1.4"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
+#define AgentExeName "mediamount-agent.exe"
 
 ; Paths relative to this .iss file
 #define SrcTauri "..\src-tauri"
 #define ReleaseDir SrcTauri + "\target\release"
+#define AgentReleaseDir "..\mediamount-agent\target\release"
+#define RcloneDir SrcTauri + "\external\rclone"
 
 [Setup]
 AppId={{B3C9D5E7-4F8A-6B2C-9D1E-7A3F5C8E2D4B}
@@ -61,6 +64,7 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "Core application files"; Types: full custom; Flags: fixed
+Name: "mediamount"; Description: "MediaMount Agent (rclone VFS mount manager with SMB fallback)"; Types: full
 Name: "uri_protocol"; Description: "Register ufb:/// URI protocol for project links"; Types: full
 Name: "union_protocol"; Description: "Register union:/// URI protocol for Union links"; Types: full
 Name: "firewall"; Description: "Add Windows Firewall rules for Mesh Sync (TCP 49200, UDP 4244)"; Types: full
@@ -70,6 +74,7 @@ Name: "shortcuts\desktop"; Description: "Create desktop shortcut"; Types: full
 Name: "shortcuts\startmenu"; Description: "Create Start Menu shortcuts"; Types: full; Flags: fixed
 
 [Tasks]
+Name: "mediamount_autostart"; Description: "Start MediaMount Agent at login"; GroupDescription: "MediaMount:"; Components: mediamount; Flags: unchecked
 Name: "cleansettings"; Description: "Remove user preferences (%LOCALAPPDATA%\ufb\settings.json) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "cleandb"; Description: "Remove database (%LOCALAPPDATA%\ufb\ufb.db) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "cleanall"; Description: "Remove ALL user data and preferences (%LOCALAPPDATA%\ufb\) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
@@ -86,6 +91,11 @@ Source: "{#ReleaseDir}\ffprobe.exe"; DestDir: "{app}"; Flags: ignoreversion skip
 
 ; Runtime DLLs
 Source: "{#ReleaseDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+
+; MediaMount Agent
+Source: "{#AgentReleaseDir}\{#AgentExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: mediamount
+Source: "{#RcloneDir}\rclone.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: mediamount
+Source: "{#RcloneDir}\rclone.1"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: mediamount
 
 ; Assets - scripts
 Source: "{#SrcTauri}\assets\scripts\*"; DestDir: "{app}\assets\scripts"; Flags: ignoreversion recursesubdirs; Components: core
@@ -126,9 +136,18 @@ Root: HKCR; Subkey: "union\shell\open\command"; ValueType: string; ValueName: ""
 ; App User Model ID (Windows 11 taskbar)
 Root: HKLM; Subkey: "Software\Classes\Applications\{#MyAppExeName}"; ValueType: string; ValueName: "AppUserModelID"; ValueData: "com.unionfiles.ufb"; Flags: uninsdeletekey
 
+; MediaMount Agent auto-start at login
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "MediaMountAgent"; ValueData: """{app}\{#AgentExeName}"""; Flags: uninsdeletevalue; Components: mediamount; Tasks: mediamount_autostart
+
 [Code]
 var
   DataCleanupPage: TInputOptionWizardPage;
+
+function IsWinFspInstalled(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{pf}\WinFsp\bin\winfsp-x64.dll')) or
+            FileExists(ExpandConstant('{pf32}\WinFsp\bin\winfsp-x64.dll'));
+end;
 
 procedure InitializeWizard();
 begin
@@ -275,6 +294,18 @@ begin
       Exec('netsh.exe', 'advfirewall firewall add rule name="UFB Mesh Sync (UDP)" dir=in action=allow protocol=UDP localport=4244 program="' + ExpandConstant('{app}\{#MyAppExeName}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
 
+    // WinFSP check for MediaMount
+    if WizardIsComponentSelected('mediamount') and not IsWinFspInstalled() then
+    begin
+      if MsgBox('MediaMount requires WinFSP to mount rclone VFS drives.' + #13#10 +
+                'WinFSP was not detected on this system.' + #13#10#13#10 +
+                'Would you like to open the WinFSP download page?',
+                mbInformation, MB_YESNO) = IDYES then
+      begin
+        Exec('cmd.exe', '/c start https://winfsp.dev/rel/', '', SW_HIDE, ewNoWait, ResultCode);
+      end;
+    end;
+
     if WizardIsTaskSelected('restartexplorer') then
       RestartExplorer();
   end;
@@ -286,8 +317,17 @@ var
   UserDataDir, NilesoftDir: String;
   Response: Integer;
 begin
+  if CurUninstallStep = usUninstall then
+  begin
+    // Stop the MediaMount agent if running
+    Exec('taskkill.exe', '/f /im {#AgentExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
   if CurUninstallStep = usPostUninstall then
   begin
+    // Remove MediaMount auto-start
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MediaMountAgent');
+
     // Remove firewall rules
     Exec('netsh.exe', 'advfirewall firewall delete rule name="UFB Mesh Sync (TCP)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec('netsh.exe', 'advfirewall firewall delete rule name="UFB Mesh Sync (UDP)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);

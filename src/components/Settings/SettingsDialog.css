@@ -431,3 +431,206 @@
   font-family: var(--font-mono);
   font-size: 11px;
 }
+
+/* ── Mounts ── */
+
+.mount-connection-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 0;
+}
+.mount-connection-status.connected { color: #4caf50; }
+.mount-connection-status.disconnected { color: var(--text-tertiary); }
+
+.mount-item {
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.mount-item-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.mount-state-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.mount-state-dot.healthy { background: #4caf50; }
+.mount-state-dot.fallback { background: #ff9800; }
+.mount-state-dot.error { background: #f44336; }
+.mount-state-dot.neutral { background: var(--text-tertiary); }
+
+.mount-item-name {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.mount-item-state {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: auto;
+}
+
+.mount-cache-bar {
+  height: 4px;
+  background: var(--bg-secondary);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.mount-cache-fill {
+  height: 100%;
+  background: var(--accent-color);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.mount-cache-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.mount-dirty {
+  color: #ff9800;
+}
+
+.mount-controls {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mount-controls button {
+  font-size: 11px;
+  padding: 3px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.mount-controls button:hover {
+  background: var(--bg-hover);
+}
+
+/* ── Mount config list items ── */
+.mount-config-item {
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mount-config-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mount-config-name {
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.mount-config-detail {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mount-config-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ── Mount editor ── */
+.mount-editor {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-lg);
+}
+
+.mount-editor-title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: var(--spacing-md);
+}
+
+.mount-editor-row {
+  display: flex;
+  gap: var(--spacing-md);
+}
+
+.mount-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-lg);
+  padding-top: var(--spacing-md);
+  border-top: 1px solid var(--border-color);
+}
+
+.mount-credentials-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-sm);
+}
+
+.mount-credentials-status {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.mount-cred-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.mount-cred-stored {
+  background: rgba(0, 180, 0, 0.15);
+  color: #4caf50;
+}
+
+.mount-cred-missing {
+  background: rgba(255, 160, 0, 0.15);
+  color: #ff9800;
+}
+
+.settings-btn-small {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.settings-btn-danger {
+  color: #f44336;
+}
+
+.settings-help-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+}

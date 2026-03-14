@@ -121,11 +121,83 @@
 .sync-stale { background: var(--warning); }
 .sync-error { background: var(--error); }
 
+/* ── Mount badge on subscriptions ── */
+.mount-badge {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.mount-badge .icon {
+  font-size: 14px;
+}
+
+.mount-badge-warn {
+  color: #ff9800;
+}
+
+.mount-badge-error {
+  color: #f44336;
+}
+
 .empty-message {
   padding: var(--spacing-md);
   color: var(--text-disabled);
   font-size: 12px;
   font-style: italic;
+}
+
+/* ── Mount sidebar items ── */
+
+.mount-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: var(--spacing-xs);
+}
+
+.mount-status-dot.mount-healthy { background: #4caf50; }
+.mount-status-dot.mount-starting { background: #2196f3; }
+.mount-status-dot.mount-warn { background: #ff9800; }
+.mount-status-dot.mount-fallback { background: #ff9800; }
+.mount-status-dot.mount-error { background: #f44336; }
+
+.mount-state-label {
+  font-size: 10px;
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  opacity: 0.8;
+}
+
+.mount-state-label.mount-healthy { color: #4caf50; }
+.mount-state-label.mount-starting { color: #2196f3; }
+.mount-state-label.mount-warn { color: #ff9800; }
+.mount-state-label.mount-fallback { color: #ff9800; }
+.mount-state-label.mount-error { color: #f44336; }
+
+.mount-item-disconnected {
+  opacity: 0.7;
+}
+
+.mount-item-disconnected .item-tag {
+  font-size: 10px;
+}
+
+.panel-item-disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.panel-item-disabled:hover {
+  background: transparent;
+}
+
+.ctx-menu-disabled {
+  opacity: 0.6;
+  pointer-events: none;
+  font-size: 11px;
 }
 
 /* ── Context Menu ── */

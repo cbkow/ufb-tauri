@@ -29,10 +29,12 @@ pub fn start_native_drag(paths: &[String]) -> std::result::Result<String, String
         }
     }
 
-    // Canonicalize paths
+    // Use paths as-is (preserve junction paths). Do NOT canonicalize —
+    // that resolves junctions to their target, breaking path consistency.
     let canonical: Vec<PathBuf> = paths
         .iter()
-        .filter_map(|p| dunce::canonicalize(p).ok())
+        .map(|p| PathBuf::from(p))
+        .filter(|p| p.exists())
         .collect();
 
     if canonical.is_empty() {

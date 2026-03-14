@@ -1,0 +1,22 @@
+WinFsp - Windows File System Proxy
+
+Copyright (c) 2015-2025 Bill Zissimopoulos
+
+License: GPLv3
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 3 as
+published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+Full license text: https://www.gnu.org/licenses/gpl-3.0.html
+Source: https://github.com/winfsp/winfsp
+
+Note: WinFSP is a runtime dependency installed separately by the user.
+It is not bundled with or linked into this application. UFB uses rclone,
+which in turn uses WinFSP's FUSE compatibility layer to mount virtual
+file systems on Windows.

@@ -243,6 +243,50 @@ export interface MeshSyncStatus {
   isConfigured: boolean;
 }
 
+// Mount (MediaMount Agent)
+export interface MountStateUpdate {
+  mountId: string;
+  state: string;
+  stateDetail: string;
+  cacheUsedBytes: number;
+  cacheMaxBytes: number;
+  dirtyFiles: number;
+  lastFallbackTime: number | null;
+  isRcloneActive: boolean;
+  isSmbActive: boolean;
+}
+
+export interface MountConfig {
+  id: string;
+  enabled: boolean;
+  displayName: string;
+  nasSharePath: string;
+  credentialKey: string;
+  rcloneDriveLetter: string;
+  smbDriveLetter: string;
+  junctionPath: string;
+  cacheDirPath: string;
+  cacheMaxSize: string;
+  cacheMaxAge: string;
+  vfsWriteBack: string;
+  vfsReadChunkSize: string;
+  vfsReadChunkStreams: number;
+  vfsReadAhead: string;
+  bufferSize: string;
+  probeIntervalSecs: number;
+  probeTimeoutMs: number;
+  fallbackThreshold: number;
+  recoveryThreshold: number;
+  maxRcloneStartAttempts: number;
+  healthcheckFileName: string;
+  extraRcloneFlags: string[];
+}
+
+export interface MountsConfig {
+  version: number;
+  mounts: MountConfig[];
+}
+
 // Backup
 export interface BackupInfo {
   timestamp: number;

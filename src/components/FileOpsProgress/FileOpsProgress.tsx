@@ -37,6 +37,9 @@ export function FileOpsProgress() {
               return parts[parts.length - 1] || f;
             };
 
+            const itemsPercent = () =>
+              op.itemsTotal > 1 ? Math.round((op.itemsDone / op.itemsTotal) * 100) : 0;
+
             return (
               <div class={`fileops-item fileops-${op.status}`}>
                 <Show when={op.status === "active"}>
@@ -49,21 +52,40 @@ export function FileOpsProgress() {
                   <span class="icon fileops-error-icon">error</span>
                 </Show>
 
-                <span class="fileops-label">{label()}</span>
-
-                <Show when={shortFile() && op.status === "active"}>
-                  <span class="fileops-filename">{shortFile()}</span>
-                </Show>
-
-                <Show when={op.status === "active"}>
-                  <div class="fileops-progress-track">
-                    <div
-                      class="fileops-progress-fill"
-                      style={{ width: `${percent()}%` }}
-                    />
+                <div class="fileops-details">
+                  <div class="fileops-row">
+                    <span class="fileops-label">{label()}</span>
+                    <Show when={shortFile() && op.status === "active"}>
+                      <span class="fileops-filename">{shortFile()}</span>
+                    </Show>
                   </div>
-                  <span class="fileops-percent">{percent()}%</span>
-                </Show>
+
+                  <Show when={op.status === "active"}>
+                    {/* Overall items progress (shown when multiple items) */}
+                    <Show when={op.itemsTotal > 1}>
+                      <div class="fileops-row">
+                        <span class="fileops-items-count">{op.itemsDone} / {op.itemsTotal}</span>
+                        <div class="fileops-progress-track">
+                          <div
+                            class="fileops-progress-fill fileops-items-fill"
+                            style={{ width: `${itemsPercent()}%` }}
+                          />
+                        </div>
+                      </div>
+                    </Show>
+
+                    {/* Per-file byte progress */}
+                    <div class="fileops-row">
+                      <div class="fileops-progress-track">
+                        <div
+                          class="fileops-progress-fill"
+                          style={{ width: `${percent()}%` }}
+                        />
+                      </div>
+                      <span class="fileops-percent">{percent()}%</span>
+                    </div>
+                  </Show>
+                </div>
 
                 <button
                   class="fileops-dismiss"

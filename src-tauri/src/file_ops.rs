@@ -25,14 +25,16 @@ pub fn list_directory(path: &str) -> Result<Vec<FileEntry>, String> {
 
     for entry in read_dir {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let metadata = entry
-            .metadata()
+        // Use std::fs::metadata (follows symlinks/junctions) instead of
+        // entry.metadata() which uses FindFirstFile and does NOT follow reparse points.
+        let metadata = std::fs::metadata(entry.path())
+            .or_else(|_| entry.metadata())
             .map_err(|e| format!("Failed to read metadata: {}", e))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        let path_str = dunce::canonicalize(entry.path())
-            .unwrap_or_else(|_| entry.path())
-            .to_string_lossy()
-            .to_string();
+        // Use the path as-is (preserving junction paths like C:\gfx_nas\...).
+        // Do NOT canonicalize — that resolves junctions to their target (R:\...),
+        // breaking path prefix matching for subscriptions and mount detection.
+        let path_str = entry.path().to_string_lossy().to_string();
         let extension = entry
             .path()
             .extension()
@@ -75,10 +77,77 @@ pub fn rename_path(old_path: &str, new_path: &str) -> Result<(), String> {
 }
 
 /// Delete files/directories to the OS trash/recycle bin.
+/// Falls back to native shell delete (with confirmation) for network/junction paths
+/// where the Recycle Bin isn't available.
 pub fn delete_to_trash(paths: &[String]) -> Result<(), String> {
+    let mut failed: Vec<String> = Vec::new();
+
     for path in paths {
-        trash::delete(path).map_err(|e| format!("Failed to trash '{}': {}", path, e))?;
+        if let Err(_) = trash::delete(path) {
+            failed.push(path.clone());
+        }
     }
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    // Fallback: use native shell delete for paths that couldn't be recycled
+    // (typically network/junction paths with no Recycle Bin)
+    #[cfg(windows)]
+    {
+        shell_delete_files(&failed)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        for path in &failed {
+            let p = Path::new(path);
+            if p.is_dir() {
+                std::fs::remove_dir_all(p)
+                    .map_err(|e| format!("Failed to delete '{}': {}", path, e))?;
+            } else {
+                std::fs::remove_file(p)
+                    .map_err(|e| format!("Failed to delete '{}': {}", path, e))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Windows: delete files using SHFileOperationW which shows the native
+/// "Are you sure you want to permanently delete?" dialog for network paths.
+#[cfg(windows)]
+fn shell_delete_files(paths: &[String]) -> Result<(), String> {
+    use windows::Win32::UI::Shell::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE};
+    use windows::Win32::UI::Shell::FOF_ALLOWUNDO;
+
+    // SHFileOperationW expects a double-null-terminated string of paths
+    let mut wide: Vec<u16> = Vec::new();
+    for path in paths {
+        wide.extend(path.encode_utf16());
+        wide.push(0); // null separator between paths
+    }
+    wide.push(0); // double-null terminator
+
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: windows::core::PCWSTR(wide.as_ptr()),
+        fFlags: FOF_ALLOWUNDO.0 as u16, // Try recycle first; if unavailable, shows permanent delete dialog
+        ..Default::default()
+    };
+
+    let result = unsafe { SHFileOperationW(&mut op) };
+
+    if result != 0 {
+        // User cancelled or operation failed
+        if op.fAnyOperationsAborted.as_bool() {
+            return Ok(()); // User cancelled — not an error
+        }
+        return Err(format!("Shell delete failed (error {})", result));
+    }
+
     Ok(())
 }
 

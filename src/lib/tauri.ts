@@ -241,6 +241,44 @@ export const transcodeRemoveJob = (id: string) =>
 export const transcodeClearCompleted = () =>
   invoke<void>("transcode_clear_completed");
 
+// ── Mount (MediaMount Agent) ──
+
+export const mountGetStates = () =>
+  invoke<Record<string, import("./types").MountStateUpdate>>("mount_get_states");
+
+export const mountIsConnected = () =>
+  invoke<boolean>("mount_is_connected");
+
+export const mountRestart = (mountId: string) =>
+  invoke<void>("mount_restart", { mountId });
+
+export const mountFlushAndRestart = (mountId: string) =>
+  invoke<void>("mount_flush_and_restart", { mountId });
+
+export const mountSwitchToSmb = (mountId: string) =>
+  invoke<void>("mount_switch_to_smb", { mountId });
+
+export const mountForceRclone = (mountId: string) =>
+  invoke<void>("mount_force_rclone", { mountId });
+
+export const mountSaveConfig = (config: import("./types").MountsConfig) =>
+  invoke<void>("mount_save_config", { config });
+
+export const mountGetConfig = () =>
+  invoke<import("./types").MountsConfig>("mount_get_config");
+
+export const mountLaunchAgent = () =>
+  invoke<void>("mount_launch_agent");
+
+export const mountStoreCredentials = (key: string, username: string, password: string) =>
+  invoke<void>("mount_store_credentials", { key, username, password });
+
+export const mountHasCredentials = (key: string) =>
+  invoke<boolean>("mount_has_credentials", { key });
+
+export const mountDeleteCredentials = (key: string) =>
+  invoke<void>("mount_delete_credentials", { key });
+
 // ── App lifecycle ──
 
 export const relaunchApp = () => invoke<void>("relaunch_app");

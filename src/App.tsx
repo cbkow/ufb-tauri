@@ -1,7 +1,8 @@
-import { onMount, onCleanup, createSignal, Show, For, Switch, Match } from "solid-js";
+import { onMount, onCleanup, createSignal, Show, For, Switch, Match, createMemo } from "solid-js";
 import { settingsStore } from "./stores/settingsStore";
 import { subscriptionStore } from "./stores/subscriptionStore";
 import { workspaceStore } from "./stores/workspaceStore";
+import { mountStore } from "./stores/mountStore";
 import { DualBrowserView } from "./components/DualBrowserView/DualBrowserView";
 import { SubscriptionPanel } from "./components/SubscriptionPanel/SubscriptionPanel";
 import { Splitter } from "./components/shared/Splitter";
@@ -32,6 +33,9 @@ export default function App() {
 
     const accent = settingsStore.getAccentColor();
     document.documentElement.style.setProperty("--accent-color", accent);
+
+    // Initialize mount store
+    mountStore.loadStates();
 
     setReady(true);
 
@@ -173,11 +177,46 @@ export default function App() {
         }
       />
       <FileOpsProgress />
+      <MountStatusBar />
       </div>
 
       <Show when={showSettings()}>
         <SettingsDialog onClose={() => setShowSettings(false)} />
       </Show>
+    </Show>
+  );
+}
+
+/** Mount status indicator — hidden when all healthy or no mounts configured */
+function MountStatusBar() {
+  const hasMounts = createMemo(() => Object.keys(mountStore.states).length > 0);
+  const hasIssues = createMemo(() => {
+    const states = Object.values(mountStore.states);
+    return states.some(
+      (s: any) =>
+        s.state === "rclone_degraded" ||
+        s.state === "smb_active" ||
+        s.state === "error" ||
+        s.state === "falling_back_to_smb"
+    );
+  });
+
+  return (
+    <Show when={hasMounts() && hasIssues()}>
+      <div class="mount-status-bar">
+        <span class="icon" style={{ "font-size": "13px", color: "#ff9800" }}>
+          warning
+        </span>
+        <span style={{ "font-size": "11px" }}>
+          {Object.values(mountStore.states)
+            .filter(
+              (s: any) =>
+                s.state !== "rclone_healthy" && s.state !== "initializing"
+            )
+            .map((s: any) => `${s.mountId}: ${s.stateDetail}`)
+            .join(", ")}
+        </span>
+      </div>
     </Show>
   );
 }

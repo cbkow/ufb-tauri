@@ -171,8 +171,12 @@ impl ThumbnailManager {
 
 fn get_or_generate_sync(db: &Database, file_path: &str) -> Result<Option<Vec<u8>>, String> {
     let path = Path::new(file_path);
-    if !path.exists() || path.is_dir() {
-        return Ok(None);
+    // Use std::fs::metadata to follow junctions properly.
+    // If path is inaccessible or is a directory, skip it.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => return Ok(None),
+        Err(_) => return Ok(None),
+        _ => {}
     }
 
     let ext = path
