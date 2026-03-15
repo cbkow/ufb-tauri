@@ -602,7 +602,7 @@ function defaultMountConfig(): MountConfig {
     nasSharePath: "",
     credentialKey: "",
     rcloneDriveLetter: "R",
-    smbDriveLetter: "S",
+    smbDriveLetter: "",
     junctionPath: "",
     cacheDirPath: "",
     cacheMaxSize: "1T",
@@ -825,32 +825,19 @@ function MountsSection(props: {
 
             <MountCredentialEditor credentialKey={m().credentialKey} />
 
-            <h3>Drive Letters</h3>
+            <h3>Drive Letter</h3>
 
-            <div class="mount-editor-row">
-              <label class="settings-field" style={{ flex: 1 }}>
-                <div class="settings-field-header">
-                  <span>rclone Drive</span>
-                  <span class="settings-help" title="Drive letter for the rclone VFS mount">?</span>
-                </div>
-                <SettingsInput
-                  value={m().rcloneDriveLetter}
-                  placeholder="R"
-                  onCommit={(v) => updateField("rcloneDriveLetter", v.toUpperCase().charAt(0))}
-                />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <div class="settings-field-header">
-                  <span>SMB Drive</span>
-                  <span class="settings-help" title="Drive letter for the SMB fallback mount">?</span>
-                </div>
-                <SettingsInput
-                  value={m().smbDriveLetter}
-                  placeholder="S"
-                  onCommit={(v) => updateField("smbDriveLetter", v.toUpperCase().charAt(0))}
-                />
-              </label>
-            </div>
+            <label class="settings-field">
+              <div class="settings-field-header">
+                <span>rclone Drive</span>
+                <span class="settings-help" title="Drive letter for the rclone VFS mount">?</span>
+              </div>
+              <SettingsInput
+                value={m().rcloneDriveLetter}
+                placeholder="R"
+                onCommit={(v) => updateField("rcloneDriveLetter", v.toUpperCase().charAt(0))}
+              />
+            </label>
 
             <div class="settings-field">
               <div class="settings-field-header">

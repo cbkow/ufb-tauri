@@ -1,4 +1,5 @@
 import { Show, For } from "solid-js";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { ColumnDefinition } from "./types";
 
 export interface CellRenderParams {
@@ -161,7 +162,7 @@ export function renderCellValue(params: CellRenderParams) {
                   target="_blank"
                   rel="noopener"
                   title={url}
-                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); window.open(url, "_blank"); }}
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); openUrl(url); }}
                 >
                   {label}
                 </a>

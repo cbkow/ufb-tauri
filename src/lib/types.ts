@@ -263,7 +263,7 @@ export interface MountConfig {
   nasSharePath: string;
   credentialKey: string;
   rcloneDriveLetter: string;
-  smbDriveLetter: string;
+  smbDriveLetter?: string;
   junctionPath: string;
   cacheDirPath: string;
   cacheMaxSize: string;

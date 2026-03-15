@@ -12,27 +12,46 @@ pub struct FileEntry {
     pub extension: String,
 }
 
+/// Check if a path is a symlink pointing to a directory.
+fn is_dir_symlink(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// List directory contents, returning file entries sorted (dirs first, then by name).
 pub fn list_directory(path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = Path::new(path);
-    if !dir_path.is_dir() {
-        return Err(format!("Not a directory: {}", path));
-    }
 
     let mut entries = Vec::new();
     let read_dir =
-        std::fs::read_dir(dir_path).map_err(|e| format!("Failed to read directory: {}", e))?;
+        std::fs::read_dir(dir_path).map_err(|e| format!("Not a directory or cannot read: {}", e))?;
 
     for entry in read_dir {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        // Use std::fs::metadata (follows symlinks/junctions) instead of
-        // entry.metadata() which uses FindFirstFile and does NOT follow reparse points.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Check if this entry is a symlink (before following it)
+        let is_symlink = entry.file_type()
+            .map(|ft| ft.is_symlink())
+            .unwrap_or(false);
+
+        // Use std::fs::metadata (follows symlinks) to get the target's metadata.
+        // Fall back to symlink_metadata so symlinks still appear even if target is slow.
         let metadata = std::fs::metadata(entry.path())
-            .or_else(|_| entry.metadata())
-            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+            .or_else(|_| std::fs::symlink_metadata(entry.path()));
+        let metadata = match metadata {
+            Ok(m) => m,
+            Err(_) => continue, // skip entries we can't stat
+        };
         let name = entry.file_name().to_string_lossy().to_string();
-        // Use the path as-is (preserving junction paths like C:\gfx_nas\...).
-        // Do NOT canonicalize — that resolves junctions to their target (R:\...),
+        // Use the path as-is (preserving symlink paths like C:\gfx_nas\...).
+        // Do NOT canonicalize — that resolves symlinks to their target,
         // breaking path prefix matching for subscriptions and mount detection.
         let path_str = entry.path().to_string_lossy().to_string();
         let extension = entry
@@ -46,10 +65,15 @@ pub fn list_directory(path: &str) -> Result<Vec<FileEntry>, String> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
 
+        // Directory symlinks: metadata.is_dir() is true when std::fs::metadata
+        // followed the symlink. If we fell back to symlink_metadata, is_dir is
+        // false — so for symlinks, assume directory if we can't tell.
+        let is_dir = metadata.is_dir() || (is_symlink && !metadata.is_file());
+
         entries.push(FileEntry {
             name,
             path: path_str,
-            is_dir: metadata.is_dir(),
+            is_dir,
             size: metadata.len(),
             modified,
             extension,

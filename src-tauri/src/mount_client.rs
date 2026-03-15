@@ -88,6 +88,7 @@ pub struct MountConfig {
     pub nas_share_path: String,
     pub credential_key: String,
     pub rclone_drive_letter: String,
+    #[serde(default)]
     pub smb_drive_letter: String,
     pub junction_path: String,
     pub cache_dir_path: String,

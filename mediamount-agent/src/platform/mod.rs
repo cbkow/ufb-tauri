@@ -16,16 +16,10 @@ pub trait MountPoint: Send + Sync {
     fn verify(&self, junction_path: &str, expected_target: &str) -> Result<bool, String>;
 }
 
-/// Trait for managing SMB/NFS fallback mounts.
-pub trait FallbackMount: Send + Sync {
-    /// Map a network share to a drive letter.
-    fn map(&self, share_path: &str, drive_letter: &str, username: &str, password: &str) -> Result<(), String>;
-
-    /// Unmap a network drive.
-    fn unmap(&self, drive_letter: &str) -> Result<(), String>;
-
-    /// Check if a drive letter is currently mapped.
-    fn is_mapped(&self, drive_letter: &str) -> Result<bool, String>;
+/// Trait for establishing SMB sessions (no drive letter mapping).
+pub trait SmbSession: Send + Sync {
+    /// Ensure an authenticated SMB session exists for the given share.
+    fn ensure_session(&self, share_path: &str, username: &str, password: &str) -> Result<(), String>;
 }
 
 /// Trait for credential storage.
@@ -50,6 +44,7 @@ pub fn is_drive_in_use(letter: &str) -> bool {
 #[cfg(windows)]
 pub fn set_auto_start(enabled: bool) -> Result<(), String> {
     use std::process::Command;
+    use std::os::windows::process::CommandExt;
 
     let exe_path = std::env::current_exe()
         .map_err(|e| format!("Failed to get exe path: {}", e))?;
@@ -69,6 +64,7 @@ pub fn set_auto_start(enabled: bool) -> Result<(), String> {
                 &format!("\"{}\"", exe_str),
                 "/f",
             ])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map_err(|e| format!("Failed to run reg: {}", e))?;
         if !status.status.success() {
@@ -84,6 +80,7 @@ pub fn set_auto_start(enabled: bool) -> Result<(), String> {
                 "MediaMountAgent",
                 "/f",
             ])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output();
         log::info!("Auto-start disabled");
     }
@@ -93,6 +90,7 @@ pub fn set_auto_start(enabled: bool) -> Result<(), String> {
 /// Check if auto-start is enabled.
 #[cfg(windows)]
 pub fn is_auto_start_enabled() -> bool {
+    use std::os::windows::process::CommandExt;
     std::process::Command::new("reg")
         .args([
             "query",
@@ -100,6 +98,7 @@ pub fn is_auto_start_enabled() -> bool {
             "/v",
             "MediaMountAgent",
         ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

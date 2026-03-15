@@ -1,6 +1,6 @@
 [package]
 name = "ufb-tauri"
-version = "0.1.4"
+version = "0.1.5"
 description = "Union File Browser - Tauri Edition"
 authors = ["Chris"]
 edition = "2021"
@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 cc = "1"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-deep-link = "2"

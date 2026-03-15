@@ -116,8 +116,12 @@ export function FileBrowser(props: FileBrowserProps) {
   // ── File actions ──
 
   function openEntry(entry: FileEntry) {
-    if (entry.isDir) {
-      store().navigateTo(entry.path);
+    if (entry.isDir || !entry.extension) {
+      // Directories and extensionless entries (likely symlinks) — try to navigate
+      store().navigateTo(entry.path).catch(() => {
+        // If navigation fails (not a directory), open as file instead
+        openFile(entry.path).catch((e) => console.error("Failed to open file:", e));
+      });
     } else {
       openFile(entry.path).catch((e) => console.error("Failed to open file:", e));
     }

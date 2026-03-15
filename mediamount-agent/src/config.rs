@@ -26,7 +26,8 @@ pub struct MountConfig {
     /// Drive letter for rclone VFS mount (e.g. "R")
     pub rclone_drive_letter: String,
 
-    /// Drive letter for SMB fallback mapping (e.g. "S")
+    /// Drive letter for SMB fallback mapping (e.g. "S") — legacy, no longer used
+    #[serde(default)]
     pub smb_drive_letter: String,
 
     /// Path to the NTFS junction that switches between rclone/SMB (e.g. "M:\\media")
@@ -284,5 +285,25 @@ mod tests {
         let json = r#"{ not valid json }"#;
         let result = serde_json::from_str::<MountsConfig>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_missing_smb_drive_letter_defaults() {
+        let json = r#"{
+            "version": 1,
+            "mounts": [{
+                "id": "test",
+                "displayName": "Test",
+                "nasSharePath": "\\\\nas\\test",
+                "credentialKey": "test",
+                "rcloneDriveLetter": "R",
+                "junctionPath": "M:\\test",
+                "cacheDirPath": "D:\\cache"
+            }]
+        }"#;
+
+        let config: MountsConfig = serde_json::from_str(json).unwrap();
+        let m = &config.mounts[0];
+        assert_eq!(m.smb_drive_letter, ""); // defaults to empty when missing
     }
 }

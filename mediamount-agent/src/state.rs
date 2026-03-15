@@ -96,8 +96,7 @@ pub enum Effect {
     KillRclone,
     SwitchJunctionToRclone,
     SwitchJunctionToSmb,
-    MapSmb,
-    UnmapSmb,
+    EnsureSmbSession,
     StartProbeLoop,
     StopProbeLoop,
     UpdateTray,
@@ -146,7 +145,7 @@ pub fn transition(
         (Initializing, Start) => (
             RcloneStarting { attempt: 1 },
             vec![
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::SpawnRclone,
                 Effect::LogEvent {
@@ -199,7 +198,7 @@ pub fn transition(
                 (
                     FallingBackToSmb,
                     vec![
-                        Effect::MapSmb,
+                        Effect::EnsureSmbSession,
                         Effect::SwitchJunctionToSmb,
                         Effect::LogEvent {
                             level: LogLevel::Error,
@@ -274,7 +273,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -316,7 +315,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -336,7 +335,7 @@ pub fn transition(
                     vec![
                         Effect::StopProbeLoop,
                         Effect::KillRclone,
-                        Effect::MapSmb,
+                        Effect::EnsureSmbSession,
                         Effect::SwitchJunctionToSmb,
                         Effect::StartProbeLoop,
                         Effect::LogEvent {
@@ -381,7 +380,7 @@ pub fn transition(
             FallingBackToSmb,
             vec![
                 Effect::StopProbeLoop,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::StartProbeLoop,
                 Effect::LogEvent {
@@ -399,11 +398,25 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "manual switch to SMB".into(),
+                },
+                Effect::UpdateTray,
+                Effect::EmitStateUpdate,
+            ],
+        ),
+        (RcloneDegraded { .. }, ForceRclone) => (
+            RcloneStarting { attempt: 1 },
+            vec![
+                Effect::StopProbeLoop,
+                Effect::KillRclone,
+                Effect::SpawnRclone,
+                Effect::LogEvent {
+                    level: LogLevel::Info,
+                    message: "manual force rclone restart from degraded".into(),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -448,6 +461,19 @@ pub fn transition(
                 Effect::EmitStateUpdate,
             ],
         ),
+        (FallingBackToSmb, ForceRclone) => (
+            RcloneStarting { attempt: 1 },
+            vec![
+                Effect::StopProbeLoop,
+                Effect::SpawnRclone,
+                Effect::LogEvent {
+                    level: LogLevel::Info,
+                    message: "manual force rclone from SMB fallback".into(),
+                },
+                Effect::UpdateTray,
+                Effect::EmitStateUpdate,
+            ],
+        ),
         (FallingBackToSmb, SmbMapFailed { reason }) => (
             Error(MountError::SmbFailed {
                 reason: reason.clone(),
@@ -481,7 +507,7 @@ pub fn transition(
             RcloneStarting { attempt: 1 },
             vec![
                 Effect::StopProbeLoop,
-                Effect::UnmapSmb,
+
                 Effect::SpawnRclone,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -495,7 +521,7 @@ pub fn transition(
             Initializing,
             vec![
                 Effect::StopProbeLoop,
-                Effect::UnmapSmb,
+
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "mount stopped".into(),
@@ -549,12 +575,25 @@ pub fn transition(
                 Effect::EmitStateUpdate,
             ],
         ),
+        (SmbRecovering { .. }, ForceRclone) => (
+            RcloneStarting { attempt: 1 },
+            vec![
+                Effect::StopProbeLoop,
+                Effect::SpawnRclone,
+                Effect::LogEvent {
+                    level: LogLevel::Info,
+                    message: "manual force rclone from SMB recovery".into(),
+                },
+                Effect::UpdateTray,
+                Effect::EmitStateUpdate,
+            ],
+        ),
 
         // ── RecoveringToRclone ──
         (RecoveringToRclone { .. }, RcloneStarted) => (
             RcloneHealthy { consecutive_ok: 0 },
             vec![
-                Effect::UnmapSmb,
+
                 Effect::SwitchJunctionToRclone,
                 Effect::StartProbeLoop,
                 Effect::LogEvent {
@@ -582,7 +621,7 @@ pub fn transition(
         (ManualOverride { target: MountTarget::Smb }, ForceRclone) => (
             RcloneStarting { attempt: 1 },
             vec![
-                Effect::UnmapSmb,
+
                 Effect::SpawnRclone,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -599,7 +638,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -625,7 +664,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::UnmapSmb,
+
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "mount stopped from manual override".into(),
@@ -661,7 +700,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
-                Effect::MapSmb,
+                Effect::EnsureSmbSession,
                 Effect::SwitchJunctionToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -720,7 +759,7 @@ mod tests {
         let (state, effects) =
             transition(MountState::Initializing, MountEvent::Start, &default_config());
         assert!(matches!(state, MountState::RcloneStarting { attempt: 1 }));
-        assert!(effects.contains(&Effect::MapSmb));
+        assert!(effects.contains(&Effect::EnsureSmbSession));
         assert!(effects.contains(&Effect::SwitchJunctionToSmb));
         assert!(effects.contains(&Effect::SpawnRclone));
         assert!(effects.contains(&Effect::EmitStateUpdate));
@@ -761,7 +800,7 @@ mod tests {
         // Attempt 3 fails → fallback
         let (state, effects) = transition(state, MountEvent::RcloneStartFailed, &config);
         assert!(matches!(state, MountState::FallingBackToSmb));
-        assert!(effects.contains(&Effect::MapSmb));
+        assert!(effects.contains(&Effect::EnsureSmbSession));
         assert!(effects.contains(&Effect::SwitchJunctionToSmb));
     }
 
@@ -814,7 +853,7 @@ mod tests {
         let (state, effects) = transition(state, MountEvent::ProbeFailed, &config);
         assert!(matches!(state, MountState::FallingBackToSmb));
         assert!(effects.contains(&Effect::KillRclone));
-        assert!(effects.contains(&Effect::MapSmb));
+        assert!(effects.contains(&Effect::EnsureSmbSession));
         assert!(effects.contains(&Effect::SwitchJunctionToSmb));
     }
 
@@ -891,7 +930,6 @@ mod tests {
             state,
             MountState::RcloneHealthy { consecutive_ok: 0 }
         ));
-        assert!(effects.contains(&Effect::UnmapSmb));
         assert!(effects.contains(&Effect::SwitchJunctionToRclone));
     }
 
@@ -919,7 +957,7 @@ mod tests {
             }
         ));
         assert!(effects.contains(&Effect::KillRclone));
-        assert!(effects.contains(&Effect::MapSmb));
+        assert!(effects.contains(&Effect::EnsureSmbSession));
     }
 
     #[test]
@@ -932,7 +970,6 @@ mod tests {
             &default_config(),
         );
         assert!(matches!(state, MountState::RcloneStarting { attempt: 1 }));
-        assert!(effects.contains(&Effect::UnmapSmb));
         assert!(effects.contains(&Effect::SpawnRclone));
     }
 
@@ -1046,7 +1083,7 @@ mod tests {
             &default_config(),
         );
         assert!(matches!(state, MountState::FallingBackToSmb));
-        assert!(effects.contains(&Effect::MapSmb));
+        assert!(effects.contains(&Effect::EnsureSmbSession));
         assert!(effects.contains(&Effect::SwitchJunctionToSmb));
     }
 }

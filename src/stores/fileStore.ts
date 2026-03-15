@@ -1,7 +1,8 @@
-import { createSignal } from "solid-js";
+import { createSignal, onCleanup } from "solid-js";
 import { createStore } from "solid-js/store";
 import type { FileEntry } from "../lib/types";
 import { listDirectory } from "../lib/tauri";
+import { listen } from "@tauri-apps/api/event";
 
 export type SortField = "name" | "size" | "modified" | "extension";
 export type SortDirection = "asc" | "desc";
@@ -200,6 +201,19 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
       }
     });
   }
+
+  // Auto-refresh when mount state changes (e.g. symlink created/switched)
+  let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
+  const unlisten = listen("mount:state-update", () => {
+    if (currentPath() && !refreshDebounce) {
+      refreshDebounce = setTimeout(() => {
+        refreshDebounce = null;
+        navigateTo(currentPath(), false);
+      }, 1000);
+    }
+  });
+  // Clean up listener if store is used inside a reactive owner
+  try { onCleanup(() => { unlisten.then(fn => fn()); }); } catch {}
 
   // Init with path if provided
   if (initialPath) {

@@ -2,7 +2,7 @@ use crate::config::MountConfig;
 use crate::health::HealthMonitor;
 use crate::messages::{AgentToUfb, MountStateUpdateMsg};
 use crate::rclone::{cache, RcloneManager, RcloneSignal};
-use crate::state::{self, Effect, HysteresisConfig, LogLevel, MountEvent, MountState};
+use crate::state::{self, Effect, HysteresisConfig, LogLevel, MountEvent, MountState, MountTarget};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -67,20 +67,9 @@ impl Orchestrator {
             self.state
         );
 
-        // Crash recovery: remove any stale junction so the normal startup flow
-        // can recreate it cleanly (map SMB first, then junction → SMB, then rclone).
-        #[cfg(windows)]
-        {
-            let junction = std::path::Path::new(&self.config.junction_path);
-            if junction.exists() || junction.read_link().is_ok() {
-                log::info!(
-                    "[{}] Removing stale junction at {} for clean startup",
-                    self.mount_id,
-                    self.config.junction_path
-                );
-                let _ = std::fs::remove_dir(junction);
-            }
-        }
+        // Note: stale symlinks are handled by switch() which removes before recreating.
+        // We intentionally do NOT remove the symlink here — it may still be valid
+        // and removing it causes a gap where apps see a missing path.
 
         // Check prerequisites before starting
         if !RcloneManager::check_winfsp() {
@@ -187,14 +176,10 @@ impl Orchestrator {
                 self.switch_junction(&target).await;
             }
             Effect::SwitchJunctionToSmb => {
-                let target = format!("{}:\\", self.config.smb_drive_letter);
-                self.switch_junction(&target).await;
+                self.switch_junction(&self.config.nas_share_path.clone()).await;
             }
-            Effect::MapSmb => {
-                self.map_smb().await;
-            }
-            Effect::UnmapSmb => {
-                self.unmap_smb().await;
+            Effect::EnsureSmbSession => {
+                self.ensure_smb_session().await;
             }
             Effect::StartProbeLoop => {
                 self.start_probe_loop();
@@ -326,10 +311,10 @@ impl Orchestrator {
         }
     }
 
-    async fn map_smb(&mut self) {
+    async fn ensure_smb_session(&mut self) {
         #[cfg(windows)]
         {
-            use crate::platform::{CredentialStore, FallbackMount};
+            use crate::platform::{CredentialStore, SmbSession};
             let cred_store = crate::platform::windows::WindowsCredentialStore::new();
 
             let (username, password) = match cred_store.retrieve(&self.config.credential_key) {
@@ -345,14 +330,13 @@ impl Orchestrator {
                 }
             };
 
-            let smb = crate::platform::windows::WindowsFallbackMount::new();
-            if let Err(e) = smb.map(
+            let smb = crate::platform::windows::WindowsSmbSession::new();
+            if let Err(e) = smb.ensure_session(
                 &self.config.nas_share_path,
-                &self.config.smb_drive_letter,
                 &username,
                 &password,
             ) {
-                log::error!("[{}] SMB map failed: {}", self.mount_id, e);
+                log::error!("[{}] SMB session failed: {}", self.mount_id, e);
                 let _ = self
                     .event_tx
                     .send(MountEvent::SmbMapFailed { reason: e })
@@ -365,12 +349,9 @@ impl Orchestrator {
                         .as_millis() as u64,
                 );
 
-                // Ensure .healthcheck file exists on the share
-                let healthcheck_path = std::path::Path::new(&format!(
-                    "{}:\\",
-                    self.config.smb_drive_letter
-                ))
-                .join(&self.config.healthcheck_file_name);
+                // Ensure .healthcheck file exists on the share (via UNC path)
+                let healthcheck_path = std::path::Path::new(&self.config.nas_share_path)
+                    .join(&self.config.healthcheck_file_name);
                 if !healthcheck_path.exists() {
                     match std::fs::write(&healthcheck_path, "ok") {
                         Ok(_) => log::info!(
@@ -386,17 +367,6 @@ impl Orchestrator {
                         ),
                     }
                 }
-            }
-        }
-    }
-
-    async fn unmap_smb(&mut self) {
-        #[cfg(windows)]
-        {
-            use crate::platform::FallbackMount;
-            let smb = crate::platform::windows::WindowsFallbackMount::new();
-            if let Err(e) = smb.unmap(&self.config.smb_drive_letter) {
-                log::warn!("[{}] SMB unmap failed: {}", self.mount_id, e);
             }
         }
     }
@@ -464,6 +434,7 @@ impl Orchestrator {
             MountState::SmbActive
                 | MountState::SmbRecovering { .. }
                 | MountState::FallingBackToSmb
+                | MountState::ManualOverride { target: MountTarget::Smb }
         );
 
         let state_name = match &self.state {

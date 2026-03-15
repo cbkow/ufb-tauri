@@ -187,7 +187,7 @@ export function FolderTabView(props: FolderTabViewProps) {
         <Show when={layoutMode() === "B"}>
           <Splitter
             direction="horizontal"
-            initialSize={420}
+            initialSize={540}
             minSize={200}
             minSecondSize={300}
             first={itemListPanel()}
@@ -202,7 +202,7 @@ export function FolderTabView(props: FolderTabViewProps) {
       }>
         <Splitter
           direction="horizontal"
-          initialSize={420}
+          initialSize={540}
           minSize={200}
           minSecondSize={400}
           first={itemListPanel()}

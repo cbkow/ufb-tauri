@@ -5,7 +5,7 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.1.4"
+#define MyAppVersion "0.1.5"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
@@ -74,7 +74,7 @@ Name: "shortcuts\desktop"; Description: "Create desktop shortcut"; Types: full
 Name: "shortcuts\startmenu"; Description: "Create Start Menu shortcuts"; Types: full; Flags: fixed
 
 [Tasks]
-Name: "mediamount_autostart"; Description: "Start MediaMount Agent at login"; GroupDescription: "MediaMount:"; Components: mediamount; Flags: unchecked
+Name: "mediamount_autostart"; Description: "Start MediaMount Agent at login"; GroupDescription: "MediaMount:"; Components: mediamount
 Name: "cleansettings"; Description: "Remove user preferences (%LOCALAPPDATA%\ufb\settings.json) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "cleandb"; Description: "Remove database (%LOCALAPPDATA%\ufb\ufb.db) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "cleanall"; Description: "Remove ALL user data and preferences (%LOCALAPPDATA%\ufb\) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
@@ -306,6 +306,7 @@ begin
       end;
     end;
 
+
     if WizardIsTaskSelected('restartexplorer') then
       RestartExplorer();
   end;
@@ -325,6 +326,7 @@ begin
 
   if CurUninstallStep = usPostUninstall then
   begin
+
     // Remove MediaMount auto-start
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MediaMountAgent');
 

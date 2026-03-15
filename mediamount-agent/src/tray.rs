@@ -226,7 +226,7 @@ mod windows_tray {
         match msg {
             WM_TRAY_CALLBACK => {
                 let event = (lparam.0 & 0xFFFF) as u32;
-                if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
+                if event == WM_RBUTTONUP {
                     show_context_menu(hwnd);
                 }
                 LRESULT(0)
