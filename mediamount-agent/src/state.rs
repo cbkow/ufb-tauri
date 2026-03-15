@@ -33,7 +33,7 @@ pub enum MountError {
     WinfspMissing,
     DriveLetterConflict { letter: char },
     ConfigInvalid { reason: String },
-    JunctionFailed { reason: String },
+    DriveMapFailed { reason: String },
     SmbFailed { reason: String },
 }
 
@@ -48,7 +48,7 @@ impl fmt::Display for MountError {
                 write!(f, "drive letter {}:\\ already in use", letter)
             }
             MountError::ConfigInvalid { reason } => write!(f, "invalid config: {}", reason),
-            MountError::JunctionFailed { reason } => write!(f, "junction failed: {}", reason),
+            MountError::DriveMapFailed { reason } => write!(f, "drive map failed: {}", reason),
             MountError::SmbFailed { reason } => write!(f, "SMB failed: {}", reason),
         }
     }
@@ -79,7 +79,7 @@ pub enum MountEvent {
     // Platform errors
     WinfspMissing,
     DriveLetterConflict { letter: char },
-    JunctionSwitchFailed { reason: String },
+    DriveMapFailed { reason: String },
     SmbMapFailed { reason: String },
 
     // State query
@@ -94,8 +94,8 @@ pub enum MountEvent {
 pub enum Effect {
     SpawnRclone,
     KillRclone,
-    SwitchJunctionToRclone,
-    SwitchJunctionToSmb,
+    MapDriveToRclone,
+    MapDriveToSmb,
     EnsureSmbSession,
     StartProbeLoop,
     StopProbeLoop,
@@ -146,7 +146,7 @@ pub fn transition(
             RcloneStarting { attempt: 1 },
             vec![
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::SpawnRclone,
                 Effect::LogEvent {
                     level: LogLevel::Info,
@@ -182,11 +182,11 @@ pub fn transition(
         (RcloneStarting { .. }, RcloneStarted) => (
             RcloneHealthy { consecutive_ok: 0 },
             vec![
-                Effect::SwitchJunctionToRclone,
+                Effect::MapDriveToRclone,
                 Effect::StartProbeLoop,
                 Effect::LogEvent {
                     level: LogLevel::Info,
-                    message: "rclone started, junction switched".into(),
+                    message: "rclone started, drive mapped".into(),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -199,7 +199,7 @@ pub fn transition(
                     FallingBackToSmb,
                     vec![
                         Effect::EnsureSmbSession,
-                        Effect::SwitchJunctionToSmb,
+                        Effect::MapDriveToSmb,
                         Effect::LogEvent {
                             level: LogLevel::Error,
                             message: format!(
@@ -274,7 +274,7 @@ pub fn transition(
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "manual switch to SMB".into(),
@@ -316,10 +316,10 @@ pub fn transition(
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
-                    message: "mount stopped, junction switched to SMB".into(),
+                    message: "mount stopped, drive mapped to SMB".into(),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -336,7 +336,7 @@ pub fn transition(
                         Effect::StopProbeLoop,
                         Effect::KillRclone,
                         Effect::EnsureSmbSession,
-                        Effect::SwitchJunctionToSmb,
+                        Effect::MapDriveToSmb,
                         Effect::StartProbeLoop,
                         Effect::LogEvent {
                             level: LogLevel::Error,
@@ -381,7 +381,7 @@ pub fn transition(
             vec![
                 Effect::StopProbeLoop,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::StartProbeLoop,
                 Effect::LogEvent {
                     level: LogLevel::Error,
@@ -399,7 +399,7 @@ pub fn transition(
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "manual switch to SMB".into(),
@@ -594,11 +594,11 @@ pub fn transition(
             RcloneHealthy { consecutive_ok: 0 },
             vec![
 
-                Effect::SwitchJunctionToRclone,
+                Effect::MapDriveToRclone,
                 Effect::StartProbeLoop,
                 Effect::LogEvent {
                     level: LogLevel::Info,
-                    message: "recovered to rclone, junction switched back".into(),
+                    message: "recovered to rclone, drive remapped".into(),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -639,7 +639,7 @@ pub fn transition(
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "manual switch to SMB".into(),
@@ -693,7 +693,7 @@ pub fn transition(
         ),
 
         // ── Global: Stop from any state ──
-        // Kill rclone but leave SMB mapped and junction pointing at SMB
+        // Kill rclone but leave drive mapped to SMB
         // so artists keep a working path after shutdown.
         (_, Stop) => (
             Initializing,
@@ -701,10 +701,10 @@ pub fn transition(
                 Effect::StopProbeLoop,
                 Effect::KillRclone,
                 Effect::EnsureSmbSession,
-                Effect::SwitchJunctionToSmb,
+                Effect::MapDriveToSmb,
                 Effect::LogEvent {
                     level: LogLevel::Info,
-                    message: "mount stopped, junction switched to SMB".into(),
+                    message: "mount stopped, drive mapped to SMB".into(),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -760,7 +760,7 @@ mod tests {
             transition(MountState::Initializing, MountEvent::Start, &default_config());
         assert!(matches!(state, MountState::RcloneStarting { attempt: 1 }));
         assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::SwitchJunctionToSmb));
+        assert!(effects.contains(&Effect::MapDriveToSmb));
         assert!(effects.contains(&Effect::SpawnRclone));
         assert!(effects.contains(&Effect::EmitStateUpdate));
     }
@@ -776,7 +776,7 @@ mod tests {
             state,
             MountState::RcloneHealthy { consecutive_ok: 0 }
         ));
-        assert!(effects.contains(&Effect::SwitchJunctionToRclone));
+        assert!(effects.contains(&Effect::MapDriveToRclone));
         assert!(effects.contains(&Effect::StartProbeLoop));
     }
 
@@ -801,7 +801,7 @@ mod tests {
         let (state, effects) = transition(state, MountEvent::RcloneStartFailed, &config);
         assert!(matches!(state, MountState::FallingBackToSmb));
         assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::SwitchJunctionToSmb));
+        assert!(effects.contains(&Effect::MapDriveToSmb));
     }
 
     #[test]
@@ -854,7 +854,7 @@ mod tests {
         assert!(matches!(state, MountState::FallingBackToSmb));
         assert!(effects.contains(&Effect::KillRclone));
         assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::SwitchJunctionToSmb));
+        assert!(effects.contains(&Effect::MapDriveToSmb));
     }
 
     #[test]
@@ -930,7 +930,7 @@ mod tests {
             state,
             MountState::RcloneHealthy { consecutive_ok: 0 }
         ));
-        assert!(effects.contains(&Effect::SwitchJunctionToRclone));
+        assert!(effects.contains(&Effect::MapDriveToRclone));
     }
 
     #[test]
@@ -1084,6 +1084,6 @@ mod tests {
         );
         assert!(matches!(state, MountState::FallingBackToSmb));
         assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::SwitchJunctionToSmb));
+        assert!(effects.contains(&Effect::MapDriveToSmb));
     }
 }

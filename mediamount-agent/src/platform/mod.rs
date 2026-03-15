@@ -1,19 +1,19 @@
 #[cfg(windows)]
 pub mod windows;
 
-/// Trait for managing mount points (junctions on Windows, symlinks on macOS/Linux).
-pub trait MountPoint: Send + Sync {
-    /// Create or switch a junction/symlink to point at the given target.
-    fn switch(&self, junction_path: &str, target_path: &str) -> Result<(), String>;
+/// Trait for managing drive letter mappings via DefineDosDevice (Windows).
+pub trait DriveMapping: Send + Sync {
+    /// Map a drive letter to the given target path.
+    fn switch(&self, drive_letter: &str, target_path: &str) -> Result<(), String>;
 
-    /// Read where a junction/symlink currently points.
-    fn read_target(&self, junction_path: &str) -> Result<String, String>;
+    /// Read where a drive letter currently points.
+    fn read_target(&self, drive_letter: &str) -> Result<String, String>;
 
-    /// Remove a junction/symlink.
-    fn remove(&self, junction_path: &str) -> Result<(), String>;
+    /// Remove a drive letter mapping.
+    fn remove(&self, drive_letter: &str) -> Result<(), String>;
 
-    /// Verify the junction points to the expected target.
-    fn verify(&self, junction_path: &str, expected_target: &str) -> Result<bool, String>;
+    /// Verify the drive letter maps to the expected target.
+    fn verify(&self, drive_letter: &str, expected_target: &str) -> Result<bool, String>;
 }
 
 /// Trait for establishing SMB sessions (no drive letter mapping).

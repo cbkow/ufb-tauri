@@ -32,7 +32,8 @@ export interface MountConfig {
   credentialKey: string;
   rcloneDriveLetter: string;
   smbDriveLetter?: string;
-  junctionPath: string;
+  mountDriveLetter: string;
+  junctionPath?: string;
   cacheDirPath: string;
   cacheMaxSize: string;
   cacheMaxAge: string;
@@ -85,13 +86,14 @@ function setupListeners() {
   });
 }
 
-/** Get the mount state for a given path via prefix matching against junction paths. */
+/** Get the mount state for a given path via prefix matching against mount drive letters. */
 function getMountForPath(path: string): MountStateUpdate | undefined {
   if (state.configs.length === 0) return undefined;
   const normalized = path.replace(/\//g, "\\").toLowerCase();
   for (const cfg of state.configs) {
-    const junctionNorm = cfg.junctionPath.replace(/\//g, "\\").toLowerCase();
-    if (normalized.startsWith(junctionNorm)) {
+    if (!cfg.mountDriveLetter) continue;
+    const mountPrefix = (cfg.mountDriveLetter + ":\\").toLowerCase();
+    if (normalized.startsWith(mountPrefix)) {
       return state.states[cfg.id];
     }
   }

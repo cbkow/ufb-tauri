@@ -30,7 +30,12 @@ pub struct MountConfig {
     #[serde(default)]
     pub smb_drive_letter: String,
 
-    /// Path to the NTFS junction that switches between rclone/SMB (e.g. "M:\\media")
+    /// Drive letter that maps to rclone or SMB via DefineDosDevice (e.g. "M")
+    #[serde(default)]
+    pub mount_drive_letter: String,
+
+    /// Legacy junction path field — silently ignored, kept for config compatibility
+    #[serde(default)]
     pub junction_path: String,
 
     /// Local cache directory for rclone VFS
@@ -89,6 +94,11 @@ impl MountConfig {
             recovery_threshold: self.recovery_threshold,
             max_rclone_start_attempts: self.max_rclone_start_attempts,
         }
+    }
+
+    /// The path apps use to access the mount (e.g. "M:\").
+    pub fn mount_path(&self) -> String {
+        format!("{}:\\", self.mount_drive_letter)
     }
 }
 
@@ -223,7 +233,8 @@ mod tests {
                 credential_key: "mediamount_primary-nas".into(),
                 rclone_drive_letter: "R".into(),
                 smb_drive_letter: "S".into(),
-                junction_path: r"M:\media".into(),
+                mount_drive_letter: "M".into(),
+                junction_path: String::new(),
                 cache_dir_path: r"D:\rclone-cache\primary-nas".into(),
                 cache_max_size: "1T".into(),
                 cache_max_age: "72h".into(),
@@ -249,7 +260,42 @@ mod tests {
         assert_eq!(parsed.mounts.len(), 1);
         assert_eq!(parsed.mounts[0].id, "primary-nas");
         assert_eq!(parsed.mounts[0].rclone_drive_letter, "R");
+        assert_eq!(parsed.mounts[0].mount_drive_letter, "M");
         assert_eq!(parsed.mounts[0].cache_max_size, "1T");
+    }
+
+    #[test]
+    fn test_mount_path() {
+        let config = MountsConfig {
+            version: 1,
+            mounts: vec![MountConfig {
+                id: "test".into(),
+                enabled: true,
+                display_name: "Test".into(),
+                nas_share_path: r"\\nas\test".into(),
+                credential_key: "test".into(),
+                rclone_drive_letter: "R".into(),
+                smb_drive_letter: String::new(),
+                mount_drive_letter: "M".into(),
+                junction_path: String::new(),
+                cache_dir_path: r"D:\cache".into(),
+                cache_max_size: "1T".into(),
+                cache_max_age: "72h".into(),
+                vfs_write_back: "10s".into(),
+                vfs_read_chunk_size: "64M".into(),
+                vfs_read_chunk_streams: 8,
+                vfs_read_ahead: "2G".into(),
+                buffer_size: "512M".into(),
+                probe_interval_secs: 15,
+                probe_timeout_ms: 3000,
+                fallback_threshold: 3,
+                recovery_threshold: 5,
+                max_rclone_start_attempts: 3,
+                healthcheck_file_name: ".healthcheck".into(),
+                extra_rclone_flags: vec![],
+            }],
+        };
+        assert_eq!(config.mounts[0].mount_path(), r"M:\");
     }
 
     #[test]
@@ -262,8 +308,7 @@ mod tests {
                 "nasSharePath": "\\\\nas\\test",
                 "credentialKey": "test",
                 "rcloneDriveLetter": "R",
-                "smbDriveLetter": "S",
-                "junctionPath": "M:\\test",
+                "mountDriveLetter": "M",
                 "cacheDirPath": "D:\\cache"
             }]
         }"#;
@@ -272,6 +317,7 @@ mod tests {
         let m = &config.mounts[0];
 
         assert!(m.enabled); // default true
+        assert_eq!(m.mount_drive_letter, "M");
         assert_eq!(m.cache_max_size, "1T");
         assert_eq!(m.probe_interval_secs, 15);
         assert_eq!(m.fallback_threshold, 3);
@@ -297,7 +343,7 @@ mod tests {
                 "nasSharePath": "\\\\nas\\test",
                 "credentialKey": "test",
                 "rcloneDriveLetter": "R",
-                "junctionPath": "M:\\test",
+                "mountDriveLetter": "M",
                 "cacheDirPath": "D:\\cache"
             }]
         }"#;
@@ -305,5 +351,27 @@ mod tests {
         let config: MountsConfig = serde_json::from_str(json).unwrap();
         let m = &config.mounts[0];
         assert_eq!(m.smb_drive_letter, ""); // defaults to empty when missing
+    }
+
+    #[test]
+    fn test_legacy_junction_path_ignored() {
+        // Old configs with junctionPath should still parse; the field is silently ignored
+        let json = r#"{
+            "version": 1,
+            "mounts": [{
+                "id": "test",
+                "displayName": "Test",
+                "nasSharePath": "\\\\nas\\test",
+                "credentialKey": "test",
+                "rcloneDriveLetter": "R",
+                "junctionPath": "M:\\media",
+                "cacheDirPath": "D:\\cache"
+            }]
+        }"#;
+
+        let config: MountsConfig = serde_json::from_str(json).unwrap();
+        let m = &config.mounts[0];
+        assert_eq!(m.junction_path, r"M:\media"); // preserved but unused
+        assert_eq!(m.mount_drive_letter, ""); // not set — user must configure
     }
 }

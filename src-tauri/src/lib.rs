@@ -17,6 +17,7 @@ pub mod subscription;
 pub mod thumbnails;
 pub mod udp_notify;
 pub mod mount_client;
+pub mod explorer_pins;
 pub mod transcode;
 pub mod utils;
 
@@ -94,6 +95,15 @@ pub fn run() {
                 state.enable_mesh_sync_if_configured(&settings).await;
                 state.set_transcode_app_handle(app_handle.clone()).await;
                 state.mount_client.start(app_handle.clone());
+
+                // Sync Explorer nav pane pins for Jobs folders
+                #[cfg(windows)]
+                {
+                    let pins = crate::explorer_pins::collect_nav_pins(&state);
+                    if let Err(e) = crate::explorer_pins::sync_nav_pins(&pins) {
+                        log::warn!("Failed to sync Explorer nav pins: {}", e);
+                    }
+                }
             });
             Ok(())
         })
@@ -188,6 +198,8 @@ pub fn run() {
             commands::mount_store_credentials,
             commands::mount_has_credentials,
             commands::mount_delete_credentials,
+            commands::mount_hide_drives,
+            commands::mount_unhide_drives,
             // App lifecycle
             commands::relaunch_app,
             // Deep link

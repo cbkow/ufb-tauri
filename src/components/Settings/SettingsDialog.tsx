@@ -1,6 +1,6 @@
 import { createSignal, createResource, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountHideDrives, mountUnhideDrives } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
 import "./SettingsDialog.css";
@@ -603,7 +603,7 @@ function defaultMountConfig(): MountConfig {
     credentialKey: "",
     rcloneDriveLetter: "R",
     smbDriveLetter: "",
-    junctionPath: "",
+    mountDriveLetter: "",
     cacheDirPath: "",
     cacheMaxSize: "1T",
     cacheMaxAge: "72h",
@@ -686,6 +686,41 @@ function MountsSection(props: {
         </div>
       </div>
 
+      {/* Explorer drive visibility */}
+      <Show when={props.mountConfig().mounts.length > 0}>
+        <div class="settings-field">
+          <div class="settings-field-header">
+            <span>Explorer Drive Visibility</span>
+            <span class="settings-help" title="Hide mount-related drive letters from Explorer's 'This PC' view. Drives remain accessible by path. Requires admin (UAC prompt). Restart Explorer after changing.">?</span>
+          </div>
+          <div class="mount-controls" style={{ gap: "var(--spacing-sm)" }}>
+            <button
+              class="settings-btn"
+              onClick={() => {
+                const letters: string[] = [];
+                for (const m of props.mountConfig().mounts) {
+                  if (m.rcloneDriveLetter) letters.push(m.rcloneDriveLetter);
+                  if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
+                }
+                if (letters.length > 0) mountHideDrives(letters);
+              }}
+            >Hide Drives</button>
+            <button
+              class="settings-btn"
+              onClick={() => {
+                const letters: string[] = [];
+                for (const m of props.mountConfig().mounts) {
+                  if (m.rcloneDriveLetter) letters.push(m.rcloneDriveLetter);
+                  if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
+                }
+                if (letters.length > 0) mountUnhideDrives(letters);
+              }}
+            >Show Drives</button>
+            <span class="settings-hint-inline">Restart Explorer after changing.</span>
+          </div>
+        </div>
+      </Show>
+
       {/* Live mount status */}
       <Show when={Object.keys(mountStore.states).length > 0}>
         <h3>Live Status</h3>
@@ -739,7 +774,7 @@ function MountsSection(props: {
               <div class="mount-config-header">
                 <span class={`mount-state-dot ${cfg.enabled ? "healthy" : "neutral"}`} />
                 <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
-                <span class="mount-config-detail">{cfg.nasSharePath} → {cfg.junctionPath}</span>
+                <span class="mount-config-detail">{cfg.nasSharePath} → {cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "(not set)"}</span>
               </div>
               <div class="mount-config-actions">
                 <button class="settings-btn" onClick={() => startEdit(cfg)}>Edit</button>
@@ -839,17 +874,17 @@ function MountsSection(props: {
               />
             </label>
 
-            <div class="settings-field">
+            <label class="settings-field">
               <div class="settings-field-header">
-                <span>Junction Path</span>
-                <span class="settings-help" title="NTFS junction that switches between rclone and SMB drives transparently">?</span>
+                <span>Mount Drive Letter</span>
+                <span class="settings-help" title="Drive letter that apps use to access media. Maps to rclone or SMB automatically via DefineDosDevice — no Developer Mode required.">?</span>
               </div>
               <SettingsInput
-                value={m().junctionPath}
-                placeholder="M:\\media"
-                onCommit={(v) => updateField("junctionPath", v)}
+                value={m().mountDriveLetter}
+                placeholder="M"
+                onCommit={(v) => updateField("mountDriveLetter", v.toUpperCase().charAt(0))}
               />
-            </div>
+            </label>
 
             <h3>Cache</h3>
 

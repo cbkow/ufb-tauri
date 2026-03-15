@@ -264,7 +264,9 @@ export interface MountConfig {
   credentialKey: string;
   rcloneDriveLetter: string;
   smbDriveLetter?: string;
-  junctionPath: string;
+  mountDriveLetter: string;
+  /** @deprecated Legacy field, silently ignored */
+  junctionPath?: string;
   cacheDirPath: string;
   cacheMaxSize: string;
   cacheMaxAge: string;

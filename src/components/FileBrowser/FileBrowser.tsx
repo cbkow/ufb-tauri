@@ -50,9 +50,9 @@ export function FileBrowser(props: FileBrowserProps) {
       (b) => b.isProjectFolder && b.path.replace(/[\\/]+$/, "").toLowerCase() === normalized
     );
     if (isBookmarkProject) return true;
-    // Mount junction paths are always treated as Jobs folders
+    // Mount drive letters are always treated as Jobs folders
     return mountStore.configs.some(
-      (c) => c.junctionPath.replace(/[\\/]+$/, "").toLowerCase() === normalized
+      (c) => c.mountDriveLetter && (c.mountDriveLetter + ":").toLowerCase() === normalized
     );
   });
 

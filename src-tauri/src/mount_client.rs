@@ -90,6 +90,9 @@ pub struct MountConfig {
     pub rclone_drive_letter: String,
     #[serde(default)]
     pub smb_drive_letter: String,
+    #[serde(default)]
+    pub mount_drive_letter: String,
+    #[serde(default)]
     pub junction_path: String,
     pub cache_dir_path: String,
     #[serde(default = "default_cache_max_size")]

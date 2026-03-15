@@ -67,8 +67,8 @@ impl Orchestrator {
             self.state
         );
 
-        // Note: stale symlinks are handled by switch() which removes before recreating.
-        // We intentionally do NOT remove the symlink here — it may still be valid
+        // Note: stale drive mappings are handled by switch() which removes before recreating.
+        // We intentionally do NOT remove the mapping here — it may still be valid
         // and removing it causes a gap where apps see a missing path.
 
         // Check prerequisites before starting
@@ -171,12 +171,12 @@ impl Orchestrator {
             Effect::KillRclone => {
                 self.kill_rclone().await;
             }
-            Effect::SwitchJunctionToRclone => {
+            Effect::MapDriveToRclone => {
                 let target = format!("{}:\\", self.config.rclone_drive_letter);
-                self.switch_junction(&target).await;
+                self.switch_drive_mapping(&target).await;
             }
-            Effect::SwitchJunctionToSmb => {
-                self.switch_junction(&self.config.nas_share_path.clone()).await;
+            Effect::MapDriveToSmb => {
+                self.switch_drive_mapping(&self.config.nas_share_path.clone()).await;
             }
             Effect::EnsureSmbSession => {
                 self.ensure_smb_session().await;
@@ -296,16 +296,16 @@ impl Orchestrator {
         self.rclone_signal_rx = None;
     }
 
-    async fn switch_junction(&mut self, target: &str) {
+    async fn switch_drive_mapping(&mut self, target: &str) {
         #[cfg(windows)]
         {
-            use crate::platform::MountPoint;
-            let mp = crate::platform::windows::WindowsMountPoint::new();
-            if let Err(e) = mp.switch(&self.config.junction_path, target) {
-                log::error!("[{}] Junction switch failed: {}", self.mount_id, e);
+            use crate::platform::DriveMapping;
+            let dm = crate::platform::windows::WindowsDriveMapping::new();
+            if let Err(e) = dm.switch(&self.config.mount_drive_letter, target) {
+                log::error!("[{}] Drive mapping failed: {}", self.mount_id, e);
                 let _ = self
                     .event_tx
-                    .send(MountEvent::JunctionSwitchFailed { reason: e })
+                    .send(MountEvent::DriveMapFailed { reason: e })
                     .await;
             }
         }
@@ -374,7 +374,7 @@ impl Orchestrator {
     fn start_probe_loop(&mut self) {
         self.stop_probe_loop();
 
-        let mount_path = PathBuf::from(&self.config.junction_path);
+        let mount_path = PathBuf::from(self.config.mount_path());
         let healthcheck_file = self.config.healthcheck_file_name.clone();
         let interval = Duration::from_secs(self.config.probe_interval_secs);
         let timeout = Duration::from_millis(self.config.probe_timeout_ms);

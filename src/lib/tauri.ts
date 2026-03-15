@@ -279,6 +279,12 @@ export const mountHasCredentials = (key: string) =>
 export const mountDeleteCredentials = (key: string) =>
   invoke<void>("mount_delete_credentials", { key });
 
+export const mountHideDrives = (letters: string[]) =>
+  invoke<void>("mount_hide_drives", { letters });
+
+export const mountUnhideDrives = (letters: string[]) =>
+  invoke<void>("mount_unhide_drives", { letters });
+
 // ── App lifecycle ──
 
 export const relaunchApp = () => invoke<void>("relaunch_app");

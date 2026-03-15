@@ -328,10 +328,10 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 return (
                   <div
                     class="panel-item"
-                    onClick={() => navigate(cfg.junctionPath)}
-                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(cfg.junctionPath); } }}
+                    onClick={() => navigate(cfg.mountDriveLetter + ":\\")}
+                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(cfg.mountDriveLetter + ":\\"); } }}
                     onContextMenu={(e) => onMountContextMenu(e, cfg.id)}
-                    title={ms()?.stateDetail ?? cfg.junctionPath}
+                    title={ms()?.stateDetail ?? cfg.mountDriveLetter + ":\\"}
                   >
                     <span class={`mount-status-dot ${stateClass()}`} />
                     <span class="item-label truncate">{cfg.displayName}</span>
@@ -477,7 +477,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
         {(menu) => {
           const ms = () => mountStore.states[menu().mountId];
           const cfg = () => mountStore.configs.find((c) => c.id === menu().mountId);
-          const mountPath = () => cfg()?.junctionPath ?? "";
+          const mountPath = () => cfg()?.mountDriveLetter ? cfg()!.mountDriveLetter + ":\\" : "";
           return (
             <div
               class="ctx-menu"

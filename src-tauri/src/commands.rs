@@ -204,12 +204,26 @@ pub fn add_bookmark(
     display_name: String,
     is_project_folder: bool,
 ) -> Result<Bookmark, String> {
-    state.bookmark_manager.add_bookmark(&path, &display_name, is_project_folder)
+    let result = state.bookmark_manager.add_bookmark(&path, &display_name, is_project_folder);
+    #[cfg(windows)]
+    sync_explorer_pins(&state);
+    result
 }
 
 #[tauri::command]
 pub fn remove_bookmark(state: State<AppState>, path: String) -> Result<(), String> {
-    state.bookmark_manager.remove_bookmark(&path)
+    let result = state.bookmark_manager.remove_bookmark(&path);
+    #[cfg(windows)]
+    sync_explorer_pins(&state);
+    result
+}
+
+#[cfg(windows)]
+fn sync_explorer_pins(state: &AppState) {
+    let pins = crate::explorer_pins::collect_nav_pins(state);
+    if let Err(e) = crate::explorer_pins::sync_nav_pins(&pins) {
+        log::warn!("Failed to sync Explorer nav pins: {}", e);
+    }
 }
 
 // ── File Operations ──
@@ -1401,5 +1415,97 @@ fn delete_credentials_windows(key: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub fn mount_hide_drives(letters: Vec<String>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        hide_drives_elevated(&letters, true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = letters;
+        Err("Not supported on this platform".into())
+    }
+}
+
+#[tauri::command]
+pub fn mount_unhide_drives(letters: Vec<String>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        hide_drives_elevated(&letters, false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = letters;
+        Err("Not supported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+fn hide_drives_elevated(letters: &[String], hide: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let mut bit_ops = Vec::new();
+    for letter in letters {
+        if let Some(ch) = letter.chars().next() {
+            let upper = ch.to_ascii_uppercase();
+            if upper.is_ascii_uppercase() {
+                let bit = (upper as u32) - ('A' as u32);
+                if hide {
+                    bit_ops.push(format!("$mask = $mask -bor (1 -shl {})", bit));
+                } else {
+                    bit_ops.push(format!("$mask = $mask -band (-bnot (1 -shl {}))", bit));
+                }
+            }
+        }
+    }
+
+    if bit_ops.is_empty() {
+        return Ok(());
+    }
+
+    let script = format!(
+        "$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer'\n\
+         if (-not (Test-Path $key)) {{ New-Item -Path $key -Force | Out-Null }}\n\
+         $current = (Get-ItemProperty -Path $key -Name NoDrives -ErrorAction SilentlyContinue).NoDrives\n\
+         if ($null -eq $current) {{ $current = 0 }}\n\
+         $mask = [int]$current\n\
+         {}\n\
+         if ($mask -eq 0) {{ Remove-ItemProperty -Path $key -Name NoDrives -ErrorAction SilentlyContinue }}\n\
+         else {{ Set-ItemProperty -Path $key -Name NoDrives -Value $mask -Type DWord }}\n",
+        bit_ops.join("\n")
+    );
+
+    // Write script to a temp file to avoid quoting hell
+    let temp_dir = std::env::temp_dir();
+    let script_path = temp_dir.join("ufb_nodrives.ps1");
+    std::fs::write(&script_path, &script)
+        .map_err(|e| format!("Failed to write temp script: {}", e))?;
+
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-WindowStyle", "Hidden",
+            "-Command",
+            &format!(
+                "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File','{}'",
+                script_path.to_string_lossy()
+            ),
+        ])
+        .creation_flags(0x08000000)
+        .status()
+        .map_err(|e| format!("Failed to launch elevated PowerShell: {}", e))?;
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&script_path);
+
+    if status.success() {
+        log::info!("Drive visibility changed (hide={}) for {:?}", hide, letters);
+        Ok(())
+    } else {
+        Err("Elevated command failed or was cancelled".into())
+    }
 }
 
