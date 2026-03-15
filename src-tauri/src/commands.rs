@@ -663,7 +663,12 @@ pub fn get_drives() -> Vec<(String, String)> {
     let mut drives = Vec::new();
     #[cfg(target_os = "windows")]
     {
+        let no_drives = read_no_drives_mask();
         for letter in b'A'..=b'Z' {
+            let bit = (letter - b'A') as u32;
+            if no_drives & (1 << bit) != 0 {
+                continue; // Hidden via NoDrives policy
+            }
             let root = format!("{}:\\", letter as char);
             let path = std::path::Path::new(&root);
             if path.exists() {
@@ -1415,6 +1420,34 @@ fn delete_credentials_windows(key: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_no_drives_mask() -> u32 {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
+            "/v",
+            "NoDrives",
+        ])
+        .creation_flags(0x08000000)
+        .output();
+    if let Ok(o) = output {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            if line.contains("NoDrives") {
+                if let Some(hex) = line.split_whitespace().last() {
+                    if let Some(stripped) = hex.strip_prefix("0x") {
+                        return u32::from_str_radix(stripped, 16).unwrap_or(0);
+                    }
+                    return hex.parse::<u32>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    0
 }
 
 #[tauri::command]
