@@ -1,5 +1,7 @@
 param([string]$Paths)
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 $fileList = $Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) }
 if (-not $fileList -or $fileList.Count -eq 0) { exit }
 
@@ -49,7 +51,7 @@ $totalFiles = $fileList.Count
         Title="Transcode" Width="460" Height="180"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        Icon="$appRoot\icons\icon.ico">
     <Window.Resources>
         <Style x:Key="SecondaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -120,9 +122,9 @@ $progressFill = $window.FindName("ProgressFill")
 $cancelBtn = $window.FindName("CancelButton")
 
 # Tool paths
-$ffmpeg = "C:\Program Files\ufb\ffmpeg.exe"
-$ffprobe = "C:\Program Files\ufb\ffprobe.exe"
-$exiftool = "C:\Program Files\ufb\assets\exiftool\exiftool.exe"
+$ffmpeg = Join-Path $appRoot 'ffmpeg.exe'
+$ffprobe = Join-Path $appRoot 'ffprobe.exe'
+$exiftool = Join-Path $appRoot 'assets\exiftool\exiftool.exe'
 
 # Shared state between UI and background runspace
 $sync = [hashtable]::Synchronized(@{

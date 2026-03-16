@@ -1,5 +1,7 @@
 param([string]$Paths)
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 $fileList = $Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) }
 if (-not $fileList -or $fileList.Count -eq 0) { exit }
 
@@ -61,7 +63,7 @@ $message = "Moved $count $noun to Z_OLD."
         Title="Move to Z_OLD" Width="420" Height="150"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        Icon="$appRoot\icons\icon.ico">
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>

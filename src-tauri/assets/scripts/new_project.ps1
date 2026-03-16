@@ -1,7 +1,10 @@
 param(
-    [string]$SourceDir = "C:\Program Files\ufb\assets\projectTemplate",
+    [string]$SourceDir,
     [string]$TargetDir
 )
+
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+if (-not $SourceDir) { $SourceDir = Join-Path $appRoot 'assets\projectTemplate' }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
@@ -50,7 +53,7 @@ if ($isDark) {
         Title="New Project" Width="420" Height="195"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        Icon="$appRoot\icons\icon.ico">
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>

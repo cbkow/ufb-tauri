@@ -3,6 +3,8 @@ param(
     [string]$TargetDir
 )
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 # DWM interop for dark title bar, AppUserModelID for taskbar icon
@@ -50,7 +52,7 @@ if ($isDark) {
         Title="$Title" Width="420" Height="195"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        Icon="$appRoot\icons\icon.ico">
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>

@@ -1,5 +1,7 @@
 param([string]$Path)
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 if (-not $Path -or -not (Test-Path $Path)) { exit }
 
 # Find latest aerender.exe from Adobe installation
@@ -57,7 +59,7 @@ if ($isDark) {
         Title="AE Render" Width="420" Height="150"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        Icon="$appRoot\icons\icon.ico">
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
