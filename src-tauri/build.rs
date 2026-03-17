@@ -99,6 +99,25 @@ fn build_video_thumb() {
                 if !dest.exists() {
                     let _ = std::fs::copy(&src, &dest);
                 }
+                // Also copy exiftool_files directory (Perl runtime + libs)
+                let src_files_dir = src.parent().unwrap().join("exiftool_files");
+                let dest_files_dir = target_dir.join("exiftool_files");
+                if src_files_dir.is_dir() && !dest_files_dir.exists() {
+                    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+                        std::fs::create_dir_all(dst)?;
+                        for entry in std::fs::read_dir(src)? {
+                            let entry = entry?;
+                            let dest_path = dst.join(entry.file_name());
+                            if entry.file_type()?.is_dir() {
+                                copy_dir_recursive(&entry.path(), &dest_path)?;
+                            } else {
+                                std::fs::copy(entry.path(), dest_path)?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    let _ = copy_dir_recursive(&src_files_dir, &dest_files_dir);
+                }
                 break;
             }
         }

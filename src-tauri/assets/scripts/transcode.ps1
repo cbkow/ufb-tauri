@@ -2,7 +2,7 @@ param([string]$Paths)
 
 $appRoot = Split-Path (Split-Path $PSScriptRoot)
 
-$fileList = $Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) }
+$fileList = @($Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) })
 if (-not $fileList -or $fileList.Count -eq 0) { exit }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -51,7 +51,7 @@ $totalFiles = $fileList.Count
         Title="Transcode" Width="460" Height="180"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="$appRoot\icons\icon.ico">
+        >
     <Window.Resources>
         <Style x:Key="SecondaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -108,6 +108,11 @@ $totalFiles = $fileList.Count
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
+$iconFile = Join-Path $appRoot 'icons\icon.ico'
+if (Test-Path $iconFile) {
+    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconFile))
+}
+
 if ($isDark) {
     $window.Add_SourceInitialized({
         $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
@@ -124,7 +129,7 @@ $cancelBtn = $window.FindName("CancelButton")
 # Tool paths
 $ffmpeg = Join-Path $appRoot 'ffmpeg.exe'
 $ffprobe = Join-Path $appRoot 'ffprobe.exe'
-$exiftool = Join-Path $appRoot 'assets\exiftool\exiftool.exe'
+$exiftool = Join-Path $appRoot 'exiftool.exe'
 
 # Shared state between UI and background runspace
 $sync = [hashtable]::Synchronized(@{

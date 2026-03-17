@@ -5,7 +5,7 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.1.6.1"
+#define MyAppVersion "0.1.6.6"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
@@ -88,6 +88,10 @@ Source: "{#ReleaseDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion;
 ; FFmpeg binaries
 Source: "{#ReleaseDir}\ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
 Source: "{#ReleaseDir}\ffprobe.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+
+; ExifTool
+Source: "{#ReleaseDir}\exiftool.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+Source: "{#ReleaseDir}\exiftool_files\*"; DestDir: "{app}\exiftool_files"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Components: core
 
 ; Runtime DLLs
 Source: "{#ReleaseDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
