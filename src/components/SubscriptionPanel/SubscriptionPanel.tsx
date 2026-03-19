@@ -316,7 +316,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                   >
                     <span class={`mount-status-dot ${stateClass()}`} />
                     <span class="item-label truncate">{cfg.displayName}</span>
-                    <span class="item-tag">Jobs</span>
+                    <Show when={cfg.isJobsFolder}><span class="item-tag">Jobs</span></Show>
                     <span class={`mount-state-label ${stateClass()}`}>{stateLabel()}</span>
                   </div>
                 );

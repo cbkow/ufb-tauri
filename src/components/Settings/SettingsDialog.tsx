@@ -1,6 +1,7 @@
-import { createSignal, createResource, For, Show, onCleanup, onMount } from "solid-js";
+import { createSignal, createResource, createMemo, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
+import type { CredentialInfo } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
 import "./SettingsDialog.css";
@@ -41,106 +42,58 @@ function SettingsInput(props: {
   );
 }
 
-/** Credential editor for a mount — lets users store/check/clear NAS credentials. */
-function MountCredentialEditor(props: { credentialKey: string }) {
-  const [hasStored, setHasStored] = createSignal<boolean | null>(null);
-  const [username, setUsername] = createSignal("");
+/** Inline credential form for adding or editing a credential. */
+function InlineCredentialForm(props: {
+  initialName?: string;
+  initialUsername?: string;
+  nameReadOnly?: boolean;
+  onSave: (name: string, username: string, password: string) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = createSignal(props.initialName ?? "");
+  const [username, setUsername] = createSignal(props.initialUsername ?? "");
   const [password, setPassword] = createSignal("");
-  const [status, setStatus] = createSignal("");
-
-  const checkStored = async () => {
-    if (!props.credentialKey) {
-      setHasStored(null);
-      return;
-    }
-    try {
-      const result = await mountHasCredentials(props.credentialKey);
-      setHasStored(result);
-    } catch {
-      setHasStored(false);
-    }
-  };
-
-  onMount(() => checkStored());
-
-  // Re-check when key changes
-  const prevKey = { v: props.credentialKey };
-  // Use a simple check approach
-  const checkKeyChange = () => {
-    if (props.credentialKey !== prevKey.v) {
-      prevKey.v = props.credentialKey;
-      checkStored();
-    }
-  };
 
   return (
-    <div class="mount-credentials-section">
-      <div class="mount-credentials-status">
-        {checkKeyChange()}
-        <Show when={!props.credentialKey}>
-          <span class="settings-help-text">Set a credential key above to manage credentials</span>
-        </Show>
-        <Show when={props.credentialKey}>
-          <Show when={hasStored() === true}>
-            <span class="mount-cred-badge mount-cred-stored">Credentials stored</span>
-            <button
-              class="settings-btn settings-btn-small settings-btn-danger"
-              onClick={async () => {
-                try {
-                  await mountDeleteCredentials(props.credentialKey);
-                  setHasStored(false);
-                  setStatus("Credentials removed");
-                } catch (e) {
-                  setStatus("Failed to remove: " + e);
-                }
-              }}
-            >Remove</button>
-          </Show>
-          <Show when={hasStored() === false}>
-            <span class="mount-cred-badge mount-cred-missing">No credentials stored</span>
-          </Show>
-        </Show>
+    <div class="mount-editor" style={{ "margin-top": "var(--spacing-sm)" }}>
+      <label class="settings-field">
+        <span>Credential Name</span>
+        <input
+          type="text"
+          value={name()}
+          placeholder="primary-nas"
+          disabled={props.nameReadOnly}
+          onInput={(e) => setName(e.currentTarget.value.replace(/\s+/g, "-").toLowerCase())}
+        />
+      </label>
+      <div class="mount-editor-row">
+        <label class="settings-field" style={{ flex: 1 }}>
+          <span>Username</span>
+          <input
+            type="text"
+            value={username()}
+            placeholder="admin"
+            onInput={(e) => setUsername(e.currentTarget.value)}
+          />
+        </label>
+        <label class="settings-field" style={{ flex: 1 }}>
+          <span>Password</span>
+          <input
+            type="password"
+            value={password()}
+            placeholder="password"
+            onInput={(e) => setPassword(e.currentTarget.value)}
+          />
+        </label>
       </div>
-      <Show when={props.credentialKey && hasStored() !== true}>
-        <div class="mount-editor-row">
-          <label class="settings-field" style={{ flex: 1 }}>
-            <span>Username</span>
-            <input
-              type="text"
-              value={username()}
-              placeholder="admin"
-              onInput={(e) => setUsername(e.currentTarget.value)}
-            />
-          </label>
-          <label class="settings-field" style={{ flex: 1 }}>
-            <span>Password</span>
-            <input
-              type="password"
-              value={password()}
-              placeholder="password"
-              onInput={(e) => setPassword(e.currentTarget.value)}
-            />
-          </label>
-        </div>
+      <div class="mount-editor-actions">
+        <button class="settings-btn" onClick={props.onCancel}>Cancel</button>
         <button
-          class="settings-btn"
-          disabled={!username() || !password()}
-          onClick={async () => {
-            try {
-              await mountStoreCredentials(props.credentialKey, username(), password());
-              setHasStored(true);
-              setUsername("");
-              setPassword("");
-              setStatus("Credentials saved");
-            } catch (e) {
-              setStatus("Failed to save: " + e);
-            }
-          }}
-        >Save Credentials</button>
-      </Show>
-      <Show when={status()}>
-        <span class="settings-help-text">{status()}</span>
-      </Show>
+          class="settings-btn settings-btn-primary"
+          disabled={!name() || !username() || !password()}
+          onClick={() => props.onSave(name(), username(), password())}
+        >Save</button>
+      </div>
     </div>
   );
 }
@@ -579,7 +532,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                     </div>
 
                     <p class="settings-hint" style={{ "margin-top": "var(--spacing-sm)" }}>
-                      Mounts to <code>~/.local/share/ufb/mnt/{mountShare() || "<share>"}/</code>. Requires <code>cifs-utils</code> package.
+                      Mounts to <code>/media/$USER/ufb/{mountShare() || "<share>"}/</code>. Requires <code>cifs-utils</code> package.
                     </p>
                   </div>
                 </Show>
@@ -711,6 +664,7 @@ function defaultMountConfig(): MountConfig {
     mountDriveLetter: "",
     smbMountPath: "",
     mountPathLinux: "",
+    isJobsFolder: true,
   };
 }
 
@@ -723,23 +677,82 @@ function MountsSection(props: {
   const [isNew, setIsNew] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<string | null>(null);
 
+  // ── Saved credentials ──
+  const [savedCreds, setSavedCreds] = createSignal<CredentialInfo[]>([]);
+  const [credFormMode, setCredFormMode] = createSignal<"add" | "edit" | null>(null);
+  const [editingCredKey, setEditingCredKey] = createSignal<string>("");
+  const [editingCredUsername, setEditingCredUsername] = createSignal<string>("");
+  const [confirmDeleteCred, setConfirmDeleteCred] = createSignal<string | null>(null);
+  const [credSectionOpen, setCredSectionOpen] = createSignal(false);
+
+  // ── Inline credential form from mount editor (+ New credential...) ──
+  const [showInlineCred, setShowInlineCred] = createSignal(false);
+
+  async function refreshCreds() {
+    try {
+      const creds = await mountListCredentialKeys();
+      setSavedCreds(creds);
+    } catch (e) {
+      console.error("Failed to list credentials:", e);
+    }
+  }
+
+  onMount(() => refreshCreds());
+
   function startAdd() {
     setEditingMount(defaultMountConfig());
     setIsNew(true);
+    setShowInlineCred(false);
   }
 
   function startEdit(cfg: MountConfig) {
     setEditingMount({ ...cfg });
     setIsNew(false);
+    setShowInlineCred(false);
   }
 
   function cancelEdit() {
     setEditingMount(null);
+    setShowInlineCred(false);
   }
 
-  async function saveMount() {
+  // ── Validation ──
+  const saveDisabled = createMemo(() => {
     const m = editingMount();
-    if (!m || !m.id.trim() || !m.nasSharePath.trim()) return;
+    if (!m) return true;
+    if (!m.id.trim()) return true;
+    if (!m.nasSharePath.trim()) return true;
+    // Duplicate ID check (only when adding new)
+    if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id)) return true;
+    // Duplicate drive letter (Windows, excluding self when editing)
+    if (props.platform() === "win" && m.mountDriveLetter) {
+      const dup = props.mountConfig().mounts.some(
+        (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
+      );
+      if (dup) return true;
+    }
+    return false;
+  });
+
+  const saveHint = createMemo(() => {
+    const m = editingMount();
+    if (!m) return "";
+    if (!m.id.trim()) return "Mount ID is required";
+    if (!m.nasSharePath.trim()) return "NAS share path is required";
+    if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id))
+      return "A mount with this ID already exists";
+    if (props.platform() === "win" && m.mountDriveLetter) {
+      const dup = props.mountConfig().mounts.some(
+        (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
+      );
+      if (dup) return `Drive letter ${m.mountDriveLetter}: is already used by another mount`;
+    }
+    return "";
+  });
+
+  async function saveMount() {
+    if (saveDisabled()) return;
+    const m = editingMount()!;
 
     const cfg = props.mountConfig();
     let mounts: MountConfig[];
@@ -752,6 +765,7 @@ function MountsSection(props: {
     props.setMountConfig(newCfg);
     await mountStore.saveConfig(newCfg);
     setEditingMount(null);
+    setShowInlineCred(false);
   }
 
   async function removeMount(id: string) {
@@ -764,7 +778,16 @@ function MountsSection(props: {
 
   function updateField<K extends keyof MountConfig>(key: K, value: MountConfig[K]) {
     const m = editingMount();
-    if (m) setEditingMount({ ...m, [key]: value });
+    if (!m) return;
+    const updated = { ...m, [key]: value };
+    // Auto-select credential when mount ID changes and no credential is selected
+    if (key === "id" && !m.credentialKey) {
+      const matchingCred = savedCreds().find((c) => c.key === value);
+      if (matchingCred) {
+        updated.credentialKey = matchingCred.key;
+      }
+    }
+    setEditingMount(updated);
   }
 
   return (
@@ -778,6 +801,84 @@ function MountsSection(props: {
           <span>{mountStore.connected ? "Connected to agent" : "Agent not connected"}</span>
         </div>
       </div>
+
+      {/* ── Saved Credentials ── */}
+      <details open={credSectionOpen()} onToggle={(e) => setCredSectionOpen((e.target as HTMLDetailsElement).open)}>
+        <summary><h3 style={{ display: "inline", cursor: "pointer" }}>Saved Credentials</h3></summary>
+        <div style={{ "margin-top": "var(--spacing-sm)" }}>
+          <Show when={savedCreds().length > 0}>
+            <For each={savedCreds()}>
+              {(cred) => (
+                <div class="mount-config-item">
+                  <div class="mount-config-header">
+                    <span class="mount-config-name">{cred.key}</span>
+                    <span class="mount-config-detail">{cred.username}</span>
+                  </div>
+                  <div class="mount-config-actions">
+                    <button class="settings-btn" onClick={() => {
+                      setCredFormMode("edit");
+                      setEditingCredKey(cred.key);
+                      setEditingCredUsername(cred.username);
+                    }}>Edit</button>
+                    <button class="settings-btn" onClick={() => setConfirmDeleteCred(cred.key)}>Delete</button>
+                  </div>
+                </div>
+              )}
+            </For>
+          </Show>
+          <Show when={savedCreds().length === 0 && credFormMode() === null}>
+            <p class="settings-hint">No saved credentials. Credentials are stored securely and referenced by name in mount configs.</p>
+          </Show>
+
+          <Show when={credFormMode() === null}>
+            <button
+              class="settings-btn"
+              style={{ "margin-top": "var(--spacing-sm)" }}
+              onClick={() => { setCredFormMode("add"); setEditingCredKey(""); setEditingCredUsername(""); }}
+            >+ Add Credential</button>
+          </Show>
+
+          <Show when={credFormMode() !== null}>
+            <InlineCredentialForm
+              initialName={credFormMode() === "edit" ? editingCredKey() : ""}
+              initialUsername={credFormMode() === "edit" ? editingCredUsername() : ""}
+              nameReadOnly={credFormMode() === "edit"}
+              onSave={async (name, username, password) => {
+                try {
+                  await mountStoreCredentials(name, username, password);
+                  await refreshCreds();
+                  setCredFormMode(null);
+                } catch (e) {
+                  console.error("Failed to save credential:", e);
+                }
+              }}
+              onCancel={() => setCredFormMode(null)}
+            />
+          </Show>
+        </div>
+      </details>
+
+      {/* Confirm delete credential */}
+      <Show when={confirmDeleteCred()}>
+        <div class="modal-overlay">
+          <div class="modal">
+            <div class="modal-title">Delete Credential</div>
+            <div class="modal-body">
+              <p>Delete credential <strong>{confirmDeleteCred()}</strong>? Any mounts using it will need a new credential.</p>
+            </div>
+            <div class="modal-actions">
+              <button class="modal-btn" onClick={() => setConfirmDeleteCred(null)}>Cancel</button>
+              <button class="modal-btn modal-btn-danger" onClick={async () => {
+                try {
+                  await mountDeleteCredentials(confirmDeleteCred()!);
+                  await refreshCreds();
+                } catch (e) { console.error("Failed to delete credential:", e); }
+                setConfirmDeleteCred(null);
+              }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      </Show>
 
       {/* Explorer drive visibility (Windows only) */}
       <Show when={props.platform() === "win" && props.mountConfig().mounts.length > 0}>
@@ -898,12 +999,24 @@ function MountsSection(props: {
               </label>
             </div>
 
+            <div class="settings-row">
+              <label class="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={m().isJobsFolder}
+                  onChange={(e) => updateField("isJobsFolder", e.currentTarget.checked)}
+                />
+                <span>Jobs Folder</span>
+              </label>
+              <span class="settings-hint-inline">Subfolders appear as subscribable jobs</span>
+            </div>
+
             <h3>Network</h3>
 
             <div class="settings-field">
               <div class="settings-field-header">
                 <span>NAS Share Path</span>
-                <span class="settings-help" title="UNC path to the network share, e.g. \\\\nas\\media">?</span>
+                <span class="settings-help" title="UNC path to the network share, e.g. \\\\nas\\media or \\\\nas\\media\\projects">?</span>
               </div>
               <SettingsInput
                 value={m().nasSharePath}
@@ -912,19 +1025,48 @@ function MountsSection(props: {
               />
             </div>
 
-            <label class="settings-field">
+            <div class="settings-field">
               <div class="settings-field-header">
-                <span>Credential Key</span>
-                <span class="settings-help" title={props.platform() === "lin" ? "Key used to store/retrieve NAS credentials in the system keyring (Secret Service)" : "Key used to store/retrieve NAS credentials in Windows Credential Manager"}>?</span>
+                <span>Credential</span>
+                <span class="settings-help" title="Select a saved credential for NAS authentication. Credentials are managed in the Saved Credentials section above.">?</span>
               </div>
-              <SettingsInput
-                value={m().credentialKey}
-                placeholder="mediamount_primary-nas"
-                onCommit={(v) => updateField("credentialKey", v)}
-              />
-            </label>
-
-            <MountCredentialEditor credentialKey={m().credentialKey} />
+              <Show when={!showInlineCred()}>
+                <select
+                  class="settings-select"
+                  value={m().credentialKey}
+                  onChange={(e) => {
+                    const val = e.currentTarget.value;
+                    if (val === "__new__") {
+                      setShowInlineCred(true);
+                    } else {
+                      updateField("credentialKey", val);
+                    }
+                  }}
+                >
+                  <option value="">(none)</option>
+                  <For each={savedCreds()}>
+                    {(cred) => <option value={cred.key}>{cred.key} ({cred.username})</option>}
+                  </For>
+                  <option value="__new__">+ New credential...</option>
+                </select>
+              </Show>
+              <Show when={showInlineCred()}>
+                <InlineCredentialForm
+                  initialName={m().id || ""}
+                  onSave={async (name, username, password) => {
+                    try {
+                      await mountStoreCredentials(name, username, password);
+                      await refreshCreds();
+                      updateField("credentialKey", name);
+                      setShowInlineCred(false);
+                    } catch (e) {
+                      console.error("Failed to save credential:", e);
+                    }
+                  }}
+                  onCancel={() => setShowInlineCred(false)}
+                />
+              </Show>
+            </div>
 
             {/* Drive letter — Windows only */}
             <Show when={props.platform() === "win"}>
@@ -950,7 +1092,7 @@ function MountsSection(props: {
                   Advanced: override auto-derived mount paths
                 </summary>
                 <p class="settings-hint">
-                  Paths are auto-derived from the mount ID (~/.local/share/ufb/mnt/). Only set these if you need custom locations.
+                  Paths are auto-derived from the mount ID (/media/$USER/ufb/). Only set these if you need custom locations.
                 </p>
 
                 <label class="settings-field">
@@ -973,12 +1115,16 @@ function MountsSection(props: {
               </details>
             </Show>
 
+            <Show when={saveHint()}>
+              <p class="settings-hint" style={{ color: "var(--warning)" }}>{saveHint()}</p>
+            </Show>
+
             <div class="mount-editor-actions">
               <button class="settings-btn" onClick={cancelEdit}>Cancel</button>
               <button
                 class="settings-btn settings-btn-primary"
                 onClick={saveMount}
-                disabled={!m().id.trim() || !m().nasSharePath.trim()}
+                disabled={saveDisabled()}
               >
                 {isNew() ? "Add" : "Save"}
               </button>

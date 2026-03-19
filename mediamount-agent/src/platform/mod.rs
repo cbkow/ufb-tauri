@@ -24,7 +24,8 @@ pub trait DriveMapping: Send + Sync {
 /// Trait for establishing SMB sessions (no drive letter mapping).
 pub trait SmbSession: Send + Sync {
     /// Ensure an authenticated SMB session exists for the given share.
-    fn ensure_session(&self, share_path: &str, username: &str, password: &str) -> Result<(), String>;
+    /// `mount_point` is used on Linux for the CIFS mount target; ignored on Windows.
+    fn ensure_session(&self, share_path: &str, mount_point: &str, username: &str, password: &str) -> Result<(), String>;
 }
 
 /// Trait for credential storage.

@@ -84,6 +84,8 @@ pub struct MountConfig {
     pub smb_mount_path: Option<String>,
     #[serde(default)]
     pub mount_path_linux: Option<String>,
+    #[serde(default = "default_true")]
+    pub is_jobs_folder: bool,
 
     // Legacy fields — kept for backwards compat with existing config files
     #[serde(default)]

@@ -50,10 +50,16 @@ export function FileBrowser(props: FileBrowserProps) {
       (b) => b.isProjectFolder && b.path.replace(/[\\/]+$/, "").toLowerCase() === normalized
     );
     if (isBookmarkProject) return true;
-    // Mount drive letters are always treated as Jobs folders
-    return mountStore.configs.some(
-      (c) => c.mountDriveLetter && (c.mountDriveLetter + ":").toLowerCase() === normalized
-    );
+    // Check mount configs where isJobsFolder is true
+    return mountStore.configs.some((c) => {
+      if (!c.isJobsFolder) return false;
+      // Windows: match drive letter
+      if (c.mountDriveLetter && (c.mountDriveLetter + ":").toLowerCase() === normalized) return true;
+      // Linux/macOS: match mount path
+      const mp = mountStore.getMountPath(c);
+      if (mp && mp.replace(/\/+$/, "").toLowerCase() === normalized) return true;
+      return false;
+    });
   });
 
   // ── Set of subscribed job paths for quick lookup ──

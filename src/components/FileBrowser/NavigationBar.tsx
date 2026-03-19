@@ -22,10 +22,27 @@ export function NavigationBar(props: NavigationBarProps) {
     const sep = path.includes("/") ? "/" : "\\";
     const parts = path.split(sep).filter(Boolean);
     const segments: { label: string; path: string }[] = [];
-    let cumulative = "";
+
+    // Determine the root prefix that split+filter strips away:
+    // Linux/macOS: "/" → prefix "/"
+    // Windows drive: "C:\..." → no prefix (drive letter handles it)
+    // UNC: "\\server\share" → prefix "\\"
+    let prefix = "";
+    if (sep === "/" && path.startsWith("/")) {
+      prefix = "/";
+    } else if (sep === "\\" && path.startsWith("\\\\")) {
+      prefix = "\\\\";
+    }
+
+    let cumulative = prefix;
     for (const part of parts) {
-      cumulative += (cumulative && !cumulative.endsWith(sep) ? sep : "") + part;
+      if (cumulative === prefix) {
+        cumulative += part;
+      } else {
+        cumulative += sep + part;
+      }
       let segPath = cumulative;
+      // Windows drive root needs trailing backslash (e.g. "C:\")
       if (segments.length === 0 && part.endsWith(":")) {
         segPath += sep;
       }

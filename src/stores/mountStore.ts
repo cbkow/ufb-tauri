@@ -25,6 +25,7 @@ export interface MountConfig {
   mountDriveLetter: string;
   smbMountPath?: string;
   mountPathLinux?: string;
+  isJobsFolder: boolean;
 }
 
 export interface MountsConfig {

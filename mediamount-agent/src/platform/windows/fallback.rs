@@ -14,6 +14,7 @@ impl SmbSession for WindowsSmbSession {
     fn ensure_session(
         &self,
         share_path: &str,
+        _mount_point: &str,
         username: &str,
         password: &str,
     ) -> Result<(), String> {

@@ -92,7 +92,7 @@ mod windows_tray {
     const TRAY_ICON_ID: u32 = 1;
 
     // Menu item IDs
-    const IDM_RESTART: u32 = 1001;
+    const IDM_RESTART_BASE: u32 = 1000; // 1000 + mount_index for per-mount restart
     const IDM_OPEN_UFB: u32 = 2001;
     const IDM_OPEN_LOG: u32 = 2002;
     const IDM_TOGGLE_AUTOSTART: u32 = 2003;
@@ -100,8 +100,7 @@ mod windows_tray {
 
     struct TrayState {
         cmd_tx: mpsc::Sender<TrayCommand>,
-        mount_id: Option<String>,
-        status_text: String,
+        mounts: std::collections::HashMap<String, crate::messages::MountStateUpdateMsg>,
     }
 
     // SAFETY: TrayState is only mutated from the tray thread via the message pump.
@@ -192,8 +191,7 @@ mod windows_tray {
                 let mut lock = get_tray_state().lock().unwrap();
                 *lock = Some(TrayState {
                     cmd_tx,
-                    mount_id: None,
-                    status_text: "Initializing...".into(),
+                    mounts: std::collections::HashMap::new(),
                 });
             }
 
@@ -254,25 +252,37 @@ mod windows_tray {
                     }
 
                     // Drain state updates
+                    let mut changed = false;
                     while let Ok(msg) = receivers.0.try_recv() {
                         if let AgentToUfb::MountStateUpdate(update) = msg {
                             let mut lock = get_tray_state().lock().unwrap();
                             if let Some(ref mut state) = *lock {
-                                state.mount_id = Some(update.mount_id.clone());
-                                state.status_text = update.state_detail.clone();
-
-                                // Update tooltip
-                                let tip = format!("MediaMount — {}", update.state_detail);
-                                let mut nid = NOTIFYICONDATAW {
-                                    cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                                    hWnd: hwnd,
-                                    uID: TRAY_ICON_ID,
-                                    uFlags: NIF_TIP,
-                                    ..Default::default()
-                                };
-                                set_tooltip(&mut nid, &tip);
-                                let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+                                state.mounts.insert(update.mount_id.clone(), update);
+                                changed = true;
                             }
+                        }
+                    }
+                    if changed {
+                        let lock = get_tray_state().lock().unwrap();
+                        if let Some(ref state) = *lock {
+                            let total = state.mounts.len();
+                            let mounted = state.mounts.values().filter(|m| m.state == "mounted").count();
+                            let tip = if total == 0 {
+                                "MediaMount".to_string()
+                            } else if mounted == total {
+                                format!("MediaMount — all mounted ({}/{})", mounted, total)
+                            } else {
+                                format!("MediaMount — {}/{} mounted", mounted, total)
+                            };
+                            let mut nid = NOTIFYICONDATAW {
+                                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                                hWnd: hwnd,
+                                uID: TRAY_ICON_ID,
+                                uFlags: NIF_TIP,
+                                ..Default::default()
+                            };
+                            set_tooltip(&mut nid, &tip);
+                            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
                         }
                     }
                 }
@@ -302,16 +312,27 @@ mod windows_tray {
         append_menu_item(menu, 0, "MediaMount", MF_DISABLED | MF_GRAYED);
         AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
 
-        // Status
-        append_menu_item(menu, 0, &state.status_text, MF_DISABLED | MF_GRAYED);
+        // Per-mount status + restart
+        if state.mounts.is_empty() {
+            append_menu_item(menu, 0, "No mounts configured", MF_DISABLED | MF_GRAYED);
+        } else {
+            // Store mount IDs in order for IDM_RESTART_BASE offset
+            let mut mount_ids: Vec<&String> = state.mounts.keys().collect();
+            mount_ids.sort();
+            for (i, mount_id) in mount_ids.iter().enumerate() {
+                if let Some(ms) = state.mounts.get(*mount_id) {
+                    let icon = if ms.state == "mounted" { "\u{25CF}" } else { "\u{2715}" };
+                    let label = format!("{} {} {}", ms.mount_id, icon, ms.state_detail);
+                    append_menu_item(menu, 0, &label, MF_DISABLED | MF_GRAYED);
+                    // Restart button for this mount (base ID + index)
+                    let restart_id = IDM_RESTART_BASE + i as u32;
+                    let restart_label = format!("  Restart {}", ms.mount_id);
+                    append_menu_item(menu, restart_id, &restart_label, MF_STRING);
+                }
+            }
+        }
 
         AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
-
-        // Mount controls
-        if state.mount_id.is_some() {
-            append_menu_item(menu, IDM_RESTART, "Restart", MF_STRING);
-            AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
-        }
 
         append_menu_item(menu, IDM_OPEN_UFB, "Open UFB", MF_STRING);
         append_menu_item(menu, IDM_OPEN_LOG, "Open log", MF_STRING);
@@ -409,10 +430,6 @@ mod windows_tray {
         };
 
         let cmd = match cmd_id {
-            IDM_RESTART => state
-                .mount_id
-                .as_ref()
-                .map(|id| TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::Restart)),
             IDM_OPEN_UFB => Some(TrayCommand::OpenUfb),
             IDM_OPEN_LOG => Some(TrayCommand::OpenLog),
             IDM_TOGGLE_AUTOSTART => {
@@ -420,9 +437,17 @@ mod windows_tray {
                 if let Err(e) = crate::platform::set_auto_start(!currently_enabled) {
                     log::error!("Failed to toggle auto-start: {}", e);
                 }
-                None // No command needed back to tokio
+                None
             }
             IDM_QUIT => Some(TrayCommand::Quit),
+            id if id >= IDM_RESTART_BASE && id < IDM_RESTART_BASE + 100 => {
+                let index = (id - IDM_RESTART_BASE) as usize;
+                let mut mount_ids: Vec<&String> = state.mounts.keys().collect();
+                mount_ids.sort();
+                mount_ids.get(index).map(|mid| {
+                    TrayCommand::MountEvent((*mid).clone(), crate::state::MountEvent::Restart)
+                })
+            }
             _ => None,
         };
 
@@ -447,15 +472,17 @@ mod linux_tray {
         mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         use tray_icon::TrayIconBuilder;
-        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent};
+        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent, IsMenuItem};
 
         // Initialize GTK (required by tray-icon on Linux)
         gtk::init().expect("Failed to init GTK for tray");
 
-        // Build menu
+        // Build menu. Mount items are inserted dynamically between
+        // mount_insert_pos (after the title separator) and the bottom section.
         let menu = Menu::new();
-        let item_status = MenuItem::new("Initializing...", false, None);
-        let item_restart = MenuItem::new("Restart", true, None);
+        let item_title = MenuItem::new("MediaMount", false, None);
+        let sep_top = PredefinedMenuItem::separator();
+        let sep_mounts = PredefinedMenuItem::separator();
         let item_open_ufb = MenuItem::new("Open UFB", true, None);
         let item_open_log = MenuItem::new("Open log", true, None);
         let item_autostart = MenuItem::new(
@@ -465,17 +492,20 @@ mod linux_tray {
         );
         let item_quit = MenuItem::new("Quit", true, None);
 
-        let _ = menu.append(&item_status);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&item_restart);
-        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_title);
+        let _ = menu.append(&sep_top);
+        // mount items go here (index 2+)
+        let _ = menu.append(&sep_mounts);
         let _ = menu.append(&item_open_ufb);
         let _ = menu.append(&item_open_log);
         let _ = menu.append(&item_autostart);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&item_quit);
 
-        // Try to load icon
+        // Keep a clone — muda Menu uses interior mutability so both
+        // the tray and our loop see the same underlying menu.
+        let menu_handle = menu.clone();
+
         let icon = load_icon();
 
         let _tray = match TrayIconBuilder::new()
@@ -493,36 +523,78 @@ mod linux_tray {
 
         log::info!("Linux tray icon created");
 
-        let mut mount_id: Option<String> = None;
+        let mut mounts: std::collections::HashMap<String, crate::messages::MountStateUpdateMsg> =
+            std::collections::HashMap::new();
+
+        // Per-mount menu items keyed by mount_id: (status_item, restart_item)
+        let mut mount_items: Vec<(String, MenuItem, MenuItem)> = Vec::new();
+        // Position in the menu where mount items start (after title + sep_top)
+        const MOUNT_INSERT_BASE: usize = 2;
+
         let menu_event_rx = MenuEvent::receiver();
 
-        // GTK main loop — poll for events
         loop {
-            // Process GTK events
             while gtk::events_pending() {
                 gtk::main_iteration_do(false);
             }
 
-            // Check for cancellation
             if let Ok(()) = cancel_rx.try_recv() {
                 break;
             }
 
             // Drain state updates
+            let mut changed = false;
             while let Ok(msg) = state_rx.try_recv() {
                 if let AgentToUfb::MountStateUpdate(update) = msg {
-                    mount_id = Some(update.mount_id.clone());
-                    item_status.set_text(&update.state_detail);
+                    mounts.insert(update.mount_id.clone(), update);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                // Update tooltip
+                let total = mounts.len();
+                let mounted_count = mounts.values().filter(|m| m.state == "mounted").count();
+                let tip = if total == 0 {
+                    "MediaMount".to_string()
+                } else if mounted_count == total {
+                    format!("MediaMount \u{2014} all mounted ({}/{})", mounted_count, total)
+                } else {
+                    format!("MediaMount \u{2014} {}/{} mounted", mounted_count, total)
+                };
+                let _ = _tray.set_tooltip(Some(&tip));
+
+                // Update or create per-mount menu items
+                let mut sorted_ids: Vec<String> = mounts.keys().cloned().collect();
+                sorted_ids.sort();
+
+                for mount_id in &sorted_ids {
+                    let ms = &mounts[mount_id];
+                    let dot = if ms.state == "mounted" { "\u{25CF}" } else { "\u{2715}" };
+                    let label = format!("{} {} {}", ms.mount_id, dot, ms.state_detail);
+
+                    if let Some(entry) = mount_items.iter().find(|(id, _, _)| id == mount_id) {
+                        // Update existing
+                        entry.1.set_text(&label);
+                    } else {
+                        // Create new items and insert into menu
+                        let status_item = MenuItem::new(&label, false, None);
+                        let restart_item = MenuItem::new(&format!("  Restart {}", mount_id), true, None);
+
+                        // Insert before the mounts separator. Each mount adds 2 items,
+                        // so the position grows as we add more.
+                        let pos = MOUNT_INSERT_BASE + mount_items.len() * 2;
+                        let _ = menu_handle.insert(&status_item as &dyn IsMenuItem, pos);
+                        let _ = menu_handle.insert(&restart_item as &dyn IsMenuItem, pos + 1);
+
+                        mount_items.push((mount_id.clone(), status_item, restart_item));
+                    }
                 }
             }
 
             // Process menu events
             if let Ok(event) = menu_event_rx.try_recv() {
-                let cmd = if event.id == item_restart.id() {
-                    mount_id.as_ref().map(|id| {
-                        TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::Restart)
-                    })
-                } else if event.id == item_open_ufb.id() {
+                let cmd = if event.id == item_open_ufb.id() {
                     Some(TrayCommand::OpenUfb)
                 } else if event.id == item_open_log.id() {
                     Some(TrayCommand::OpenLog)
@@ -538,7 +610,12 @@ mod linux_tray {
                 } else if event.id == item_quit.id() {
                     Some(TrayCommand::Quit)
                 } else {
-                    None
+                    // Check per-mount restart items
+                    mount_items.iter()
+                        .find(|(_, _, restart)| event.id == restart.id())
+                        .map(|(mount_id, _, _)| {
+                            TrayCommand::MountEvent(mount_id.clone(), crate::state::MountEvent::Restart)
+                        })
                 };
 
                 if let Some(cmd) = cmd {
@@ -546,7 +623,6 @@ mod linux_tray {
                 }
             }
 
-            // Sleep briefly to avoid busy-polling
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 

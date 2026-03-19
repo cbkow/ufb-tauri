@@ -37,6 +37,10 @@ pub struct MountConfig {
     #[serde(default)]
     pub mount_path_linux: Option<String>,
 
+    /// Whether subfolders of this mount are treated as subscribable jobs (default true)
+    #[serde(default = "default_true")]
+    pub is_jobs_folder: bool,
+
     // ── Legacy fields — kept for backwards compat with existing config files ──
 
     /// Legacy: rclone drive letter (no longer used, silently ignored)
@@ -98,6 +102,7 @@ pub struct MountConfig {
 
 impl MountConfig {
     /// Base directory for auto-derived mount paths on Linux.
+    /// Uses ~/.local/share/ufb/mnt/ which is user-writable without root.
     #[cfg(not(windows))]
     fn linux_mnt_base(&self) -> std::path::PathBuf {
         let base = if let Some(home) = std::env::var_os("HOME") {
@@ -111,7 +116,7 @@ impl MountConfig {
 
     /// The path apps use to access the mount.
     /// Windows: "M:\\" (drive letter).
-    /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
+    /// Linux: mount_path_linux, or auto-derived /media/$USER/ufb/<id>
     pub fn mount_path(&self) -> String {
         #[cfg(windows)]
         {
@@ -127,7 +132,7 @@ impl MountConfig {
     }
 
     /// The path where SMB is mounted on Linux.
-    /// Auto-derived to ~/.local/share/ufb/mnt/<id>-smb if not set.
+    /// Auto-derived to /media/$USER/ufb/<id>-smb if not set.
     #[cfg(not(windows))]
     pub fn smb_target_path(&self) -> String {
         if let Some(ref p) = self.smb_mount_path {
@@ -230,6 +235,7 @@ mod tests {
                 mount_drive_letter: "M".into(),
                 smb_mount_path: None,
                 mount_path_linux: None,
+                is_jobs_folder: true,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),
                 junction_path: String::new(),
@@ -275,6 +281,7 @@ mod tests {
                 mount_drive_letter: "M".into(),
                 smb_mount_path: None,
                 mount_path_linux: None,
+                is_jobs_folder: true,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),
                 junction_path: String::new(),

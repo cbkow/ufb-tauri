@@ -200,13 +200,13 @@ impl Orchestrator {
             {
                 use crate::platform::SmbSession;
                 let smb = crate::platform::windows::WindowsSmbSession::new();
-                smb.ensure_session(&self.config.nas_share_path, &username, &password)
+                smb.ensure_session(&self.config.nas_share_path, "", &username, &password)
             }
             #[cfg(target_os = "linux")]
             {
                 use crate::platform::SmbSession;
                 let smb = crate::platform::linux::LinuxSmbSession::new();
-                smb.ensure_session(&self.config.nas_share_path, &username, &password)
+                smb.ensure_session(&self.config.nas_share_path, &self.config.smb_target_path(), &username, &password)
             }
             #[cfg(not(any(windows, target_os = "linux")))]
             Err::<(), String>("SMB not supported on this platform".into())

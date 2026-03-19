@@ -221,6 +221,7 @@ pub fn run() {
             commands::mount_save_config,
             commands::mount_get_config,
             commands::mount_launch_agent,
+            commands::mount_list_credential_keys,
             commands::mount_store_credentials,
             commands::mount_has_credentials,
             commands::mount_delete_credentials,

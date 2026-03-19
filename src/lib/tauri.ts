@@ -261,6 +261,14 @@ export const mountGetConfig = () =>
 export const mountLaunchAgent = () =>
   invoke<void>("mount_launch_agent");
 
+export interface CredentialInfo {
+  key: string;
+  username: string;
+}
+
+export const mountListCredentialKeys = () =>
+  invoke<CredentialInfo[]>("mount_list_credential_keys");
+
 export const mountStoreCredentials = (key: string, username: string, password: string) =>
   invoke<void>("mount_store_credentials", { key, username, password });
 

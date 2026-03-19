@@ -1324,6 +1324,101 @@ pub fn create_date_prefixed_item(
 
 // ── Mount (MediaMount Agent) ──
 
+/// Credential info returned by mount_list_credential_keys (never includes passwords).
+#[derive(serde::Serialize)]
+pub struct CredentialInfo {
+    pub key: String,
+    pub username: String,
+}
+
+const CRED_PREFIX: &str = "mediamount_";
+
+/// Ensure a credential key has the mediamount_ prefix.
+fn normalize_cred_key(key: &str) -> String {
+    if key.starts_with(CRED_PREFIX) {
+        key.to_string()
+    } else {
+        format!("{}{}", CRED_PREFIX, key)
+    }
+}
+
+/// Strip the mediamount_ prefix for display.
+fn strip_cred_prefix(key: &str) -> String {
+    key.strip_prefix(CRED_PREFIX).unwrap_or(key).to_string()
+}
+
+#[tauri::command]
+pub fn mount_list_credential_keys() -> Result<Vec<CredentialInfo>, String> {
+    #[cfg(windows)]
+    {
+        list_credential_keys_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        let cred_path = if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(".local/share/ufb/credentials.json")
+        } else {
+            return Ok(vec![]);
+        };
+        let data: std::collections::HashMap<String, serde_json::Value> =
+            std::fs::read_to_string(&cred_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+        let mut results = Vec::new();
+        for (key, val) in &data {
+            if key.starts_with(CRED_PREFIX) {
+                let username = val.get("u").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                results.push(CredentialInfo {
+                    key: strip_cred_prefix(key),
+                    username,
+                });
+            }
+        }
+        results.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(results)
+    }
+}
+
+#[cfg(windows)]
+fn list_credential_keys_windows() -> Result<Vec<CredentialInfo>, String> {
+    use windows::Win32::Security::Credentials::{
+        CredEnumerateW, CredFree, CREDENTIALW, CRED_ENUMERATE_FLAGS,
+    };
+
+    let filter: Vec<u16> = "mediamount_*\0".encode_utf16().collect();
+    let mut count: u32 = 0;
+    let mut creds_ptr: *mut *mut CREDENTIALW = std::ptr::null_mut();
+
+    let result = unsafe {
+        CredEnumerateW(
+            windows::core::PCWSTR(filter.as_ptr()),
+            CRED_ENUMERATE_FLAGS(0),
+            &mut count,
+            &mut creds_ptr,
+        )
+    };
+
+    match result {
+        Ok(()) => {
+            let mut results = Vec::new();
+            for i in 0..count as isize {
+                let cred = unsafe { &**creds_ptr.offset(i) };
+                let target = unsafe { cred.TargetName.to_string() }.unwrap_or_default();
+                let username = unsafe { cred.UserName.to_string() }.unwrap_or_default();
+                results.push(CredentialInfo {
+                    key: strip_cred_prefix(&target),
+                    username,
+                });
+            }
+            unsafe { CredFree(creds_ptr as *const _) };
+            results.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(results)
+        }
+        Err(_) => Ok(vec![]), // No credentials found
+    }
+}
+
 #[tauri::command]
 pub async fn mount_get_states(
     state: State<'_, AppState>,
@@ -1423,6 +1518,7 @@ pub fn mount_store_credentials(
     username: String,
     password: String,
 ) -> Result<(), String> {
+    let key = normalize_cred_key(&key);
     #[cfg(windows)]
     {
         store_credentials_windows(&key, &username, &password)
@@ -1431,9 +1527,6 @@ pub fn mount_store_credentials(
     {
         // File-based credential store matching the agent's format
         // Stored in ~/.local/share/ufb/credentials.json (chmod 600)
-        let path = crate::utils::get_app_data_dir()
-            .parent().map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
         let cred_path = {
             let dir = if let Some(home) = std::env::var_os("HOME") {
                 std::path::PathBuf::from(home).join(".local/share/ufb")
@@ -1459,13 +1552,13 @@ pub fn mount_store_credentials(
             let _ = std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600));
         }
         log::info!("Stored credentials for key: {}", key);
-        let _ = path;
         Ok(())
     }
 }
 
 #[tauri::command]
 pub fn mount_has_credentials(key: String) -> Result<bool, String> {
+    let key = normalize_cred_key(&key);
     #[cfg(windows)]
     {
         has_credentials_windows(&key)
@@ -1488,6 +1581,7 @@ pub fn mount_has_credentials(key: String) -> Result<bool, String> {
 
 #[tauri::command]
 pub fn mount_delete_credentials(key: String) -> Result<(), String> {
+    let key = normalize_cred_key(&key);
     #[cfg(windows)]
     {
         delete_credentials_windows(&key)
