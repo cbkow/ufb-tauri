@@ -36,11 +36,6 @@ impl Orchestrator {
         self.event_tx.clone()
     }
 
-    /// Get current state.
-    pub fn state(&self) -> &MountState {
-        &self.state
-    }
-
     /// Run the orchestrator event loop. Blocks until stopped.
     pub async fn run(&mut self) {
         log::info!(
@@ -54,7 +49,6 @@ impl Orchestrator {
 
         // If mounting succeeded (no error), transition to Mounted
         if matches!(self.state, MountState::Mounting) {
-            // The effects ran successfully — emit state update to confirm mounted
             self.handle_event(MountEvent::RequestStateUpdate).await;
         }
 
@@ -107,22 +101,17 @@ impl Orchestrator {
 
     async fn dispatch_effect(&mut self, effect: Effect) {
         match effect {
-            Effect::MapDriveToSmb => {
-                #[cfg(windows)]
-                let target = self.config.nas_share_path.clone();
-                #[cfg(not(windows))]
-                let target = self.config.smb_target_path();
-                self.switch_drive_mapping(&target).await;
+            Effect::MountDrive => {
+                self.mount_drive().await;
             }
-            Effect::EnsureSmbSession => {
-                self.ensure_smb_session().await;
+            Effect::DisconnectDrive => {
+                self.disconnect_drive().await;
             }
             Effect::UpdateTray => {
                 // Tray updates are handled by the mount_service via state updates
             }
             Effect::LogEvent { level, message } => match level {
                 LogLevel::Info => log::info!("[{}] {}", self.mount_id, message),
-                LogLevel::Warn => log::warn!("[{}] {}", self.mount_id, message),
                 LogLevel::Error => log::error!("[{}] {}", self.mount_id, message),
             },
             Effect::EmitStateUpdate => {
@@ -131,94 +120,118 @@ impl Orchestrator {
         }
     }
 
-    async fn switch_drive_mapping(&mut self, target: &str) {
+    async fn mount_drive(&mut self) {
+        // Retrieve credentials
+        let (username, password) = self.retrieve_credentials().await;
+
         #[cfg(windows)]
         {
-            use crate::platform::DriveMapping;
-            let dm = crate::platform::windows::WindowsDriveMapping::new();
-            if let Err(e) = dm.switch(&self.config.mount_drive_letter, target) {
-                log::error!("[{}] Drive mapping failed: {}", self.mount_id, e);
+            // Single WNetAddConnection2W call: authenticate + map drive letter
+            let result = crate::platform::windows::fallback::connect_drive(
+                &self.config.mount_drive_letter,
+                &self.config.nas_share_path,
+                &username,
+                &password,
+            );
+            if let Err(e) = result {
+                log::error!("[{}] Mount failed: {}", self.mount_id, e);
                 let _ = self
                     .event_tx
-                    .send(MountEvent::DriveMapFailed { reason: e })
+                    .send(MountEvent::MountFailed { reason: e })
                     .await;
             }
         }
+
         #[cfg(target_os = "linux")]
         {
+            // Linux: gio mount + symlink (two-step, same as before)
+            use crate::platform::SmbSession;
+            let smb = crate::platform::linux::LinuxSmbSession::new();
+            let smb_result = smb.ensure_session(
+                &self.config.nas_share_path,
+                &self.config.smb_target_path(),
+                &username,
+                &password,
+            );
+
+            if let Err(e) = smb_result {
+                log::error!("[{}] SMB session failed: {}", self.mount_id, e);
+                let _ = self
+                    .event_tx
+                    .send(MountEvent::MountFailed { reason: e })
+                    .await;
+                return;
+            }
+
+            // Create symlink from user-facing path to SMB mount
             use crate::platform::DriveMapping;
             let dm = crate::platform::linux::LinuxMountMapping::new();
             let mount_point = self.config.mount_path();
-            if let Err(e) = dm.switch(&mount_point, target) {
+            let target = self.config.smb_target_path();
+            if let Err(e) = dm.switch(&mount_point, &target) {
                 log::error!("[{}] Mount mapping failed: {}", self.mount_id, e);
                 let _ = self
                     .event_tx
-                    .send(MountEvent::DriveMapFailed { reason: e })
+                    .send(MountEvent::MountFailed { reason: e })
                     .await;
             }
         }
     }
 
-    async fn ensure_smb_session(&mut self) {
-        let (username, password) = {
-            #[cfg(windows)]
-            {
-                use crate::platform::CredentialStore;
-                let cred_store = crate::platform::windows::WindowsCredentialStore::new();
-                match cred_store.retrieve(&self.config.credential_key) {
-                    Ok(creds) => creds,
-                    Err(e) => {
-                        log::warn!(
-                            "[{}] No credentials found for {}: {}, trying without",
-                            self.mount_id, self.config.credential_key, e
-                        );
-                        (String::new(), String::new())
-                    }
-                }
+    async fn disconnect_drive(&mut self) {
+        #[cfg(windows)]
+        {
+            if let Err(e) = crate::platform::windows::fallback::disconnect_drive(
+                &self.config.mount_drive_letter,
+            ) {
+                log::warn!("[{}] Disconnect failed (non-fatal): {}", self.mount_id, e);
             }
-            #[cfg(target_os = "linux")]
-            {
-                use crate::platform::CredentialStore;
-                let cred_store = crate::platform::linux::LinuxCredentialStore::new();
-                match cred_store.retrieve(&self.config.credential_key) {
-                    Ok(creds) => creds,
-                    Err(e) => {
-                        log::warn!(
-                            "[{}] No credentials found for {}: {}, trying without",
-                            self.mount_id, self.config.credential_key, e
-                        );
-                        (String::new(), String::new())
-                    }
-                }
-            }
-            #[cfg(not(any(windows, target_os = "linux")))]
-            { (String::new(), String::new()) }
-        };
-
-        let smb_result = {
-            #[cfg(windows)]
-            {
-                use crate::platform::SmbSession;
-                let smb = crate::platform::windows::WindowsSmbSession::new();
-                smb.ensure_session(&self.config.nas_share_path, "", &username, &password)
-            }
-            #[cfg(target_os = "linux")]
-            {
-                use crate::platform::SmbSession;
-                let smb = crate::platform::linux::LinuxSmbSession::new();
-                smb.ensure_session(&self.config.nas_share_path, &self.config.smb_target_path(), &username, &password)
-            }
-            #[cfg(not(any(windows, target_os = "linux")))]
-            Err::<(), String>("SMB not supported on this platform".into())
-        };
-
-        if let Err(e) = smb_result {
-            log::error!("[{}] SMB session failed: {}", self.mount_id, e);
-            let _ = self
-                .event_tx
-                .send(MountEvent::SmbMapFailed { reason: e })
-                .await;
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            use crate::platform::DriveMapping;
+            let dm = crate::platform::linux::LinuxMountMapping::new();
+            let mount_point = self.config.mount_path();
+            if let Err(e) = dm.remove(&mount_point) {
+                log::warn!("[{}] Remove symlink failed (non-fatal): {}", self.mount_id, e);
+            }
+        }
+    }
+
+    async fn retrieve_credentials(&self) -> (String, String) {
+        #[cfg(windows)]
+        {
+            use crate::platform::CredentialStore;
+            let cred_store = crate::platform::windows::WindowsCredentialStore::new();
+            match cred_store.retrieve(&self.config.credential_key) {
+                Ok(creds) => creds,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] No credentials found for {}: {}, trying without",
+                        self.mount_id, self.config.credential_key, e
+                    );
+                    (String::new(), String::new())
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use crate::platform::CredentialStore;
+            let cred_store = crate::platform::linux::LinuxCredentialStore::new();
+            match cred_store.retrieve(&self.config.credential_key) {
+                Ok(creds) => creds,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] No credentials found for {}: {}, trying without",
+                        self.mount_id, self.config.credential_key, e
+                    );
+                    (String::new(), String::new())
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        { (String::new(), String::new()) }
     }
 
     async fn emit_state_update(&self) {

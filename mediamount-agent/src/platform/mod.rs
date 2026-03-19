@@ -4,9 +4,8 @@ pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-/// Trait for managing drive/mount-point mappings.
-/// On Windows: drive letter mapping via DefineDosDevice.
-/// On Linux: symlink-based mount point mapping.
+/// Trait for managing mount-point mappings (Linux only).
+/// Uses symlinks to point user-facing paths to the actual CIFS mount.
 pub trait DriveMapping: Send + Sync {
     /// Map a mount point to the given target path.
     fn switch(&self, mount_point: &str, target_path: &str) -> Result<(), String>;
@@ -21,10 +20,11 @@ pub trait DriveMapping: Send + Sync {
     fn verify(&self, mount_point: &str, expected_target: &str) -> Result<bool, String>;
 }
 
-/// Trait for establishing SMB sessions (no drive letter mapping).
+/// Trait for establishing SMB sessions (Linux only).
+/// On Windows, WNetAddConnection2W handles auth + drive mapping in one call.
 pub trait SmbSession: Send + Sync {
     /// Ensure an authenticated SMB session exists for the given share.
-    /// `mount_point` is used on Linux for the CIFS mount target; ignored on Windows.
+    /// `mount_point` is the CIFS mount target path on Linux.
     fn ensure_session(&self, share_path: &str, mount_point: &str, username: &str, password: &str) -> Result<(), String>;
 }
 

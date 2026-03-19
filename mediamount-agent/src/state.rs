@@ -18,16 +18,14 @@ pub enum MountState {
 #[serde(rename_all = "snake_case")]
 pub enum MountError {
     ConfigInvalid { reason: String },
-    DriveMapFailed { reason: String },
-    SmbFailed { reason: String },
+    MountFailed { reason: String },
 }
 
 impl fmt::Display for MountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MountError::ConfigInvalid { reason } => write!(f, "invalid config: {}", reason),
-            MountError::DriveMapFailed { reason } => write!(f, "drive map failed: {}", reason),
-            MountError::SmbFailed { reason } => write!(f, "SMB failed: {}", reason),
+            MountError::MountFailed { reason } => write!(f, "mount failed: {}", reason),
         }
     }
 }
@@ -38,11 +36,9 @@ pub enum MountEvent {
     Start,
     Stop,
     Restart,
-    ConfigReloaded,
 
     // Platform errors
-    DriveMapFailed { reason: String },
-    SmbMapFailed { reason: String },
+    MountFailed { reason: String },
 
     // State query
     RequestStateUpdate,
@@ -50,8 +46,13 @@ pub enum MountEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    MapDriveToSmb,
-    EnsureSmbSession,
+    /// Connect and map the drive (single operation per platform).
+    /// Windows: WNetAddConnection2W with drive letter.
+    /// Linux: gio mount + symlink.
+    MountDrive,
+    /// Disconnect the drive before remounting or stopping.
+    /// Windows: WNetCancelConnection2W. Linux: remove symlink.
+    DisconnectDrive,
     UpdateTray,
     LogEvent { level: LogLevel, message: String },
     EmitStateUpdate,
@@ -60,7 +61,6 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogLevel {
     Info,
-    Warn,
     Error,
 }
 
@@ -77,8 +77,7 @@ pub fn transition(
         (Initializing, Start) => (
             Mounting,
             vec![
-                Effect::EnsureSmbSession,
-                Effect::MapDriveToSmb,
+                Effect::MountDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "mounting SMB share".into(),
@@ -88,7 +87,6 @@ pub fn transition(
         ),
 
         // ── Mounting ──
-        // SMB session + drive map succeeded (dispatched by orchestrator after effects)
         (Mounting, RequestStateUpdate) => (
             Mounted,
             vec![
@@ -100,27 +98,14 @@ pub fn transition(
                 Effect::EmitStateUpdate,
             ],
         ),
-        (Mounting, SmbMapFailed { reason }) => (
-            Error(MountError::SmbFailed {
+        (Mounting, MountFailed { reason }) => (
+            Error(MountError::MountFailed {
                 reason: reason.clone(),
             }),
             vec![
                 Effect::LogEvent {
                     level: LogLevel::Error,
-                    message: format!("SMB mount failed: {}", reason),
-                },
-                Effect::UpdateTray,
-                Effect::EmitStateUpdate,
-            ],
-        ),
-        (Mounting, DriveMapFailed { reason }) => (
-            Error(MountError::DriveMapFailed {
-                reason: reason.clone(),
-            }),
-            vec![
-                Effect::LogEvent {
-                    level: LogLevel::Error,
-                    message: format!("drive map failed: {}", reason),
+                    message: format!("mount failed: {}", reason),
                 },
                 Effect::UpdateTray,
                 Effect::EmitStateUpdate,
@@ -131,8 +116,8 @@ pub fn transition(
         (Mounted, Restart) => (
             Mounting,
             vec![
-                Effect::EnsureSmbSession,
-                Effect::MapDriveToSmb,
+                Effect::DisconnectDrive,
+                Effect::MountDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "restart requested".into(),
@@ -143,6 +128,7 @@ pub fn transition(
         (Mounted, Stop) => (
             Stopped,
             vec![
+                Effect::DisconnectDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "mount stopped".into(),
@@ -156,8 +142,8 @@ pub fn transition(
         (Error(_), Start) | (Error(_), Restart) => (
             Mounting,
             vec![
-                Effect::EnsureSmbSession,
-                Effect::MapDriveToSmb,
+                Effect::DisconnectDrive,
+                Effect::MountDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "retrying from error state".into(),
@@ -170,8 +156,7 @@ pub fn transition(
         (Stopped, Start) => (
             Mounting,
             vec![
-                Effect::EnsureSmbSession,
-                Effect::MapDriveToSmb,
+                Effect::MountDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "starting from stopped state".into(),
@@ -190,6 +175,7 @@ pub fn transition(
         (_, Stop) => (
             Stopped,
             vec![
+                Effect::DisconnectDrive,
                 Effect::LogEvent {
                     level: LogLevel::Info,
                     message: "mount stopped".into(),
@@ -227,8 +213,7 @@ mod tests {
     fn test_init_to_mounting() {
         let (state, effects) = transition(MountState::Initializing, MountEvent::Start);
         assert!(matches!(state, MountState::Mounting));
-        assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::MapDriveToSmb));
+        assert!(effects.contains(&Effect::MountDrive));
         assert!(effects.contains(&Effect::EmitStateUpdate));
     }
 
@@ -241,32 +226,33 @@ mod tests {
     }
 
     #[test]
-    fn test_mounting_smb_failed() {
+    fn test_mounting_failed() {
         let (state, _effects) = transition(
             MountState::Mounting,
-            MountEvent::SmbMapFailed { reason: "network error".into() },
+            MountEvent::MountFailed { reason: "network error".into() },
         );
-        assert!(matches!(state, MountState::Error(MountError::SmbFailed { .. })));
+        assert!(matches!(state, MountState::Error(MountError::MountFailed { .. })));
     }
 
     #[test]
     fn test_mounted_restart() {
         let (state, effects) = transition(MountState::Mounted, MountEvent::Restart);
         assert!(matches!(state, MountState::Mounting));
-        assert!(effects.contains(&Effect::EnsureSmbSession));
-        assert!(effects.contains(&Effect::MapDriveToSmb));
+        assert!(effects.contains(&Effect::DisconnectDrive));
+        assert!(effects.contains(&Effect::MountDrive));
     }
 
     #[test]
     fn test_mounted_stop() {
-        let (state, _) = transition(MountState::Mounted, MountEvent::Stop);
+        let (state, effects) = transition(MountState::Mounted, MountEvent::Stop);
         assert!(matches!(state, MountState::Stopped));
+        assert!(effects.contains(&Effect::DisconnectDrive));
     }
 
     #[test]
     fn test_error_retry() {
         let (state, _) = transition(
-            MountState::Error(MountError::SmbFailed { reason: "test".into() }),
+            MountState::Error(MountError::MountFailed { reason: "test".into() }),
             MountEvent::Start,
         );
         assert!(matches!(state, MountState::Mounting));
