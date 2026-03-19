@@ -1,7 +1,6 @@
 use crate::config::{self, MountConfig, MountsConfig};
 use crate::messages::{AgentToUfb, AckMsg, ErrorMsg, UfbToAgent};
 use crate::orchestrator::Orchestrator;
-use crate::rclone::RcloneManager;
 use crate::state::MountEvent;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -10,7 +9,6 @@ use tokio::sync::mpsc;
 pub struct MountService {
     mounts: HashMap<String, MountInstance>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
-    next_rc_port: u16,
 }
 
 struct MountInstance {
@@ -24,18 +22,11 @@ impl MountService {
         Self {
             mounts: HashMap::new(),
             ipc_tx,
-            next_rc_port: 5572,
         }
     }
 
     /// Load config and start all enabled mounts.
     pub async fn start_from_config(&mut self) {
-        // Verify rclone is available before starting any mounts
-        match RcloneManager::verify_rclone() {
-            Ok(path) => log::info!("rclone verified at {}", path.display()),
-            Err(e) => log::error!("rclone not available: {} — mounts will fail to start", e),
-        }
-
         let config = config::load_config();
         self.apply_config(config).await;
     }
@@ -79,8 +70,6 @@ impl MountService {
             }
 
             if self.mounts.contains_key(&mount_config.id) {
-                // Mount already exists — for now, we don't hot-reload config changes
-                // (would need to stop, update config, restart)
                 continue;
             }
 
@@ -90,16 +79,10 @@ impl MountService {
 
     async fn start_mount(&mut self, config: MountConfig) {
         let mount_id = config.id.clone();
-        let rc_port = RcloneManager::find_available_port(self.next_rc_port);
-        self.next_rc_port = rc_port + 1;
 
-        log::info!(
-            "Starting mount: {} (rc_port={})",
-            mount_id,
-            rc_port
-        );
+        log::info!("Starting mount: {}", mount_id);
 
-        let mut orchestrator = Orchestrator::new(config.clone(), self.ipc_tx.clone(), rc_port);
+        let mut orchestrator = Orchestrator::new(config.clone(), self.ipc_tx.clone());
         let event_tx = orchestrator.event_sender();
 
         // Run orchestrator in background task
@@ -145,18 +128,6 @@ impl MountService {
             }
             UfbToAgent::RestartMount(msg) => {
                 self.send_to_mount(&msg.mount_id, MountEvent::Restart, &msg.command_id)
-                    .await;
-            }
-            UfbToAgent::SwitchToSmb(msg) => {
-                self.send_to_mount(&msg.mount_id, MountEvent::ForceSwitchToSmb, &msg.command_id)
-                    .await;
-            }
-            UfbToAgent::ForceRclone(msg) => {
-                self.send_to_mount(&msg.mount_id, MountEvent::ForceRclone, &msg.command_id)
-                    .await;
-            }
-            UfbToAgent::FlushAndRestart(msg) => {
-                self.send_to_mount(&msg.mount_id, MountEvent::FlushAndRestart, &msg.command_id)
                     .await;
             }
         }

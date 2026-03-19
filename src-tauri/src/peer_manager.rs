@@ -296,9 +296,11 @@ impl PeerManager {
 
     /// Poll peers via HTTP GET /api/status.
     ///
-    /// - Alive peers: polled every cycle (skipped if UDP healthy + recent).
+    /// - Alive peers: polled every cycle.
     /// - Not-alive peers: polled once per cycle to verify whether they've
     ///   come back (needed so stale-phonebook peers can become alive).
+    /// UDP heartbeats can still resurrect peers via `process_heartbeat`,
+    /// but HTTP is the sole authority for marking peers dead.
     pub async fn poll_peers(&self, client: &reqwest::Client) {
         let now = crate::utils::current_time_ms();
 
@@ -319,12 +321,7 @@ impl PeerManager {
                 .collect()
         };
 
-        for (node_id, endpoint, is_alive, has_udp, last_seen) in peer_list {
-            // Adaptive polling: skip alive peers if UDP is healthy and polled recently (< 9s)
-            if is_alive && has_udp && (now - last_seen) < 9000 {
-                continue;
-            }
-
+        for (node_id, endpoint, is_alive, _has_udp, _last_seen) in peer_list {
             let url = format!("http://{}:{}/api/status", endpoint.ip, endpoint.port);
             match client.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -346,10 +343,10 @@ impl PeerManager {
                     if let Some(p) = peers.get_mut(&node_id) {
                         if p.is_alive {
                             p.failed_polls += 1;
-                            // Dead if failed_polls >= 3 AND no recent UDP
-                            if p.failed_polls >= crate::mesh_sync::PEER_DEAD_POLL_COUNT && !p.has_udp_contact {
+                            // Dead if failed_polls >= 3 (HTTP is authoritative for liveness)
+                            if p.failed_polls >= crate::mesh_sync::PEER_DEAD_POLL_COUNT {
                                 p.is_alive = false;
-                                log::info!("Peer {} marked dead (failed_polls={}, no UDP)", node_id, p.failed_polls);
+                                log::info!("Peer {} marked dead (failed_polls={})", node_id, p.failed_polls);
                             }
                         }
                         // Not-alive peers: just leave them not-alive, don't increment

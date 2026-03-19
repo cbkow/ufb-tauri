@@ -15,7 +15,6 @@
 #define SrcTauri "..\src-tauri"
 #define ReleaseDir SrcTauri + "\target\release"
 #define AgentReleaseDir "..\mediamount-agent\target\release"
-#define RcloneDir SrcTauri + "\external\rclone"
 
 [Setup]
 AppId={{B3C9D5E7-4F8A-6B2C-9D1E-7A3F5C8E2D4B}
@@ -64,7 +63,7 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "Core application files"; Types: full custom; Flags: fixed
-Name: "mediamount"; Description: "MediaMount Agent (rclone VFS mount manager with SMB fallback)"; Types: full
+Name: "mediamount"; Description: "MediaMount Agent (SMB mount manager)"; Types: full
 Name: "uri_protocol"; Description: "Register ufb:/// URI protocol for project links"; Types: full
 Name: "union_protocol"; Description: "Register union:/// URI protocol for Union links"; Types: full
 Name: "firewall"; Description: "Add Windows Firewall rules for Mesh Sync (TCP 49200, UDP 4244)"; Types: full
@@ -98,8 +97,6 @@ Source: "{#ReleaseDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsour
 
 ; MediaMount Agent
 Source: "{#AgentReleaseDir}\{#AgentExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: mediamount
-Source: "{#RcloneDir}\rclone.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: mediamount
-Source: "{#RcloneDir}\rclone.1"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: mediamount
 
 ; Assets - scripts
 Source: "{#SrcTauri}\assets\scripts\*"; DestDir: "{app}\assets\scripts"; Flags: ignoreversion recursesubdirs; Components: core
@@ -146,12 +143,6 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Code]
 var
   DataCleanupPage: TInputOptionWizardPage;
-
-function IsWinFspInstalled(): Boolean;
-begin
-  Result := FileExists(ExpandConstant('{pf}\WinFsp\bin\winfsp-x64.dll')) or
-            FileExists(ExpandConstant('{pf32}\WinFsp\bin\winfsp-x64.dll'));
-end;
 
 procedure InitializeWizard();
 begin
@@ -297,19 +288,6 @@ begin
       Exec('netsh.exe', 'advfirewall firewall add rule name="UFB Mesh Sync (TCP)" dir=in action=allow protocol=TCP localport=49200 program="' + ExpandConstant('{app}\{#MyAppExeName}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       Exec('netsh.exe', 'advfirewall firewall add rule name="UFB Mesh Sync (UDP)" dir=in action=allow protocol=UDP localport=4244 program="' + ExpandConstant('{app}\{#MyAppExeName}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
-
-    // WinFSP check for MediaMount
-    if WizardIsComponentSelected('mediamount') and not IsWinFspInstalled() then
-    begin
-      if MsgBox('MediaMount requires WinFSP to mount rclone VFS drives.' + #13#10 +
-                'WinFSP was not detected on this system.' + #13#10#13#10 +
-                'Would you like to open the WinFSP download page?',
-                mbInformation, MB_YESNO) = IDYES then
-      begin
-        Exec('cmd.exe', '/c start https://winfsp.dev/rel/', '', SW_HIDE, ewNoWait, ResultCode);
-      end;
-    end;
-
 
     if WizardIsTaskSelected('restartexplorer') then
       RestartExplorer();

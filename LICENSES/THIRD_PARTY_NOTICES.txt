@@ -40,13 +40,7 @@ individual LICENSE files in this directory.
    License: BSD-3-Clause
    File: OpenEXR-LICENSE.txt
 
-8. rclone
-   Copyright (c) 2014-2025 Nick Craig-Wood and contributors
-   License: MIT
-   File: rclone-LICENSE.txt
-   https://github.com/rclone/rclone
-
-9. WinFSP - Windows File System Proxy
+8. WinFSP - Windows File System Proxy
    Copyright (c) 2015-2025 Bill Zissimopoulos
    License: GPLv3 (runtime dependency, not bundled)
    File: WinFSP-LICENSE.txt

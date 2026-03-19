@@ -3,6 +3,7 @@ import { settingsStore } from "./stores/settingsStore";
 import { subscriptionStore } from "./stores/subscriptionStore";
 import { workspaceStore } from "./stores/workspaceStore";
 import { mountStore } from "./stores/mountStore";
+import { platformStore } from "./stores/platformStore";
 import { DualBrowserView } from "./components/DualBrowserView/DualBrowserView";
 import { SubscriptionPanel } from "./components/SubscriptionPanel/SubscriptionPanel";
 import { Splitter } from "./components/shared/Splitter";
@@ -28,6 +29,7 @@ export default function App() {
   let selectInLeft: ((path: string) => void) | undefined;
 
   onMount(async () => {
+    await platformStore.init();
     await settingsStore.load();
     await subscriptionStore.loadAll();
 
@@ -194,10 +196,8 @@ function MountStatusBar() {
     const states = Object.values(mountStore.states);
     return states.some(
       (s: any) =>
-        s.state === "rclone_degraded" ||
-        s.state === "smb_active" ||
         s.state === "error" ||
-        s.state === "falling_back_to_smb"
+        s.state === "stopped"
     );
   });
 
@@ -211,7 +211,7 @@ function MountStatusBar() {
           {Object.values(mountStore.states)
             .filter(
               (s: any) =>
-                s.state !== "rclone_healthy" && s.state !== "initializing"
+                s.state !== "mounted" && s.state !== "initializing" && s.state !== "mounting"
             )
             .map((s: any) => `${s.mountId}: ${s.stateDetail}`)
             .join(", ")}

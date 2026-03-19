@@ -19,4 +19,21 @@ fn main() {
             }
         }
     }
+
+    // Copy icon.png next to the agent binary for tray icon on Linux
+    #[cfg(not(windows))]
+    {
+        let icon_src = std::path::Path::new("../src-tauri/icons/icon.png");
+        if icon_src.exists() {
+            if let Ok(out_dir) = std::env::var("OUT_DIR") {
+                let target_dir = std::path::PathBuf::from(&out_dir)
+                    .ancestors()
+                    .find(|p| p.ends_with("debug") || p.ends_with("release"))
+                    .map(|p| p.to_path_buf());
+                if let Some(dir) = target_dir {
+                    let _ = std::fs::copy(icon_src, dir.join("icon.png"));
+                }
+            }
+        }
+    }
 }

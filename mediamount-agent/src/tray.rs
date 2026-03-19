@@ -36,7 +36,20 @@ impl TrayManager {
             Some(cancel_tx)
         };
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let cancel_tx = {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            let cmd_tx_clone = cmd_tx.clone();
+            std::thread::Builder::new()
+                .name("tray".into())
+                .spawn(move || {
+                    linux_tray::run_tray(cmd_tx_clone, _state_rx, cancel_rx);
+                })
+                .expect("Failed to spawn tray thread");
+            Some(cancel_tx)
+        };
+
+        #[cfg(not(any(windows, target_os = "linux")))]
         let cancel_tx = {
             log::info!("Tray icon not implemented for this platform");
             let _ = (cmd_tx, _state_rx);
@@ -80,9 +93,6 @@ mod windows_tray {
 
     // Menu item IDs
     const IDM_RESTART: u32 = 1001;
-    const IDM_FLUSH_RESTART: u32 = 1002;
-    const IDM_SWITCH_SMB: u32 = 1003;
-    const IDM_FORCE_RCLONE: u32 = 1004;
     const IDM_OPEN_UFB: u32 = 2001;
     const IDM_OPEN_LOG: u32 = 2002;
     const IDM_TOGGLE_AUTOSTART: u32 = 2003;
@@ -92,10 +102,6 @@ mod windows_tray {
         cmd_tx: mpsc::Sender<TrayCommand>,
         mount_id: Option<String>,
         status_text: String,
-        cache_text: String,
-        dirty_text: String,
-        is_rclone_active: bool,
-        is_smb_active: bool,
     }
 
     // SAFETY: TrayState is only mutated from the tray thread via the message pump.
@@ -188,10 +194,6 @@ mod windows_tray {
                     cmd_tx,
                     mount_id: None,
                     status_text: "Initializing...".into(),
-                    cache_text: String::new(),
-                    dirty_text: String::new(),
-                    is_rclone_active: false,
-                    is_smb_active: false,
                 });
             }
 
@@ -258,23 +260,6 @@ mod windows_tray {
                             if let Some(ref mut state) = *lock {
                                 state.mount_id = Some(update.mount_id.clone());
                                 state.status_text = update.state_detail.clone();
-                                state.is_rclone_active = update.is_rclone_active;
-                                state.is_smb_active = update.is_smb_active;
-
-                                let cache_gb =
-                                    update.cache_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                                let max_gb =
-                                    update.cache_max_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                                state.cache_text = if max_gb > 0.0 {
-                                    format!("Cache: {:.1} / {:.0} GB", cache_gb, max_gb)
-                                } else {
-                                    String::new()
-                                };
-                                state.dirty_text = if update.dirty_files > 0 {
-                                    format!("Write-back: {} files", update.dirty_files)
-                                } else {
-                                    String::new()
-                                };
 
                                 // Update tooltip
                                 let tip = format!("MediaMount — {}", update.state_detail);
@@ -318,35 +303,13 @@ mod windows_tray {
         AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
 
         // Status
-        let status_label = if state.is_rclone_active {
-            "rclone active"
-        } else if state.is_smb_active {
-            "SMB fallback"
-        } else {
-            &state.status_text
-        };
-        append_menu_item(menu, 0, status_label, MF_DISABLED | MF_GRAYED);
-
-        if !state.cache_text.is_empty() {
-            append_menu_item(menu, 0, &state.cache_text, MF_DISABLED | MF_GRAYED);
-        }
-        if !state.dirty_text.is_empty() {
-            append_menu_item(menu, 0, &state.dirty_text, MF_DISABLED | MF_GRAYED);
-        }
+        append_menu_item(menu, 0, &state.status_text, MF_DISABLED | MF_GRAYED);
 
         AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
 
         // Mount controls
         if state.mount_id.is_some() {
-            if state.is_rclone_active {
-                append_menu_item(menu, IDM_SWITCH_SMB, "Switch to SMB", MF_STRING);
-            }
-            if state.is_smb_active {
-                append_menu_item(menu, IDM_FORCE_RCLONE, "Force rclone", MF_STRING);
-            }
-            AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
             append_menu_item(menu, IDM_RESTART, "Restart", MF_STRING);
-            append_menu_item(menu, IDM_FLUSH_RESTART, "Flush cache & restart", MF_STRING);
             AppendMenuW(menu, MF_SEPARATOR, 0, None).ok();
         }
 
@@ -450,15 +413,6 @@ mod windows_tray {
                 .mount_id
                 .as_ref()
                 .map(|id| TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::Restart)),
-            IDM_FLUSH_RESTART => state.mount_id.as_ref().map(|id| {
-                TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::FlushAndRestart)
-            }),
-            IDM_SWITCH_SMB => state.mount_id.as_ref().map(|id| {
-                TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::ForceSwitchToSmb)
-            }),
-            IDM_FORCE_RCLONE => state.mount_id.as_ref().map(|id| {
-                TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::ForceRclone)
-            }),
             IDM_OPEN_UFB => Some(TrayCommand::OpenUfb),
             IDM_OPEN_LOG => Some(TrayCommand::OpenLog),
             IDM_TOGGLE_AUTOSTART => {
@@ -477,5 +431,147 @@ mod windows_tray {
             drop(lock);
             let _ = tx.blocking_send(cmd);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_tray {
+    use super::TrayCommand;
+    use crate::messages::AgentToUfb;
+    use tokio::sync::mpsc;
+
+    /// Linux tray using tray-icon + muda crates with GTK main loop.
+    pub fn run_tray(
+        cmd_tx: mpsc::Sender<TrayCommand>,
+        mut state_rx: mpsc::Receiver<AgentToUfb>,
+        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tray_icon::TrayIconBuilder;
+        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent};
+
+        // Initialize GTK (required by tray-icon on Linux)
+        gtk::init().expect("Failed to init GTK for tray");
+
+        // Build menu
+        let menu = Menu::new();
+        let item_status = MenuItem::new("Initializing...", false, None);
+        let item_restart = MenuItem::new("Restart", true, None);
+        let item_open_ufb = MenuItem::new("Open UFB", true, None);
+        let item_open_log = MenuItem::new("Open log", true, None);
+        let item_autostart = MenuItem::new(
+            if crate::platform::is_auto_start_enabled() { "Disable auto-start" } else { "Start at login" },
+            true,
+            None,
+        );
+        let item_quit = MenuItem::new("Quit", true, None);
+
+        let _ = menu.append(&item_status);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_restart);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_open_ufb);
+        let _ = menu.append(&item_open_log);
+        let _ = menu.append(&item_autostart);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_quit);
+
+        // Try to load icon
+        let icon = load_icon();
+
+        let _tray = match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("MediaMount Agent")
+            .with_icon(icon)
+            .build()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("Failed to create tray icon: {}", e);
+                return;
+            }
+        };
+
+        log::info!("Linux tray icon created");
+
+        let mut mount_id: Option<String> = None;
+        let menu_event_rx = MenuEvent::receiver();
+
+        // GTK main loop — poll for events
+        loop {
+            // Process GTK events
+            while gtk::events_pending() {
+                gtk::main_iteration_do(false);
+            }
+
+            // Check for cancellation
+            if let Ok(()) = cancel_rx.try_recv() {
+                break;
+            }
+
+            // Drain state updates
+            while let Ok(msg) = state_rx.try_recv() {
+                if let AgentToUfb::MountStateUpdate(update) = msg {
+                    mount_id = Some(update.mount_id.clone());
+                    item_status.set_text(&update.state_detail);
+                }
+            }
+
+            // Process menu events
+            if let Ok(event) = menu_event_rx.try_recv() {
+                let cmd = if event.id == item_restart.id() {
+                    mount_id.as_ref().map(|id| {
+                        TrayCommand::MountEvent(id.clone(), crate::state::MountEvent::Restart)
+                    })
+                } else if event.id == item_open_ufb.id() {
+                    Some(TrayCommand::OpenUfb)
+                } else if event.id == item_open_log.id() {
+                    Some(TrayCommand::OpenLog)
+                } else if event.id == item_autostart.id() {
+                    let currently_enabled = crate::platform::is_auto_start_enabled();
+                    if let Err(e) = crate::platform::set_auto_start(!currently_enabled) {
+                        log::error!("Failed to toggle auto-start: {}", e);
+                    }
+                    item_autostart.set_text(
+                        if !currently_enabled { "Disable auto-start" } else { "Start at login" }
+                    );
+                    None
+                } else if event.id == item_quit.id() {
+                    Some(TrayCommand::Quit)
+                } else {
+                    None
+                };
+
+                if let Some(cmd) = cmd {
+                    let _ = cmd_tx.blocking_send(cmd);
+                }
+            }
+
+            // Sleep briefly to avoid busy-polling
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        log::info!("Linux tray icon removed");
+    }
+
+    fn load_icon() -> tray_icon::Icon {
+        // Try to load icon from file next to executable
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for name in &["icon.png", "../../src-tauri/icons/icon.png"] {
+                    let path = dir.join(name);
+                    if let Ok(img) = image::open(&path) {
+                        let rgba = img.into_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+                            return icon;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: 16x16 transparent icon
+        tray_icon::Icon::from_rgba(vec![0u8; 16 * 16 * 4], 16, 16)
+            .expect("Failed to create fallback icon")
     }
 }

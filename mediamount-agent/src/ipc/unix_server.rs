@@ -1,0 +1,152 @@
+use crate::messages::{AgentToUfb, UfbToAgent};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+
+/// Resolve the socket path for the IPC server.
+fn socket_path() -> std::path::PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let dir = std::path::PathBuf::from(runtime_dir).join("ufb");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("mediamount-agent.sock")
+    } else {
+        std::path::PathBuf::from("/tmp/ufb-mediamount-agent.sock")
+    }
+}
+
+/// Get the socket path (for use by the client side too).
+pub fn get_socket_path() -> std::path::PathBuf {
+    socket_path()
+}
+
+/// IPC server that listens for UFB connections on a Unix domain socket.
+pub struct IpcServer {
+    pub command_rx: mpsc::Receiver<UfbToAgent>,
+    response_tx: mpsc::Sender<AgentToUfb>,
+    _cancel_tx: tokio::sync::oneshot::Sender<()>,
+}
+
+impl IpcServer {
+    pub fn start() -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<UfbToAgent>(64);
+        let (resp_tx, mut resp_rx) = mpsc::channel::<AgentToUfb>(64);
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Shared handle for current client connection (write half)
+        let active_writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+
+        // Response writer task
+        let writer_handle = active_writer.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = resp_rx.recv().await {
+                let mut lock = writer_handle.lock().await;
+                if let Some(ref mut stream) = *lock {
+                    if let Err(e) = super::send_message(stream, &msg) {
+                        log::warn!("Failed to send to UFB client: {}", e);
+                        *lock = None;
+                    }
+                }
+            }
+        });
+
+        // Connection listener task
+        let listener_handle = active_writer;
+        tokio::spawn(async move {
+            let sock_path = socket_path();
+
+            // Clean up stale socket
+            if sock_path.exists() {
+                let _ = std::fs::remove_file(&sock_path);
+            }
+
+            let listener = match UnixListener::bind(&sock_path) {
+                Ok(l) => {
+                    log::info!("IPC listening on {}", sock_path.display());
+                    l
+                }
+                Err(e) => {
+                    log::error!("Failed to bind Unix socket at {}: {}", sock_path.display(), e);
+                    return;
+                }
+            };
+
+            // Set permissions so only current user can connect
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o700));
+            }
+
+            loop {
+                // Accept connection (blocking)
+                let (stream, _addr) = match tokio::task::spawn_blocking({
+                    let listener_fd = listener.try_clone().expect("Failed to clone listener");
+                    move || listener_fd.accept()
+                })
+                .await
+                {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        log::error!("Accept failed: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("Accept task panicked: {}", e);
+                        break;
+                    }
+                };
+
+                log::info!("UFB client connected");
+
+                // Clone stream for writing
+                let write_stream = match stream.try_clone() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to clone stream: {}", e);
+                        continue;
+                    }
+                };
+
+                // Store write half for response writer
+                {
+                    let mut lock = listener_handle.lock().await;
+                    *lock = Some(write_stream);
+                }
+
+                // Read commands in blocking thread
+                let cmd_tx_clone = cmd_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut reader = stream;
+                    loop {
+                        match super::recv_message::<_, UfbToAgent>(&mut reader) {
+                            Ok(msg) => {
+                                if cmd_tx_clone.blocking_send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                log::info!("UFB client disconnected");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        Self {
+            command_rx: cmd_rx,
+            response_tx: resp_tx,
+            _cancel_tx: cancel_tx,
+        }
+    }
+
+    pub async fn send(&self, msg: AgentToUfb) -> Result<(), String> {
+        self.response_tx
+            .send(msg)
+            .await
+            .map_err(|e| format!("Failed to queue response: {}", e))
+    }
+}

@@ -6144,6 +6144,7 @@ dependencies = [
  "glob",
  "hostname",
  "image",
+ "libc",
  "log",
  "once_cell",
  "opener",

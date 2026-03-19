@@ -42,6 +42,11 @@
         "installerHooks": "nsis/hooks.nsh"
       }
     },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    },
     "resources": [
       "icons/32x32.png",
       "assets/scripts/*",
@@ -54,7 +59,7 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["ufb"]
+        "schemes": ["ufb", "union"]
       }
     }
   }

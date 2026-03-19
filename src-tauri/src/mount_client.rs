@@ -27,12 +27,6 @@ pub struct MountStateUpdateMsg {
     pub mount_id: String,
     pub state: String,
     pub state_detail: String,
-    pub cache_used_bytes: u64,
-    pub cache_max_bytes: u64,
-    pub dirty_files: u32,
-    pub last_fallback_time: Option<u64>,
-    pub is_rclone_active: bool,
-    pub is_smb_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,9 +48,6 @@ pub enum UfbToAgent {
     StartMount(MountIdMsg),
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
-    SwitchToSmb(MountIdMsg),
-    ForceRclone(MountIdMsg),
-    FlushAndRestart(MountIdMsg),
     ReloadConfig,
     GetStates,
     Ping,
@@ -87,58 +78,57 @@ pub struct MountConfig {
     pub display_name: String,
     pub nas_share_path: String,
     pub credential_key: String,
+    #[serde(default)]
+    pub mount_drive_letter: String,
+    #[serde(default)]
+    pub smb_mount_path: Option<String>,
+    #[serde(default)]
+    pub mount_path_linux: Option<String>,
+
+    // Legacy fields — kept for backwards compat with existing config files
+    #[serde(default)]
     pub rclone_drive_letter: String,
     #[serde(default)]
     pub smb_drive_letter: String,
     #[serde(default)]
-    pub mount_drive_letter: String,
-    #[serde(default)]
     pub junction_path: String,
+    #[serde(default)]
+    pub rclone_mount_path: Option<String>,
+    #[serde(default)]
+    pub rclone_remote: Option<String>,
+    #[serde(default)]
     pub cache_dir_path: String,
-    #[serde(default = "default_cache_max_size")]
+    #[serde(default)]
     pub cache_max_size: String,
-    #[serde(default = "default_cache_max_age")]
+    #[serde(default)]
     pub cache_max_age: String,
-    #[serde(default = "default_vfs_write_back")]
+    #[serde(default)]
     pub vfs_write_back: String,
-    #[serde(default = "default_vfs_read_chunk_size")]
+    #[serde(default)]
     pub vfs_read_chunk_size: String,
-    #[serde(default = "default_vfs_read_chunk_streams")]
+    #[serde(default)]
     pub vfs_read_chunk_streams: u32,
-    #[serde(default = "default_vfs_read_ahead")]
+    #[serde(default)]
     pub vfs_read_ahead: String,
-    #[serde(default = "default_buffer_size")]
+    #[serde(default)]
     pub buffer_size: String,
-    #[serde(default = "default_probe_interval_secs")]
+    #[serde(default)]
     pub probe_interval_secs: u64,
-    #[serde(default = "default_probe_timeout_ms")]
+    #[serde(default)]
     pub probe_timeout_ms: u64,
-    #[serde(default = "default_fallback_threshold")]
+    #[serde(default)]
     pub fallback_threshold: u32,
-    #[serde(default = "default_recovery_threshold")]
+    #[serde(default)]
     pub recovery_threshold: u32,
-    #[serde(default = "default_max_rclone_start_attempts")]
+    #[serde(default)]
     pub max_rclone_start_attempts: u32,
-    #[serde(default = "default_healthcheck_file_name")]
+    #[serde(default)]
     pub healthcheck_file_name: String,
     #[serde(default)]
     pub extra_rclone_flags: Vec<String>,
 }
 
 fn default_true() -> bool { true }
-fn default_cache_max_size() -> String { "1T".into() }
-fn default_cache_max_age() -> String { "72h".into() }
-fn default_vfs_write_back() -> String { "10s".into() }
-fn default_vfs_read_chunk_size() -> String { "64M".into() }
-fn default_vfs_read_chunk_streams() -> u32 { 8 }
-fn default_vfs_read_ahead() -> String { "2G".into() }
-fn default_buffer_size() -> String { "512M".into() }
-fn default_probe_interval_secs() -> u64 { 15 }
-fn default_probe_timeout_ms() -> u64 { 3000 }
-fn default_fallback_threshold() -> u32 { 3 }
-fn default_recovery_threshold() -> u32 { 5 }
-fn default_max_rclone_start_attempts() -> u32 { 3 }
-fn default_healthcheck_file_name() -> String { ".healthcheck".into() }
 
 // ── IPC framing ──
 
@@ -334,7 +324,94 @@ impl MountClient {
                 }
             }
 
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            match connect_to_agent_unix() {
+                Ok(stream) => {
+                    log::info!("MountClient: connected to agent (unix socket)");
+                    {
+                        let mut state = self.state.lock().await;
+                        state.connected = true;
+                    }
+                    let _ = app_handle.emit("mount:connection", true);
+
+                    // Clone for separate read/write halves
+                    let mut write_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("MountClient: failed to clone unix stream: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Request current states
+                    let _ = send_msg(&mut write_stream, &UfbToAgent::GetStates);
+
+                    // Read messages in a blocking thread
+                    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(64);
+                    tokio::task::spawn_blocking(move || {
+                        let mut reader = stream;
+                        loop {
+                            match recv_msg(&mut reader) {
+                                Ok(msg) => {
+                                    if msg_tx.blocking_send(msg).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    // Process incoming messages and outgoing commands
+                    loop {
+                        tokio::select! {
+                            msg = msg_rx.recv() => {
+                                match msg {
+                                    Some(AgentToUfb::MountStateUpdate(update)) => {
+                                        log::info!("MountClient: received state update for {} ({})", update.mount_id, update.state);
+                                        let mount_id = update.mount_id.clone();
+                                        {
+                                            let mut state = self.state.lock().await;
+                                            state.mount_states.insert(mount_id, update.clone());
+                                        }
+                                        let _ = app_handle.emit("mount:state-update", &update);
+                                    }
+                                    Some(AgentToUfb::Pong) => {}
+                                    Some(AgentToUfb::Ack(ack)) => {
+                                        let _ = app_handle.emit("mount:ack", &ack);
+                                    }
+                                    Some(AgentToUfb::Error(err)) => {
+                                        let _ = app_handle.emit("mount:error", &err);
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(cmd) = cmd_rx.recv() => {
+                                if let Err(e) = send_msg(&mut write_stream, &cmd) {
+                                    log::error!("MountClient: failed to send command: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    log::info!("MountClient: disconnected from agent");
+                    {
+                        let mut state = self.state.lock().await;
+                        state.connected = false;
+                    }
+                    let _ = app_handle.emit("mount:connection", false);
+                }
+                Err(e) => {
+                    log::debug!("MountClient: agent not available: {}", e);
+                }
+            }
+
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 log::debug!("MountClient: not supported on this platform");
             }
@@ -421,6 +498,18 @@ pub fn save_mount_config(config: &MountsConfig) -> Result<(), String> {
     std::fs::write(&path, json)
         .map_err(|e| format!("Failed to write config: {}", e))?;
     Ok(())
+}
+
+/// Connect to the agent's Unix domain socket (Linux).
+#[cfg(target_os = "linux")]
+fn connect_to_agent_unix() -> io::Result<std::os::unix::net::UnixStream> {
+    let sock_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(runtime_dir).join("ufb/mediamount-agent.sock")
+    } else {
+        std::path::PathBuf::from("/tmp/ufb-mediamount-agent.sock")
+    };
+
+    std::os::unix::net::UnixStream::connect(&sock_path)
 }
 
 /// Connect to the agent's named pipe (Windows only).

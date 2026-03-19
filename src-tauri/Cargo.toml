@@ -102,6 +102,9 @@ rfd = "0.15"
 # Drag plugin (for now, may replace with custom OLE)
 tauri-plugin-drag = "2.1.0"
 
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
+
 # Windows APIs (OLE drag-drop)
 [target.'cfg(windows)'.dependencies]
 # Windows clipboard (CF_HDROP for Explorer paste)

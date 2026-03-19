@@ -1,6 +1,6 @@
 import { createSignal, createResource, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountHideDrives, mountUnhideDrives } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
 import "./SettingsDialog.css";
@@ -147,6 +147,7 @@ function MountCredentialEditor(props: { credentialKey: string }) {
 
 export function SettingsDialog(props: SettingsDialogProps) {
   const [activeSection, setActiveSection] = createSignal("appearance");
+  const [platform, setPlatform] = createSignal("win");
 
   const sections = [
     { id: "appearance", label: "Appearance" },
@@ -160,6 +161,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
   const [mountConfig, setMountConfig] = createSignal<MountsConfig>({ version: 1, mounts: [] });
 
   onMount(async () => {
+    try { setPlatform(await getPlatform()); } catch {}
     mountStore.loadStates();
     const cfg = await mountStore.loadConfig();
     setMountConfig(cfg);
@@ -218,6 +220,32 @@ export function SettingsDialog(props: SettingsDialogProps) {
   async function saveAndRestart() {
     await settingsStore.save();
     await relaunchApp();
+  }
+
+  const [showMountDialog, setShowMountDialog] = createSignal(false);
+  const [mountHost, setMountHost] = createSignal("");
+  const [mountShare, setMountShare] = createSignal("");
+  const [mountUser, setMountUser] = createSignal("");
+  const [mountPass, setMountPass] = createSignal("");
+  const [mountStatus, setMountStatus] = createSignal("");
+  const [mounting, setMounting] = createSignal(false);
+
+  async function doSmbMount() {
+    if (!mountHost() || !mountShare()) return;
+    setMounting(true);
+    setMountStatus("Mounting... (you may see a password prompt for sudo)");
+    try {
+      const localPath = await mountSmbShare(mountHost(), mountShare(), mountUser(), mountPass());
+      settingsStore.setSettings("meshSync", "farmPath", localPath);
+      settingsStore.save();
+      setShowMountDialog(false);
+      setMountStatus("");
+      setMountPass("");
+    } catch (e) {
+      setMountStatus("Failed: " + e);
+    } finally {
+      setMounting(false);
+    }
   }
 
   async function browseFarmPath() {
@@ -462,20 +490,99 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 <div class="settings-field">
                   <div class="settings-field-header">
                     <span>Farm Path</span>
-                    <span class="settings-help" title="Shared folder accessible by all nodes (e.g., UNC path to network share). Used for peer discovery and snapshot storage.">?</span>
+                    <span class="settings-help" title="Shared folder accessible by all nodes. On Windows use a UNC path (e.g. \\\\server\\share\\ufb-sync). On Linux use a local mount path.">?</span>
                   </div>
                   <div class="settings-field-row">
                     <SettingsInput
                       value={settingsStore.settings.meshSync.farmPath}
-                      placeholder="\\\\server\\share\\ufb-sync"
+                      placeholder={platform() === "lin" ? "/mnt/nas/ufb-sync" : "\\\\server\\share\\ufb-sync"}
                       onCommit={(v) => {
                         settingsStore.setSettings("meshSync", "farmPath", v);
                         settingsStore.save();
                       }}
                     />
                     <button class="settings-btn" onClick={browseFarmPath}>Browse...</button>
+                    <Show when={platform() === "lin"}>
+                      <button class="settings-btn" onClick={() => setShowMountDialog(true)}>Mount SMB...</button>
+                    </Show>
                   </div>
+                  <Show when={platform() === "lin" && settingsStore.settings.meshSync.farmPath.startsWith("smb://")}>
+                    <span class="settings-hint" style={{ color: "var(--warning)" }}>
+                      Farm path should be a local mount path, not an smb:// URL. Use "Mount SMB..." to mount the share first.
+                    </span>
+                  </Show>
                 </div>
+
+                {/* SMB Mount dialog */}
+                <Show when={showMountDialog()}>
+                  <div class="mount-editor" style={{ "margin-top": "var(--spacing-md)" }}>
+                    <div class="mount-editor-title">Mount SMB Share</div>
+                    <p class="settings-hint">Mount a network share to a local path. You'll be prompted for your system password.</p>
+
+                    <div class="mount-editor-row">
+                      <label class="settings-field" style={{ flex: 2 }}>
+                        <span>Host / IP</span>
+                        <input
+                          type="text"
+                          value={mountHost()}
+                          placeholder="192.168.40.100"
+                          onInput={(e) => setMountHost(e.currentTarget.value)}
+                        />
+                      </label>
+                      <label class="settings-field" style={{ flex: 1 }}>
+                        <span>Share Name</span>
+                        <input
+                          type="text"
+                          value={mountShare()}
+                          placeholder="MinRender"
+                          onInput={(e) => setMountShare(e.currentTarget.value)}
+                        />
+                      </label>
+                    </div>
+
+                    <div class="mount-editor-row">
+                      <label class="settings-field" style={{ flex: 1 }}>
+                        <span>Username</span>
+                        <input
+                          type="text"
+                          value={mountUser()}
+                          placeholder="(optional)"
+                          onInput={(e) => setMountUser(e.currentTarget.value)}
+                        />
+                      </label>
+                      <label class="settings-field" style={{ flex: 1 }}>
+                        <span>Password</span>
+                        <input
+                          type="password"
+                          value={mountPass()}
+                          placeholder="(optional)"
+                          onInput={(e) => setMountPass(e.currentTarget.value)}
+                        />
+                      </label>
+                    </div>
+
+                    <Show when={mountStatus()}>
+                      <p class="settings-hint" style={{ color: mountStatus().startsWith("Failed") ? "var(--warning)" : undefined }}>
+                        {mountStatus()}
+                      </p>
+                    </Show>
+
+                    <div class="mount-editor-actions">
+                      <button class="settings-btn" onClick={() => { setShowMountDialog(false); setMountStatus(""); setMountPass(""); }}>Cancel</button>
+                      <button
+                        class="settings-btn settings-btn-primary"
+                        onClick={doSmbMount}
+                        disabled={!mountHost() || !mountShare() || mounting()}
+                      >
+                        Mount
+                      </button>
+                    </div>
+
+                    <p class="settings-hint" style={{ "margin-top": "var(--spacing-sm)" }}>
+                      Mounts to <code>~/.local/share/ufb/mnt/{mountShare() || "<share>"}/</code>. Requires <code>cifs-utils</code> package.
+                    </p>
+                  </div>
+                </Show>
 
                 <label class="settings-field">
                   <div class="settings-field-header">
@@ -546,7 +653,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
             {/* ── Mounts ── */}
             <Show when={activeSection() === "mounts"}>
-              <MountsSection mountConfig={mountConfig} setMountConfig={setMountConfig} />
+              <MountsSection mountConfig={mountConfig} setMountConfig={setMountConfig} platform={platform} />
             </Show>
 
             {/* ── Integrations ── */}
@@ -601,30 +708,16 @@ function defaultMountConfig(): MountConfig {
     displayName: "",
     nasSharePath: "",
     credentialKey: "",
-    rcloneDriveLetter: "R",
-    smbDriveLetter: "",
     mountDriveLetter: "",
-    cacheDirPath: "",
-    cacheMaxSize: "1T",
-    cacheMaxAge: "72h",
-    vfsWriteBack: "10s",
-    vfsReadChunkSize: "64M",
-    vfsReadChunkStreams: 8,
-    vfsReadAhead: "2G",
-    bufferSize: "512M",
-    probeIntervalSecs: 15,
-    probeTimeoutMs: 3000,
-    fallbackThreshold: 3,
-    recoveryThreshold: 5,
-    maxRcloneStartAttempts: 3,
-    healthcheckFileName: ".healthcheck",
-    extraRcloneFlags: [],
+    smbMountPath: "",
+    mountPathLinux: "",
   };
 }
 
 function MountsSection(props: {
   mountConfig: () => MountsConfig;
   setMountConfig: (cfg: MountsConfig) => void;
+  platform: () => string;
 }) {
   const [editingMount, setEditingMount] = createSignal<MountConfig | null>(null);
   const [isNew, setIsNew] = createSignal(false);
@@ -686,8 +779,8 @@ function MountsSection(props: {
         </div>
       </div>
 
-      {/* Explorer drive visibility */}
-      <Show when={props.mountConfig().mounts.length > 0}>
+      {/* Explorer drive visibility (Windows only) */}
+      <Show when={props.platform() === "win" && props.mountConfig().mounts.length > 0}>
         <div class="settings-field">
           <div class="settings-field-header">
             <span>Explorer Drive Visibility</span>
@@ -699,7 +792,6 @@ function MountsSection(props: {
               onClick={() => {
                 const letters: string[] = [];
                 for (const m of props.mountConfig().mounts) {
-                  if (m.rcloneDriveLetter) letters.push(m.rcloneDriveLetter);
                   if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
                 }
                 if (letters.length > 0) mountHideDrives(letters);
@@ -710,7 +802,6 @@ function MountsSection(props: {
               onClick={() => {
                 const letters: string[] = [];
                 for (const m of props.mountConfig().mounts) {
-                  if (m.rcloneDriveLetter) letters.push(m.rcloneDriveLetter);
                   if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
                 }
                 if (letters.length > 0) mountUnhideDrives(letters);
@@ -725,43 +816,18 @@ function MountsSection(props: {
       <Show when={Object.keys(mountStore.states).length > 0}>
         <h3>Live Status</h3>
         <For each={Object.values(mountStore.states) as MountStateUpdate[]}>
-          {(ms) => {
-            const cachePercent = () =>
-              ms.cacheMaxBytes > 0
-                ? Math.round((ms.cacheUsedBytes / ms.cacheMaxBytes) * 100)
-                : 0;
-            const cacheUsedGB = () => (ms.cacheUsedBytes / (1024 * 1024 * 1024)).toFixed(1);
-            const cacheMaxGB = () => (ms.cacheMaxBytes / (1024 * 1024 * 1024)).toFixed(0);
-
-            return (
-              <div class="mount-item">
-                <div class="mount-item-header">
-                  <span class={`mount-state-dot ${ms.isRcloneActive ? "healthy" : ms.isSmbActive ? "fallback" : ms.state === "error" ? "error" : "neutral"}`} />
-                  <span class="mount-item-name">{ms.mountId}</span>
-                  <span class="mount-item-state">{ms.stateDetail}</span>
-                </div>
-                <div class="mount-cache-bar">
-                  <div class="mount-cache-fill" style={{ width: `${cachePercent()}%` }} />
-                </div>
-                <div class="mount-cache-label">
-                  Cache: {cacheUsedGB()} GB / {cacheMaxGB()} GB
-                  <Show when={ms.dirtyFiles > 0}>
-                    <span class="mount-dirty"> | {ms.dirtyFiles} dirty</span>
-                  </Show>
-                </div>
-                <div class="mount-controls">
-                  <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
-                  <button onClick={() => mountStore.flushAndRestart(ms.mountId)}>Flush & Restart</button>
-                  <Show when={ms.isRcloneActive}>
-                    <button onClick={() => mountStore.switchToSmb(ms.mountId)}>Switch to SMB</button>
-                  </Show>
-                  <Show when={ms.isSmbActive}>
-                    <button onClick={() => mountStore.forceRclone(ms.mountId)}>Force rclone</button>
-                  </Show>
-                </div>
+          {(ms) => (
+            <div class="mount-item">
+              <div class="mount-item-header">
+                <span class={`mount-state-dot ${ms.state === "mounted" ? "healthy" : ms.state === "error" ? "error" : "neutral"}`} />
+                <span class="mount-item-name">{ms.mountId}</span>
+                <span class="mount-item-state">{ms.stateDetail}</span>
               </div>
-            );
-          }}
+              <div class="mount-controls">
+                <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
+              </div>
+            </div>
+          )}
         </For>
       </Show>
 
@@ -774,7 +840,7 @@ function MountsSection(props: {
               <div class="mount-config-header">
                 <span class={`mount-state-dot ${cfg.enabled ? "healthy" : "neutral"}`} />
                 <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
-                <span class="mount-config-detail">{cfg.nasSharePath} → {cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "(not set)"}</span>
+                <span class="mount-config-detail">{cfg.nasSharePath} → {mountStore.getMountPath(cfg) || "(not set)"}</span>
               </div>
               <div class="mount-config-actions">
                 <button class="settings-btn" onClick={() => startEdit(cfg)}>Edit</button>
@@ -784,7 +850,7 @@ function MountsSection(props: {
           )}
         </For>
         <Show when={props.mountConfig().mounts.length === 0}>
-          <p class="settings-hint">No mounts configured. Add a mount to manage NAS access with rclone VFS caching.</p>
+          <p class="settings-hint">No mounts configured. Add a mount to manage SMB NAS access.</p>
         </Show>
         <button
           class="settings-btn"
@@ -849,7 +915,7 @@ function MountsSection(props: {
             <label class="settings-field">
               <div class="settings-field-header">
                 <span>Credential Key</span>
-                <span class="settings-help" title="Key used to store/retrieve NAS credentials in Windows Credential Manager">?</span>
+                <span class="settings-help" title={props.platform() === "lin" ? "Key used to store/retrieve NAS credentials in the system keyring (Secret Service)" : "Key used to store/retrieve NAS credentials in Windows Credential Manager"}>?</span>
               </div>
               <SettingsInput
                 value={m().credentialKey}
@@ -860,89 +926,52 @@ function MountsSection(props: {
 
             <MountCredentialEditor credentialKey={m().credentialKey} />
 
-            <h3>Drive Letter</h3>
+            {/* Drive letter — Windows only */}
+            <Show when={props.platform() === "win"}>
+              <h3>Drive Letter</h3>
 
-            <label class="settings-field">
-              <div class="settings-field-header">
-                <span>rclone Drive</span>
-                <span class="settings-help" title="Drive letter for the rclone VFS mount">?</span>
-              </div>
-              <SettingsInput
-                value={m().rcloneDriveLetter}
-                placeholder="R"
-                onCommit={(v) => updateField("rcloneDriveLetter", v.toUpperCase().charAt(0))}
-              />
-            </label>
-
-            <label class="settings-field">
-              <div class="settings-field-header">
-                <span>Mount Drive Letter</span>
-                <span class="settings-help" title="Drive letter that apps use to access media. Maps to rclone or SMB automatically via DefineDosDevice — no Developer Mode required.">?</span>
-              </div>
-              <SettingsInput
-                value={m().mountDriveLetter}
-                placeholder="M"
-                onCommit={(v) => updateField("mountDriveLetter", v.toUpperCase().charAt(0))}
-              />
-            </label>
-
-            <h3>Cache</h3>
-
-            <div class="settings-field">
-              <div class="settings-field-header">
-                <span>Cache Directory</span>
-                <span class="settings-help" title="Local directory for the rclone VFS cache. Use a fast SSD.">?</span>
-              </div>
-              <div class="settings-field-row">
+              <label class="settings-field">
+                <div class="settings-field-header">
+                  <span>Mount Drive Letter</span>
+                  <span class="settings-help" title="Drive letter that apps use to access media. Maps to SMB share via DefineDosDevice — no Developer Mode required.">?</span>
+                </div>
                 <SettingsInput
-                  value={m().cacheDirPath}
-                  placeholder="D:\\rclone-cache\\primary-nas"
-                  onCommit={(v) => updateField("cacheDirPath", v)}
+                  value={m().mountDriveLetter}
+                  placeholder="M"
+                  onCommit={(v) => updateField("mountDriveLetter", v.toUpperCase().charAt(0))}
                 />
-                <button class="settings-btn" onClick={async () => {
-                  try {
-                    const selected = await pickFolder("Select Cache Directory");
-                    if (selected) updateField("cacheDirPath", selected);
-                  } catch (e) { console.error(e); }
-                }}>Browse...</button>
-              </div>
-            </div>
+              </label>
+            </Show>
 
-            <div class="mount-editor-row">
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Max Size</span>
-                <SettingsInput value={m().cacheMaxSize} placeholder="1T" onCommit={(v) => updateField("cacheMaxSize", v)} />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Max Age</span>
-                <SettingsInput value={m().cacheMaxAge} placeholder="72h" onCommit={(v) => updateField("cacheMaxAge", v)} />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Write-Back</span>
-                <SettingsInput value={m().vfsWriteBack} placeholder="10s" onCommit={(v) => updateField("vfsWriteBack", v)} />
-              </label>
-            </div>
+            {/* Linux mount path overrides — collapsed by default */}
+            <Show when={props.platform() === "lin"}>
+              <details style={{ "margin-top": "var(--spacing-sm)" }}>
+                <summary class="settings-hint" style={{ cursor: "pointer" }}>
+                  Advanced: override auto-derived mount paths
+                </summary>
+                <p class="settings-hint">
+                  Paths are auto-derived from the mount ID (~/.local/share/ufb/mnt/). Only set these if you need custom locations.
+                </p>
 
-            <h3>Performance</h3>
+                <label class="settings-field">
+                  <span>SMB Mount Path</span>
+                  <SettingsInput
+                    value={m().smbMountPath ?? ""}
+                    placeholder="(auto)"
+                    onCommit={(v) => updateField("smbMountPath", v)}
+                  />
+                </label>
 
-            <div class="mount-editor-row">
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Chunk Size</span>
-                <SettingsInput value={m().vfsReadChunkSize} placeholder="64M" onCommit={(v) => updateField("vfsReadChunkSize", v)} />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Streams</span>
-                <SettingsInput type="number" value={m().vfsReadChunkStreams} onCommit={(v) => updateField("vfsReadChunkStreams", parseInt(v) || 8)} />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Read Ahead</span>
-                <SettingsInput value={m().vfsReadAhead} placeholder="2G" onCommit={(v) => updateField("vfsReadAhead", v)} />
-              </label>
-              <label class="settings-field" style={{ flex: 1 }}>
-                <span>Buffer</span>
-                <SettingsInput value={m().bufferSize} placeholder="512M" onCommit={(v) => updateField("bufferSize", v)} />
-              </label>
-            </div>
+                <label class="settings-field">
+                  <span>User-Facing Mount Path</span>
+                  <SettingsInput
+                    value={m().mountPathLinux ?? ""}
+                    placeholder="(auto)"
+                    onCommit={(v) => updateField("mountPathLinux", v)}
+                  />
+                </label>
+              </details>
+            </Show>
 
             <div class="mount-editor-actions">
               <button class="settings-btn" onClick={cancelEdit}>Cancel</button>

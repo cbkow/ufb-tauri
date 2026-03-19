@@ -20,85 +20,120 @@ pub struct MountConfig {
     /// UNC path to the NAS share, e.g. "\\\\nas\\media"
     pub nas_share_path: String,
 
-    /// Key used to store/retrieve credentials from Windows Credential Manager
+    /// Key used to store/retrieve credentials from the credential store
     pub credential_key: String,
 
-    /// Drive letter for rclone VFS mount (e.g. "R")
-    pub rclone_drive_letter: String,
-
-    /// Drive letter for SMB fallback mapping (e.g. "S") — legacy, no longer used
-    #[serde(default)]
-    pub smb_drive_letter: String,
-
-    /// Drive letter that maps to rclone or SMB via DefineDosDevice (e.g. "M")
+    /// Drive letter that apps use to access media (e.g. "M") — Windows only
     #[serde(default)]
     pub mount_drive_letter: String,
 
-    /// Legacy junction path field — silently ignored, kept for config compatibility
+    // ── Linux mount paths ──
+
+    /// Path where SMB/CIFS is mounted (e.g. "/mnt/nas-smb")
+    #[serde(default)]
+    pub smb_mount_path: Option<String>,
+
+    /// User-facing mount path — symlink that points to SMB mount (e.g. "/mnt/nas")
+    #[serde(default)]
+    pub mount_path_linux: Option<String>,
+
+    // ── Legacy fields — kept for backwards compat with existing config files ──
+
+    /// Legacy: rclone drive letter (no longer used, silently ignored)
+    #[serde(default)]
+    pub rclone_drive_letter: String,
+
+    /// Legacy: SMB fallback drive letter (no longer used)
+    #[serde(default)]
+    pub smb_drive_letter: String,
+
+    /// Legacy: junction path (no longer used)
     #[serde(default)]
     pub junction_path: String,
 
-    /// Local cache directory for rclone VFS
+    /// Legacy: rclone mount path (no longer used)
+    #[serde(default)]
+    pub rclone_mount_path: Option<String>,
+
+    /// Legacy: rclone remote spec (no longer used)
+    #[serde(default)]
+    pub rclone_remote: Option<String>,
+
+    /// Legacy: cache directory (no longer used)
+    #[serde(default)]
     pub cache_dir_path: String,
 
-    // ── rclone tuning ──
-    #[serde(default = "default_cache_max_size")]
+    /// Legacy: cache tuning (no longer used)
+    #[serde(default)]
     pub cache_max_size: String,
-
-    #[serde(default = "default_cache_max_age")]
+    #[serde(default)]
     pub cache_max_age: String,
-
-    #[serde(default = "default_vfs_write_back")]
+    #[serde(default)]
     pub vfs_write_back: String,
-
-    #[serde(default = "default_vfs_read_chunk_size")]
+    #[serde(default)]
     pub vfs_read_chunk_size: String,
-
-    #[serde(default = "default_vfs_read_chunk_streams")]
+    #[serde(default)]
     pub vfs_read_chunk_streams: u32,
-
-    #[serde(default = "default_vfs_read_ahead")]
+    #[serde(default)]
     pub vfs_read_ahead: String,
-
-    #[serde(default = "default_buffer_size")]
+    #[serde(default)]
     pub buffer_size: String,
 
-    // ── Health/hysteresis tuning ──
-    #[serde(default = "default_probe_interval_secs")]
+    /// Legacy: health/hysteresis tuning (no longer used)
+    #[serde(default)]
     pub probe_interval_secs: u64,
-
-    #[serde(default = "default_probe_timeout_ms")]
+    #[serde(default)]
     pub probe_timeout_ms: u64,
-
-    #[serde(default = "default_fallback_threshold")]
+    #[serde(default)]
     pub fallback_threshold: u32,
-
-    #[serde(default = "default_recovery_threshold")]
+    #[serde(default)]
     pub recovery_threshold: u32,
-
-    #[serde(default = "default_max_rclone_start_attempts")]
+    #[serde(default)]
     pub max_rclone_start_attempts: u32,
-
-    #[serde(default = "default_healthcheck_file_name")]
+    #[serde(default)]
     pub healthcheck_file_name: String,
-
     #[serde(default)]
     pub extra_rclone_flags: Vec<String>,
 }
 
 impl MountConfig {
-    /// Build the hysteresis config from mount config values.
-    pub fn hysteresis_config(&self) -> crate::state::HysteresisConfig {
-        crate::state::HysteresisConfig {
-            fallback_threshold: self.fallback_threshold,
-            recovery_threshold: self.recovery_threshold,
-            max_rclone_start_attempts: self.max_rclone_start_attempts,
+    /// Base directory for auto-derived mount paths on Linux.
+    #[cfg(not(windows))]
+    fn linux_mnt_base(&self) -> std::path::PathBuf {
+        let base = if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(".local/share/ufb/mnt")
+        } else {
+            std::path::PathBuf::from("/tmp/ufb-mnt")
+        };
+        let _ = std::fs::create_dir_all(&base);
+        base
+    }
+
+    /// The path apps use to access the mount.
+    /// Windows: "M:\\" (drive letter).
+    /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
+    pub fn mount_path(&self) -> String {
+        #[cfg(windows)]
+        {
+            format!("{}:\\", self.mount_drive_letter)
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(ref p) = self.mount_path_linux {
+                if !p.is_empty() { return p.clone(); }
+            }
+            self.linux_mnt_base().join(&self.id).to_string_lossy().to_string()
         }
     }
 
-    /// The path apps use to access the mount (e.g. "M:\").
-    pub fn mount_path(&self) -> String {
-        format!("{}:\\", self.mount_drive_letter)
+    /// The path where SMB is mounted on Linux.
+    /// Auto-derived to ~/.local/share/ufb/mnt/<id>-smb if not set.
+    #[cfg(not(windows))]
+    pub fn smb_target_path(&self) -> String {
+        if let Some(ref p) = self.smb_mount_path {
+            if !p.is_empty() { return p.clone(); }
+        }
+        self.linux_mnt_base().join(format!("{}-smb", self.id)).to_string_lossy().to_string()
     }
 }
 
@@ -106,45 +141,6 @@ impl MountConfig {
 
 fn default_true() -> bool {
     true
-}
-fn default_cache_max_size() -> String {
-    "1T".into()
-}
-fn default_cache_max_age() -> String {
-    "72h".into()
-}
-fn default_vfs_write_back() -> String {
-    "10s".into()
-}
-fn default_vfs_read_chunk_size() -> String {
-    "64M".into()
-}
-fn default_vfs_read_chunk_streams() -> u32 {
-    8
-}
-fn default_vfs_read_ahead() -> String {
-    "2G".into()
-}
-fn default_buffer_size() -> String {
-    "512M".into()
-}
-fn default_probe_interval_secs() -> u64 {
-    15
-}
-fn default_probe_timeout_ms() -> u64 {
-    3000
-}
-fn default_fallback_threshold() -> u32 {
-    3
-}
-fn default_recovery_threshold() -> u32 {
-    5
-}
-fn default_max_rclone_start_attempts() -> u32 {
-    3
-}
-fn default_healthcheck_file_name() -> String {
-    ".healthcheck".into()
 }
 
 /// Resolve the config file path: %LOCALAPPDATA%/ufb/mounts.json
@@ -231,24 +227,28 @@ mod tests {
                 display_name: "Studio NAS".into(),
                 nas_share_path: r"\\nas\media".into(),
                 credential_key: "mediamount_primary-nas".into(),
-                rclone_drive_letter: "R".into(),
-                smb_drive_letter: "S".into(),
                 mount_drive_letter: "M".into(),
+                smb_mount_path: None,
+                mount_path_linux: None,
+                rclone_drive_letter: String::new(),
+                smb_drive_letter: String::new(),
                 junction_path: String::new(),
-                cache_dir_path: r"D:\rclone-cache\primary-nas".into(),
-                cache_max_size: "1T".into(),
-                cache_max_age: "72h".into(),
-                vfs_write_back: "10s".into(),
-                vfs_read_chunk_size: "64M".into(),
-                vfs_read_chunk_streams: 8,
-                vfs_read_ahead: "2G".into(),
-                buffer_size: "512M".into(),
-                probe_interval_secs: 15,
-                probe_timeout_ms: 3000,
-                fallback_threshold: 3,
-                recovery_threshold: 5,
-                max_rclone_start_attempts: 3,
-                healthcheck_file_name: ".healthcheck".into(),
+                rclone_mount_path: None,
+                rclone_remote: None,
+                cache_dir_path: String::new(),
+                cache_max_size: String::new(),
+                cache_max_age: String::new(),
+                vfs_write_back: String::new(),
+                vfs_read_chunk_size: String::new(),
+                vfs_read_chunk_streams: 0,
+                vfs_read_ahead: String::new(),
+                buffer_size: String::new(),
+                probe_interval_secs: 0,
+                probe_timeout_ms: 0,
+                fallback_threshold: 0,
+                recovery_threshold: 0,
+                max_rclone_start_attempts: 0,
+                healthcheck_file_name: String::new(),
                 extra_rclone_flags: vec![],
             }],
         };
@@ -259,9 +259,7 @@ mod tests {
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.mounts.len(), 1);
         assert_eq!(parsed.mounts[0].id, "primary-nas");
-        assert_eq!(parsed.mounts[0].rclone_drive_letter, "R");
         assert_eq!(parsed.mounts[0].mount_drive_letter, "M");
-        assert_eq!(parsed.mounts[0].cache_max_size, "1T");
     }
 
     #[test]
@@ -274,24 +272,28 @@ mod tests {
                 display_name: "Test".into(),
                 nas_share_path: r"\\nas\test".into(),
                 credential_key: "test".into(),
-                rclone_drive_letter: "R".into(),
-                smb_drive_letter: String::new(),
                 mount_drive_letter: "M".into(),
+                smb_mount_path: None,
+                mount_path_linux: None,
+                rclone_drive_letter: String::new(),
+                smb_drive_letter: String::new(),
                 junction_path: String::new(),
-                cache_dir_path: r"D:\cache".into(),
-                cache_max_size: "1T".into(),
-                cache_max_age: "72h".into(),
-                vfs_write_back: "10s".into(),
-                vfs_read_chunk_size: "64M".into(),
-                vfs_read_chunk_streams: 8,
-                vfs_read_ahead: "2G".into(),
-                buffer_size: "512M".into(),
-                probe_interval_secs: 15,
-                probe_timeout_ms: 3000,
-                fallback_threshold: 3,
-                recovery_threshold: 5,
-                max_rclone_start_attempts: 3,
-                healthcheck_file_name: ".healthcheck".into(),
+                rclone_mount_path: None,
+                rclone_remote: None,
+                cache_dir_path: String::new(),
+                cache_max_size: String::new(),
+                cache_max_age: String::new(),
+                vfs_write_back: String::new(),
+                vfs_read_chunk_size: String::new(),
+                vfs_read_chunk_streams: 0,
+                vfs_read_ahead: String::new(),
+                buffer_size: String::new(),
+                probe_interval_secs: 0,
+                probe_timeout_ms: 0,
+                fallback_threshold: 0,
+                recovery_threshold: 0,
+                max_rclone_start_attempts: 0,
+                healthcheck_file_name: String::new(),
                 extra_rclone_flags: vec![],
             }],
         };
@@ -300,6 +302,7 @@ mod tests {
 
     #[test]
     fn test_defaults_applied() {
+        // Minimal config — only required fields
         let json = r#"{
             "version": 1,
             "mounts": [{
@@ -307,9 +310,7 @@ mod tests {
                 "displayName": "Test",
                 "nasSharePath": "\\\\nas\\test",
                 "credentialKey": "test",
-                "rcloneDriveLetter": "R",
-                "mountDriveLetter": "M",
-                "cacheDirPath": "D:\\cache"
+                "mountDriveLetter": "M"
             }]
         }"#;
 
@@ -318,23 +319,11 @@ mod tests {
 
         assert!(m.enabled); // default true
         assert_eq!(m.mount_drive_letter, "M");
-        assert_eq!(m.cache_max_size, "1T");
-        assert_eq!(m.probe_interval_secs, 15);
-        assert_eq!(m.fallback_threshold, 3);
-        assert_eq!(m.recovery_threshold, 5);
-        assert_eq!(m.healthcheck_file_name, ".healthcheck");
-        assert!(m.extra_rclone_flags.is_empty());
     }
 
     #[test]
-    fn test_malformed_json() {
-        let json = r#"{ not valid json }"#;
-        let result = serde_json::from_str::<MountsConfig>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_missing_smb_drive_letter_defaults() {
+    fn test_backwards_compat_old_config() {
+        // Old config with rclone fields should still parse
         let json = r#"{
             "version": 1,
             "mounts": [{
@@ -344,34 +333,26 @@ mod tests {
                 "credentialKey": "test",
                 "rcloneDriveLetter": "R",
                 "mountDriveLetter": "M",
-                "cacheDirPath": "D:\\cache"
+                "cacheDirPath": "D:\\cache",
+                "cacheMaxSize": "1T",
+                "probeIntervalSecs": 15,
+                "fallbackThreshold": 3,
+                "healthcheckFileName": ".healthcheck"
             }]
         }"#;
 
         let config: MountsConfig = serde_json::from_str(json).unwrap();
         let m = &config.mounts[0];
-        assert_eq!(m.smb_drive_letter, ""); // defaults to empty when missing
+        assert_eq!(m.id, "test");
+        assert_eq!(m.mount_drive_letter, "M");
+        // Legacy fields are parsed but ignored
+        assert_eq!(m.rclone_drive_letter, "R");
     }
 
     #[test]
-    fn test_legacy_junction_path_ignored() {
-        // Old configs with junctionPath should still parse; the field is silently ignored
-        let json = r#"{
-            "version": 1,
-            "mounts": [{
-                "id": "test",
-                "displayName": "Test",
-                "nasSharePath": "\\\\nas\\test",
-                "credentialKey": "test",
-                "rcloneDriveLetter": "R",
-                "junctionPath": "M:\\media",
-                "cacheDirPath": "D:\\cache"
-            }]
-        }"#;
-
-        let config: MountsConfig = serde_json::from_str(json).unwrap();
-        let m = &config.mounts[0];
-        assert_eq!(m.junction_path, r"M:\media"); // preserved but unused
-        assert_eq!(m.mount_drive_letter, ""); // not set — user must configure
+    fn test_malformed_json() {
+        let json = r#"{ not valid json }"#;
+        let result = serde_json::from_str::<MountsConfig>(json);
+        assert!(result.is_err());
     }
 }

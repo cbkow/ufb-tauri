@@ -122,26 +122,6 @@ fn build_video_thumb() {
             }
         }
 
-        // Copy rclone executable (used by mediamount-agent)
-        let rclone_name = if cfg!(target_os = "windows") { "rclone.exe" } else { "rclone" };
-        let rclone_candidates = vec![
-            manifest_dir.join("external").join("rclone").join(rclone_name),
-            manifest_dir.parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-                .map(|github_dir| github_dir.join("UFB").join("external").join("rclone").join(rclone_name))
-                .unwrap_or_default(),
-        ];
-
-        for src in rclone_candidates {
-            if src.exists() {
-                let dest = target_dir.join(rclone_name);
-                if !dest.exists() {
-                    let _ = std::fs::copy(&src, &dest);
-                }
-                break;
-            }
-        }
     }
 
     // Re-run if source changes
@@ -170,6 +150,19 @@ fn find_ffmpeg_dir() -> Option<PathBuf> {
         let ufb_ffmpeg = github_dir.join("UFB").join("external").join("ffmpeg");
         if ufb_ffmpeg.exists() {
             return Some(ufb_ffmpeg);
+        }
+    }
+
+    // 4. System FFmpeg via pkg-config (Linux)
+    if let Ok(output) = std::process::Command::new("pkg-config")
+        .args(["--variable=prefix", "libavformat"])
+        .output()
+    {
+        if output.status.success() {
+            let prefix = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if prefix.join("include").exists() {
+                return Some(prefix);
+            }
         }
     }
 

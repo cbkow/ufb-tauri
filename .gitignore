@@ -17,7 +17,7 @@ installer/*.exe
 # Sidecar binaries (copied by build.rs, not checked in)
 src-tauri/binaries/
 
-# Bundled external binaries (rclone, etc.)
+# Bundled external binaries
 src-tauri/external/
 
 # IDE

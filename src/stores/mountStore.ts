@@ -1,12 +1,10 @@
 import { createStore, reconcile } from "solid-js/store";
 import { listen } from "@tauri-apps/api/event";
+import { platformStore } from "./platformStore";
 import {
   mountGetStates,
   mountIsConnected,
   mountRestart,
-  mountFlushAndRestart,
-  mountSwitchToSmb,
-  mountForceRclone,
   mountSaveConfig,
   mountGetConfig,
   mountLaunchAgent,
@@ -16,12 +14,6 @@ export interface MountStateUpdate {
   mountId: string;
   state: string;
   stateDetail: string;
-  cacheUsedBytes: number;
-  cacheMaxBytes: number;
-  dirtyFiles: number;
-  lastFallbackTime: number | null;
-  isRcloneActive: boolean;
-  isSmbActive: boolean;
 }
 
 export interface MountConfig {
@@ -30,25 +22,9 @@ export interface MountConfig {
   displayName: string;
   nasSharePath: string;
   credentialKey: string;
-  rcloneDriveLetter: string;
-  smbDriveLetter?: string;
   mountDriveLetter: string;
-  junctionPath?: string;
-  cacheDirPath: string;
-  cacheMaxSize: string;
-  cacheMaxAge: string;
-  vfsWriteBack: string;
-  vfsReadChunkSize: string;
-  vfsReadChunkStreams: number;
-  vfsReadAhead: string;
-  bufferSize: string;
-  probeIntervalSecs: number;
-  probeTimeoutMs: number;
-  fallbackThreshold: number;
-  recoveryThreshold: number;
-  maxRcloneStartAttempts: number;
-  healthcheckFileName: string;
-  extraRcloneFlags: string[];
+  smbMountPath?: string;
+  mountPathLinux?: string;
 }
 
 export interface MountsConfig {
@@ -86,15 +62,28 @@ function setupListeners() {
   });
 }
 
-/** Get the mount state for a given path via prefix matching against mount drive letters. */
+/** Get the mount state for a given path via prefix matching against mount paths. */
 function getMountForPath(path: string): MountStateUpdate | undefined {
   if (state.configs.length === 0) return undefined;
-  const normalized = path.replace(/\//g, "\\").toLowerCase();
-  for (const cfg of state.configs) {
-    if (!cfg.mountDriveLetter) continue;
-    const mountPrefix = (cfg.mountDriveLetter + ":\\").toLowerCase();
-    if (normalized.startsWith(mountPrefix)) {
-      return state.states[cfg.id];
+  const isWindows = path.length >= 2 && path[1] === ":";
+  if (isWindows) {
+    const normalized = path.replace(/\//g, "\\").toLowerCase();
+    for (const cfg of state.configs) {
+      if (!cfg.mountDriveLetter) continue;
+      const mountPrefix = (cfg.mountDriveLetter + ":\\").toLowerCase();
+      if (normalized.startsWith(mountPrefix)) {
+        return state.states[cfg.id];
+      }
+    }
+  } else {
+    // Linux/macOS: match against mount path fields
+    for (const cfg of state.configs) {
+      const linuxPaths = [cfg.mountPathLinux, cfg.smbMountPath].filter(Boolean) as string[];
+      for (const mp of linuxPaths) {
+        if (path === mp || path.startsWith(mp + "/")) {
+          return state.states[cfg.id];
+        }
+      }
     }
   }
   return undefined;
@@ -127,30 +116,6 @@ async function restart(mountId: string) {
   }
 }
 
-async function flushAndRestart(mountId: string) {
-  try {
-    await mountFlushAndRestart(mountId);
-  } catch (e) {
-    console.error("Failed to flush and restart mount:", e);
-  }
-}
-
-async function switchToSmb(mountId: string) {
-  try {
-    await mountSwitchToSmb(mountId);
-  } catch (e) {
-    console.error("Failed to switch to SMB:", e);
-  }
-}
-
-async function forceRclone(mountId: string) {
-  try {
-    await mountForceRclone(mountId);
-  } catch (e) {
-    console.error("Failed to force rclone:", e);
-  }
-}
-
 async function saveConfig(config: MountsConfig) {
   try {
     await mountSaveConfig(config);
@@ -176,6 +141,20 @@ async function loadConfig(): Promise<MountsConfig> {
   }
 }
 
+/** Get the user-facing mount path for a config (platform-aware). */
+function getMountPath(cfg: MountConfig): string {
+  if (platformStore.platform === "win") {
+    return cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "";
+  }
+  // Linux/macOS: explicit path or auto-derived from mount ID
+  if (cfg.mountPathLinux) return cfg.mountPathLinux;
+  if (cfg.smbMountPath) return cfg.smbMountPath;
+  // Auto-derived (matches agent's config.mount_path() on Linux)
+  const home = platformStore.home;
+  if (home && cfg.id) return `${home}/.local/share/ufb/mnt/${cfg.id}`;
+  return "";
+}
+
 export const mountStore = {
   get states() {
     return state.states;
@@ -187,12 +166,10 @@ export const mountStore = {
     return state.configs;
   },
   getMountForPath,
+  getMountPath,
   loadStates,
   launchAgent,
   restart,
-  flushAndRestart,
-  switchToSmb,
-  forceRclone,
   saveConfig,
   loadConfig,
 };

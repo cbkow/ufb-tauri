@@ -1,6 +1,9 @@
 #[cfg(windows)]
 pub mod server;
 
+#[cfg(target_os = "linux")]
+pub mod unix_server;
+
 use std::io::{self, Read, Write};
 
 /// Write a length-prefixed JSON message.

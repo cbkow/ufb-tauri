@@ -26,6 +26,25 @@ use settings::AppSettings;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
+
+/// Resolve a union:// URI to a local path and open it in the file manager.
+fn handle_union_uri(uri: &str) {
+    let Some(parsed) = crate::utils::parse_path_uri(uri) else {
+        log::warn!("Failed to parse union URI: {}", uri);
+        return;
+    };
+    let settings = AppSettings::load();
+    let local_path = crate::utils::translate_path(
+        &parsed.source_os,
+        &parsed.path,
+        &settings.path_mappings,
+    );
+    log::info!("union:// → revealing: {}", local_path);
+    if let Err(e) = crate::file_ops::reveal_in_file_manager(&local_path) {
+        log::error!("Failed to reveal path from union:// link: {}", e);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -45,6 +64,11 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // argv[1] is the deep-link URI from the OS
             if let Some(uri) = argv.get(1) {
+                if uri.starts_with("union://") {
+                    // union:// links open the file manager — no need to focus the app window
+                    handle_union_uri(uri);
+                    return;
+                }
                 if uri.starts_with("ufb://") {
                     let _ = app.emit("deep-link-uri", uri.clone());
                 }
@@ -64,15 +88,20 @@ pub fn run() {
             app.deep_link().on_open_url(move |event| {
                 if let Some(url) = event.urls().first() {
                     let uri = url.to_string();
-                    if uri.starts_with("ufb://") {
+                    if uri.starts_with("union://") {
+                        handle_union_uri(&uri);
+                    } else if uri.starts_with("ufb://") {
                         let _ = handle_dl.emit("deep-link-uri", uri);
                     }
                 }
             });
 
-            // Cold-start: app launched directly via ufb:// link (first instance)
+            // Cold-start: app launched directly via a deep link (first instance)
             if let Some(uri) = std::env::args().nth(1) {
-                if uri.starts_with("ufb://") {
+                if uri.starts_with("union://") {
+                    // union:// links just open the file manager — don't navigate in-app
+                    handle_union_uri(&uri);
+                } else if uri.starts_with("ufb://") {
                     // Store in AppState so frontend can fetch it on mount
                     let state: tauri::State<'_, AppState> = app.state();
                     *state.pending_deep_link.lock().unwrap() = Some(uri.clone());
@@ -189,9 +218,6 @@ pub fn run() {
             commands::mount_get_states,
             commands::mount_is_connected,
             commands::mount_restart,
-            commands::mount_flush_and_restart,
-            commands::mount_switch_to_smb,
-            commands::mount_force_rclone,
             commands::mount_save_config,
             commands::mount_get_config,
             commands::mount_launch_agent,
@@ -202,6 +228,9 @@ pub fn run() {
             commands::mount_unhide_drives,
             // App lifecycle
             commands::relaunch_app,
+            // Platform
+            commands::get_platform,
+            commands::mount_smb_share,
             // Deep link
             commands::get_pending_deep_link,
         ])

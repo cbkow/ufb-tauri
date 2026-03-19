@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Union File Browser
+Comment=File browser with NAS mount management and mesh sync
+Exec=ufb-tauri
+Icon=com.unionfiles.ufb
+Categories=Utility;FileManager;
+StartupWMClass=com.unionfiles.ufb
+MimeType=x-scheme-handler/ufb;x-scheme-handler/union;

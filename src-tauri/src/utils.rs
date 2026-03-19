@@ -98,19 +98,16 @@ pub fn parse_path_uri(uri: &str) -> Option<ParsedUri> {
     })
 }
 
-/// Translate a path from one OS to the local OS using path mapping rules.
-/// Each rule is a triplet (win_pattern, mac_pattern, lin_pattern).
-/// We find which rule matches the source OS prefix, then swap to the local OS prefix.
-pub fn translate_path(
+/// Translate a path from source_os format to target_os format using mapping rules.
+pub fn translate_path_to(
     source_os: &str,
+    target_os: &str,
     path: &str,
     mappings: &[crate::settings::PathMapping],
 ) -> String {
-    let local_os = current_os_tag();
-
     // If same OS, no translation needed
-    if source_os == local_os {
-        return to_native_path(path, local_os);
+    if source_os == target_os {
+        return to_native_path(path, target_os);
     }
 
     // Try each mapping rule
@@ -121,14 +118,14 @@ pub fn translate_path(
             "lin" => &mapping.lin,
             _ => continue,
         };
-        let local_prefix = match local_os {
+        let target_prefix = match target_os {
             "win" => &mapping.win,
             "mac" => &mapping.mac,
             "lin" => &mapping.lin,
             _ => continue,
         };
 
-        if source_prefix.is_empty() || local_prefix.is_empty() {
+        if source_prefix.is_empty() || target_prefix.is_empty() {
             continue;
         }
 
@@ -144,13 +141,36 @@ pub fn translate_path(
 
         if matches {
             let remainder = &norm_path[norm_source.len()..];
-            let translated = format!("{}{}", local_prefix, remainder);
-            return to_native_path(&translated, local_os);
+            let translated = format!("{}{}", target_prefix, remainder);
+            return to_native_path(&translated, target_os);
         }
     }
 
     // No mapping found — just convert to native path separators
-    to_native_path(path, local_os)
+    to_native_path(path, target_os)
+}
+
+/// Translate a path from one OS to the local OS using path mapping rules.
+/// Each rule is a triplet (win_pattern, mac_pattern, lin_pattern).
+/// We find which rule matches the source OS prefix, then swap to the local OS prefix.
+pub fn translate_path(
+    source_os: &str,
+    path: &str,
+    mappings: &[crate::settings::PathMapping],
+) -> String {
+    translate_path_to(source_os, current_os_tag(), path, mappings)
+}
+
+/// Convert a native OS path to Windows-canonical format for DB storage.
+/// On Windows this is a no-op. On Linux, translates /mnt/nas/... → R:\...
+pub fn to_canonical_path(native_path: &str, mappings: &[crate::settings::PathMapping]) -> String {
+    translate_path_to(current_os_tag(), "win", native_path, mappings)
+}
+
+/// Convert a Windows-canonical DB path to the local native format.
+/// On Windows this is a no-op. On Linux, translates R:\... → /mnt/nas/...
+pub fn from_canonical_path(db_path: &str, mappings: &[crate::settings::PathMapping]) -> String {
+    translate_path_to("win", current_os_tag(), db_path, mappings)
 }
 
 /// Convert forward-slash path to native OS path separators.

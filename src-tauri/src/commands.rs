@@ -5,8 +5,14 @@ use crate::file_ops::FileEntry;
 use crate::project_config::{FolderTypeConfig, ProjectConfig};
 use crate::settings::AppSettings;
 use crate::subscription::{Subscription, TrackedItemRecord};
+use crate::utils::{to_canonical_path, from_canonical_path};
 use chrono::Local;
 use tauri::{Emitter, State};
+
+/// Load path mappings from settings (cached per-call).
+fn load_mappings() -> Vec<crate::settings::PathMapping> {
+    AppSettings::load().path_mappings
+}
 
 // ── Subscriptions ──
 
@@ -16,9 +22,13 @@ pub async fn subscribe_to_job(
     job_path: String,
     job_name: String,
 ) -> Result<Subscription, String> {
-    let result = state.subscription_manager.subscribe_to_job(&job_path, &job_name)?;
+    let mappings = load_mappings();
+    let canonical_path = to_canonical_path(&job_path, &mappings);
+    let mut result = state.subscription_manager.subscribe_to_job(&canonical_path, &job_name)?;
+    // Localize path for frontend
+    result.job_path = from_canonical_path(&result.job_path, &mappings);
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
-        let change = serde_json::json!({"action": "sub_add", "job_path": job_path, "job_name": job_name});
+        let change = serde_json::json!({"action": "sub_add", "job_path": canonical_path, "job_name": job_name});
         mesh.on_table_changed(&change.to_string()).await;
         mesh.mark_snapshot_needed();
     }
@@ -27,9 +37,10 @@ pub async fn subscribe_to_job(
 
 #[tauri::command]
 pub async fn unsubscribe_from_job(state: State<'_, AppState>, job_path: String) -> Result<(), String> {
-    state.subscription_manager.unsubscribe_from_job(&job_path)?;
+    let canonical_path = to_canonical_path(&job_path, &load_mappings());
+    state.subscription_manager.unsubscribe_from_job(&canonical_path)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
-        let change = serde_json::json!({"action": "sub_remove", "job_path": job_path});
+        let change = serde_json::json!({"action": "sub_remove", "job_path": canonical_path});
         mesh.on_table_changed(&change.to_string()).await;
         mesh.mark_snapshot_needed();
     }
@@ -38,14 +49,20 @@ pub async fn unsubscribe_from_job(state: State<'_, AppState>, job_path: String) 
 
 #[tauri::command]
 pub fn get_subscriptions(state: State<AppState>) -> Result<Vec<Subscription>, String> {
-    state.subscription_manager.get_all_subscriptions()
+    let mappings = load_mappings();
+    let mut subs = state.subscription_manager.get_all_subscriptions()?;
+    for sub in &mut subs {
+        sub.job_path = from_canonical_path(&sub.job_path, &mappings);
+    }
+    Ok(subs)
 }
 
 // ── Metadata ──
 
 #[tauri::command]
 pub fn get_item_metadata(state: State<AppState>, item_path: String) -> Result<Option<String>, String> {
-    state.metadata_manager.get_metadata(&item_path)
+    let canonical_path = to_canonical_path(&item_path, &load_mappings());
+    state.metadata_manager.get_metadata(&canonical_path)
 }
 
 #[tauri::command]
@@ -57,9 +74,12 @@ pub async fn upsert_item_metadata(
     metadata_json: String,
     is_tracked: bool,
 ) -> Result<(), String> {
+    let mappings = load_mappings();
+    let canonical_job = to_canonical_path(&job_path, &mappings);
+    let canonical_item = to_canonical_path(&item_path, &mappings);
     state.metadata_manager.write_immediate(
-        &job_path,
-        &item_path,
+        &canonical_job,
+        &canonical_item,
         &folder_name,
         &metadata_json,
         is_tracked,
@@ -67,7 +87,7 @@ pub async fn upsert_item_metadata(
 
     // Also notify mesh sync if enabled
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
-        mesh.on_metadata_edited(&job_path, &item_path, &metadata_json, &folder_name, is_tracked).await;
+        mesh.on_metadata_edited(&canonical_job, &canonical_item, &metadata_json, &folder_name, is_tracked).await;
     }
 
     Ok(())
@@ -78,12 +98,25 @@ pub fn get_tracked_items(
     state: State<AppState>,
     job_path: String,
 ) -> Result<Vec<TrackedItemRecord>, String> {
-    state.subscription_manager.get_tracked_items(&job_path)
+    let mappings = load_mappings();
+    let canonical_job = to_canonical_path(&job_path, &mappings);
+    let mut items = state.subscription_manager.get_tracked_items(&canonical_job)?;
+    for item in &mut items {
+        item.item_path = from_canonical_path(&item.item_path, &mappings);
+        item.job_path = from_canonical_path(&item.job_path, &mappings);
+    }
+    Ok(items)
 }
 
 #[tauri::command]
 pub fn get_all_tracked_items(state: State<AppState>) -> Result<Vec<TrackedItemRecord>, String> {
-    state.subscription_manager.get_all_tracked_items()
+    let mappings = load_mappings();
+    let mut items = state.subscription_manager.get_all_tracked_items()?;
+    for item in &mut items {
+        item.item_path = from_canonical_path(&item.item_path, &mappings);
+        item.job_path = from_canonical_path(&item.job_path, &mappings);
+    }
+    Ok(items)
 }
 
 #[tauri::command]
@@ -92,7 +125,13 @@ pub fn get_folder_metadata(
     job_path: String,
     folder_name: String,
 ) -> Result<Vec<crate::subscription::ItemMetadataRecord>, String> {
-    state.subscription_manager.get_folder_item_metadata(&job_path, &folder_name)
+    let mappings = load_mappings();
+    let canonical_job = to_canonical_path(&job_path, &mappings);
+    let mut records = state.subscription_manager.get_folder_item_metadata(&canonical_job, &folder_name)?;
+    for record in &mut records {
+        record.item_path = from_canonical_path(&record.item_path, &mappings);
+    }
+    Ok(records)
 }
 
 // ── Columns ──
@@ -103,11 +142,19 @@ pub fn get_column_defs(
     job_path: String,
     folder_name: String,
 ) -> Result<Vec<ColumnDefinition>, String> {
-    state.column_config_manager.get_column_defs(&job_path, &folder_name)
+    let mappings = load_mappings();
+    let canonical_job = to_canonical_path(&job_path, &mappings);
+    let mut defs = state.column_config_manager.get_column_defs(&canonical_job, &folder_name)?;
+    for def in &mut defs {
+        def.job_path = from_canonical_path(&def.job_path, &mappings);
+    }
+    Ok(defs)
 }
 
 #[tauri::command]
-pub async fn add_column(state: State<'_, AppState>, def: ColumnDefinition) -> Result<i64, String> {
+pub async fn add_column(state: State<'_, AppState>, mut def: ColumnDefinition) -> Result<i64, String> {
+    let mappings = load_mappings();
+    def.job_path = to_canonical_path(&def.job_path, &mappings);
     let result = state.column_config_manager.add_column(&def)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
         let def_json = serde_json::to_string(&def).unwrap_or_default();
@@ -119,7 +166,9 @@ pub async fn add_column(state: State<'_, AppState>, def: ColumnDefinition) -> Re
 }
 
 #[tauri::command]
-pub async fn update_column(state: State<'_, AppState>, def: ColumnDefinition) -> Result<(), String> {
+pub async fn update_column(state: State<'_, AppState>, mut def: ColumnDefinition) -> Result<(), String> {
+    let mappings = load_mappings();
+    def.job_path = to_canonical_path(&def.job_path, &mappings);
     state.column_config_manager.update_column(&def)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
         let def_json = serde_json::to_string(&def).unwrap_or_default();
@@ -181,9 +230,10 @@ pub async fn add_preset_column(
     job_path: String,
     folder_name: String,
 ) -> Result<i64, String> {
-    let col_id = state.column_config_manager.add_preset_column(preset_id, &job_path, &folder_name)?;
+    let canonical_job = to_canonical_path(&job_path, &load_mappings());
+    let col_id = state.column_config_manager.add_preset_column(preset_id, &canonical_job, &folder_name)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
-        let change = serde_json::json!({"action": "preset_add", "preset_id": preset_id, "job_path": job_path, "folder_name": folder_name});
+        let change = serde_json::json!({"action": "preset_add", "preset_id": preset_id, "job_path": canonical_job, "folder_name": folder_name});
         mesh.on_table_changed(&change.to_string()).await;
         mesh.mark_snapshot_needed();
     }
@@ -194,7 +244,12 @@ pub async fn add_preset_column(
 
 #[tauri::command]
 pub fn get_bookmarks(state: State<AppState>) -> Result<Vec<Bookmark>, String> {
-    state.bookmark_manager.get_all_bookmarks()
+    let mappings = load_mappings();
+    let mut bookmarks = state.bookmark_manager.get_all_bookmarks()?;
+    for bm in &mut bookmarks {
+        bm.path = from_canonical_path(&bm.path, &mappings);
+    }
+    Ok(bookmarks)
 }
 
 #[tauri::command]
@@ -204,15 +259,19 @@ pub fn add_bookmark(
     display_name: String,
     is_project_folder: bool,
 ) -> Result<Bookmark, String> {
-    let result = state.bookmark_manager.add_bookmark(&path, &display_name, is_project_folder);
+    let mappings = load_mappings();
+    let canonical_path = to_canonical_path(&path, &mappings);
+    let mut result = state.bookmark_manager.add_bookmark(&canonical_path, &display_name, is_project_folder)?;
+    result.path = from_canonical_path(&result.path, &mappings);
     #[cfg(windows)]
     sync_explorer_pins(&state);
-    result
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn remove_bookmark(state: State<AppState>, path: String) -> Result<(), String> {
-    let result = state.bookmark_manager.remove_bookmark(&path);
+    let canonical_path = to_canonical_path(&path, &load_mappings());
+    let result = state.bookmark_manager.remove_bookmark(&canonical_path);
     #[cfg(windows)]
     sync_explorer_pins(&state);
     result
@@ -697,6 +756,26 @@ pub fn get_drives() -> Vec<(String, String)> {
                 }
             }
         }
+        // Parse /proc/mounts for CIFS/NFS mounts not under /mnt or /media
+        #[cfg(target_os = "linux")]
+        if let Ok(mounts_content) = std::fs::read_to_string("/proc/mounts") {
+            let known_paths: std::collections::HashSet<String> =
+                drives.iter().map(|(p, _)| p.clone()).collect();
+            for line in mounts_content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let fs_type = parts[2];
+                    let mount_point = parts[1];
+                    if (fs_type == "cifs" || fs_type == "nfs" || fs_type == "nfs4")
+                        && !known_paths.contains(mount_point)
+                    {
+                        let source = parts[0];
+                        let label = format!("{} ({})", mount_point, source);
+                        drives.push((mount_point.to_string(), label));
+                    }
+                }
+            }
+        }
     }
     drives
 }
@@ -821,6 +900,86 @@ pub async fn transcode_clear_completed(
 #[tauri::command]
 pub async fn relaunch_app(app: tauri::AppHandle) -> Result<(), String> {
     app.restart();
+}
+
+// ── Platform ──
+
+#[tauri::command]
+pub fn get_platform() -> String {
+    crate::utils::current_os_tag().to_string()
+}
+
+/// Mount an SMB share via `mount -t cifs` with pkexec for elevation (Linux).
+/// Returns the local mount path (under ~/.local/share/ufb/mnt/<share>/).
+#[tauri::command]
+pub fn mount_smb_share(host: String, share: String, username: String, password: String) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        // Build mount point under ~/.local/share/ufb/mnt/<share>
+        let data_dir = crate::utils::get_app_data_dir();
+        let mount_dir = data_dir.join("mnt").join(&share);
+        std::fs::create_dir_all(&mount_dir)
+            .map_err(|e| format!("Failed to create mount dir: {}", e))?;
+
+        let mount_path = mount_dir.to_string_lossy().to_string();
+        let unc = format!("//{}/{}", host, share);
+
+        // Check if already mounted
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == mount_path {
+                    log::info!("Share {} already mounted at {}", unc, mount_path);
+                    return Ok(mount_path);
+                }
+            }
+        }
+
+        // Write temporary credentials file (readable only by us)
+        let cred_path = data_dir.join(".smb_cred_tmp");
+        let cred_content = format!("username={}\npassword={}\n", username, password);
+        std::fs::write(&cred_path, &cred_content)
+            .map_err(|e| format!("Failed to write credentials file: {}", e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        let uid = unsafe { libc::getuid() }.to_string();
+        let gid = unsafe { libc::getgid() }.to_string();
+
+        let mount_opts = format!(
+            "credentials={},uid={},gid={},file_mode=0644,dir_mode=0755,vers=3.0,rw",
+            cred_path.display(), uid, gid
+        );
+
+        // Use pkexec for GUI sudo prompt
+        let output = std::process::Command::new("pkexec")
+            .args(["mount", "-t", "cifs", &unc, &mount_path, "-o", &mount_opts])
+            .output();
+
+        // Clean up credentials file immediately
+        let _ = std::fs::remove_file(&cred_path);
+
+        match output {
+            Ok(o) if o.status.success() => {
+                log::info!("Mounted {} at {}", unc, mount_path);
+                Ok(mount_path)
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                Err(format!("mount failed: {}", stderr.trim()))
+            }
+            Err(e) => Err(format!("Failed to run pkexec mount: {}", e)),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (host, share, username, password);
+        Err("SMB mounting is only available on Linux".into())
+    }
 }
 
 // ── Deep Link ──
@@ -1104,12 +1263,13 @@ pub async fn create_job_from_template(
     fs_extra::dir::copy(template_dir, &full_path, &opts)
         .map_err(|e| format!("Failed to copy template: {}", e))?;
 
-    // Auto-subscribe
-    state.subscription_manager.subscribe_to_job(&full_path_str, &folder_name)?;
+    // Auto-subscribe (store canonical path in DB)
+    let canonical_path = to_canonical_path(&full_path_str, &load_mappings());
+    state.subscription_manager.subscribe_to_job(&canonical_path, &folder_name)?;
 
     // Notify mesh sync
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
-        let change = serde_json::json!({"action": "sub_add", "job_path": full_path_str, "job_name": folder_name});
+        let change = serde_json::json!({"action": "sub_add", "job_path": canonical_path, "job_name": folder_name});
         mesh.on_table_changed(&change.to_string()).await;
         mesh.mark_snapshot_needed();
     }
@@ -1181,54 +1341,6 @@ pub async fn mount_restart(state: State<'_, AppState>, mount_id: String) -> Resu
     state
         .mount_client
         .send_command(crate::mount_client::UfbToAgent::RestartMount(
-            crate::mount_client::MountIdMsg {
-                mount_id,
-                command_id: uuid::Uuid::new_v4().to_string(),
-            },
-        ))
-        .await
-}
-
-#[tauri::command]
-pub async fn mount_flush_and_restart(
-    state: State<'_, AppState>,
-    mount_id: String,
-) -> Result<(), String> {
-    state
-        .mount_client
-        .send_command(crate::mount_client::UfbToAgent::FlushAndRestart(
-            crate::mount_client::MountIdMsg {
-                mount_id,
-                command_id: uuid::Uuid::new_v4().to_string(),
-            },
-        ))
-        .await
-}
-
-#[tauri::command]
-pub async fn mount_switch_to_smb(
-    state: State<'_, AppState>,
-    mount_id: String,
-) -> Result<(), String> {
-    state
-        .mount_client
-        .send_command(crate::mount_client::UfbToAgent::SwitchToSmb(
-            crate::mount_client::MountIdMsg {
-                mount_id,
-                command_id: uuid::Uuid::new_v4().to_string(),
-            },
-        ))
-        .await
-}
-
-#[tauri::command]
-pub async fn mount_force_rclone(
-    state: State<'_, AppState>,
-    mount_id: String,
-) -> Result<(), String> {
-    state
-        .mount_client
-        .send_command(crate::mount_client::UfbToAgent::ForceRclone(
             crate::mount_client::MountIdMsg {
                 mount_id,
                 command_id: uuid::Uuid::new_v4().to_string(),
@@ -1317,8 +1429,38 @@ pub fn mount_store_credentials(
     }
     #[cfg(not(windows))]
     {
-        let _ = (key, username, password);
-        Err("Credential storage not supported on this platform".into())
+        // File-based credential store matching the agent's format
+        // Stored in ~/.local/share/ufb/credentials.json (chmod 600)
+        let path = crate::utils::get_app_data_dir()
+            .parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cred_path = {
+            let dir = if let Some(home) = std::env::var_os("HOME") {
+                std::path::PathBuf::from(home).join(".local/share/ufb")
+            } else {
+                crate::utils::get_app_data_dir()
+            };
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("credentials.json")
+        };
+        let mut data: std::collections::HashMap<String, serde_json::Value> =
+            std::fs::read_to_string(&cred_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+        data.insert(key.clone(), serde_json::json!({ "u": username, "p": password }));
+        let json = serde_json::to_string_pretty(&data)
+            .map_err(|e| format!("Failed to serialize: {}", e))?;
+        std::fs::write(&cred_path, &json)
+            .map_err(|e| format!("Failed to write credentials: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600));
+        }
+        log::info!("Stored credentials for key: {}", key);
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -1330,8 +1472,17 @@ pub fn mount_has_credentials(key: String) -> Result<bool, String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = key;
-        Ok(false)
+        let cred_path = if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(".local/share/ufb/credentials.json")
+        } else {
+            return Ok(false);
+        };
+        let data: std::collections::HashMap<String, serde_json::Value> =
+            std::fs::read_to_string(&cred_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+        Ok(data.contains_key(&key))
     }
 }
 
@@ -1343,8 +1494,20 @@ pub fn mount_delete_credentials(key: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = key;
-        Err("Credential storage not supported on this platform".into())
+        let cred_path = if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(".local/share/ufb/credentials.json")
+        } else {
+            return Ok(());
+        };
+        let mut data: std::collections::HashMap<String, serde_json::Value> =
+            std::fs::read_to_string(&cred_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+        data.remove(&key);
+        let json = serde_json::to_string_pretty(&data).unwrap_or_default();
+        let _ = std::fs::write(&cred_path, &json);
+        Ok(())
     }
 }
 

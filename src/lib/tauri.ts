@@ -252,15 +252,6 @@ export const mountIsConnected = () =>
 export const mountRestart = (mountId: string) =>
   invoke<void>("mount_restart", { mountId });
 
-export const mountFlushAndRestart = (mountId: string) =>
-  invoke<void>("mount_flush_and_restart", { mountId });
-
-export const mountSwitchToSmb = (mountId: string) =>
-  invoke<void>("mount_switch_to_smb", { mountId });
-
-export const mountForceRclone = (mountId: string) =>
-  invoke<void>("mount_force_rclone", { mountId });
-
 export const mountSaveConfig = (config: import("./types").MountsConfig) =>
   invoke<void>("mount_save_config", { config });
 
@@ -284,6 +275,15 @@ export const mountHideDrives = (letters: string[]) =>
 
 export const mountUnhideDrives = (letters: string[]) =>
   invoke<void>("mount_unhide_drives", { letters });
+
+// ── Platform ──
+
+/** Get the current OS tag: "win", "mac", or "lin" */
+export const getPlatform = () => invoke<string>("get_platform");
+
+/** Mount an SMB share via mount -t cifs (Linux, uses pkexec for elevation). Returns the local mount path. */
+export const mountSmbShare = (host: string, share: string, username: string, password: string) =>
+  invoke<string>("mount_smb_share", { host, share, username, password });
 
 // ── App lifecycle ──
 

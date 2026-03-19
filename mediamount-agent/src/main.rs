@@ -1,13 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
-mod health;
 mod ipc;
 mod messages;
 mod mount_service;
 mod orchestrator;
 mod platform;
-mod rclone;
 mod state;
 mod tray;
 
@@ -31,7 +29,12 @@ impl Drop for MutexGuard {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+struct MutexGuard {
+    _lock_file: std::fs::File,
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 struct MutexGuard;
 
 #[cfg(windows)]
@@ -58,7 +61,40 @@ fn ensure_single_instance() -> MutexGuard {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn ensure_single_instance() -> MutexGuard {
+    use std::os::unix::io::AsRawFd;
+
+    let lock_dir = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let dir = std::path::PathBuf::from(runtime_dir).join("ufb");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    } else {
+        std::path::PathBuf::from("/tmp")
+    };
+
+    let lock_path = lock_dir.join("mediamount-agent.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create lock file {}: {}", lock_path.display(), e);
+            process::exit(1);
+        });
+
+    let fd = lock_file.as_raw_fd();
+    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        log::error!("Another mediamount-agent is already running");
+        process::exit(1);
+    }
+
+    MutexGuard { _lock_file: lock_file }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn ensure_single_instance() -> MutexGuard {
     MutexGuard
 }
@@ -182,14 +218,17 @@ async fn main() {
     #[cfg(windows)]
     let mut ipc_server = ipc::server::IpcServer::start();
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let mut ipc_server = ipc::unix_server::IpcServer::start();
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         log::error!("IPC server not implemented for this platform");
         process::exit(1);
     }
 
-    // Main loop (Windows only — IPC requires named pipes)
-    #[cfg(windows)]
+    // Main event loop
+    #[cfg(any(windows, target_os = "linux"))]
     {
         // Channel for agent→UFB messages from mount orchestrators
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(128);
@@ -344,4 +383,3 @@ fn open_log() {
         }
     }
 }
-

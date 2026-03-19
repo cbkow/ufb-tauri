@@ -17,12 +17,6 @@ pub struct MountStateUpdateMsg {
     pub mount_id: String,
     pub state: String,
     pub state_detail: String,
-    pub cache_used_bytes: u64,
-    pub cache_max_bytes: u64,
-    pub dirty_files: u32,
-    pub last_fallback_time: Option<u64>,
-    pub is_rclone_active: bool,
-    pub is_smb_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,9 +40,6 @@ pub enum UfbToAgent {
     StartMount(MountIdMsg),
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
-    SwitchToSmb(MountIdMsg),
-    ForceRclone(MountIdMsg),
-    FlushAndRestart(MountIdMsg),
     ReloadConfig,
     GetStates,
     Ping,
@@ -70,14 +61,8 @@ mod tests {
     fn test_agent_to_ufb_serde() {
         let msg = AgentToUfb::MountStateUpdate(MountStateUpdateMsg {
             mount_id: "primary-nas".into(),
-            state: "rclone_healthy".into(),
-            state_detail: "Healthy (10)".into(),
-            cache_used_bytes: 268435456000,
-            cache_max_bytes: 1099511627776,
-            dirty_files: 3,
-            last_fallback_time: None,
-            is_rclone_active: true,
-            is_smb_active: false,
+            state: "mounted".into(),
+            state_detail: "Mounted".into(),
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -126,9 +111,6 @@ mod tests {
             UfbToAgent::StartMount(MountIdMsg { mount_id: "x".into(), command_id: "1".into() }),
             UfbToAgent::StopMount(MountIdMsg { mount_id: "x".into(), command_id: "2".into() }),
             UfbToAgent::RestartMount(MountIdMsg { mount_id: "x".into(), command_id: "3".into() }),
-            UfbToAgent::SwitchToSmb(MountIdMsg { mount_id: "x".into(), command_id: "4".into() }),
-            UfbToAgent::ForceRclone(MountIdMsg { mount_id: "x".into(), command_id: "5".into() }),
-            UfbToAgent::FlushAndRestart(MountIdMsg { mount_id: "x".into(), command_id: "6".into() }),
             UfbToAgent::ReloadConfig,
             UfbToAgent::GetStates,
             UfbToAgent::Ping,
@@ -149,12 +131,6 @@ mod tests {
                 mount_id: "x".into(),
                 state: "s".into(),
                 state_detail: "d".into(),
-                cache_used_bytes: 0,
-                cache_max_bytes: 0,
-                dirty_files: 0,
-                last_fallback_time: None,
-                is_rclone_active: false,
-                is_smb_active: false,
             }),
         ];
         for v in variants {

@@ -231,23 +231,6 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
     closeMountCtxMenu();
   }
 
-  function mountCtxFlushRestart() {
-    const menu = mountCtxMenu();
-    if (menu) mountStore.flushAndRestart(menu.mountId);
-    closeMountCtxMenu();
-  }
-
-  function mountCtxSwitchSmb() {
-    const menu = mountCtxMenu();
-    if (menu) mountStore.switchToSmb(menu.mountId);
-    closeMountCtxMenu();
-  }
-
-  function mountCtxForceRclone() {
-    const menu = mountCtxMenu();
-    if (menu) mountStore.forceRclone(menu.mountId);
-    closeMountCtxMenu();
-  }
 
   // Close any open context menu when clicking anywhere
   function onPanelClick() {
@@ -309,29 +292,27 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 const ms = () => mountStore.states[cfg.id];
                 const stateClass = () => {
                   const s = ms()?.state;
-                  if (!s || s === "rclone_healthy") return "mount-healthy";
-                  if (s === "rclone_starting" || s === "initializing" || s === "recovering_to_rclone" || s === "smb_recovering") return "mount-starting";
-                  if (s === "rclone_degraded") return "mount-warn";
-                  if (s === "smb_active" || s === "falling_back_to_smb") return "mount-fallback";
+                  if (!s || s === "mounted") return "mount-healthy";
+                  if (s === "mounting" || s === "initializing") return "mount-starting";
+                  if (s === "error") return "mount-error";
+                  if (s === "stopped") return "mount-warn";
                   return "mount-error";
                 };
                 const stateLabel = () => {
                   const s = ms()?.state;
-                  if (!s || s === "rclone_healthy") return "Healthy";
-                  if (s === "rclone_starting" || s === "initializing") return "Starting";
-                  if (s === "rclone_degraded") return "Degraded";
-                  if (s === "smb_active" || s === "falling_back_to_smb") return "SMB";
-                  if (s === "smb_recovering" || s === "recovering_to_rclone") return "Recovering";
+                  if (!s || s === "mounted") return "Mounted";
+                  if (s === "mounting" || s === "initializing") return "Starting";
                   if (s === "error") return "Error";
+                  if (s === "stopped") return "Stopped";
                   return s ?? "Unknown";
                 };
                 return (
                   <div
                     class="panel-item"
-                    onClick={() => navigate(cfg.mountDriveLetter + ":\\")}
-                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(cfg.mountDriveLetter + ":\\"); } }}
+                    onClick={() => navigate(mountStore.getMountPath(cfg))}
+                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(mountStore.getMountPath(cfg)); } }}
                     onContextMenu={(e) => onMountContextMenu(e, cfg.id)}
-                    title={ms()?.stateDetail ?? cfg.mountDriveLetter + ":\\"}
+                    title={ms()?.stateDetail ?? mountStore.getMountPath(cfg)}
                   >
                     <span class={`mount-status-dot ${stateClass()}`} />
                     <span class="item-label truncate">{cfg.displayName}</span>
@@ -399,7 +380,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
               const mountIssue = () => {
                 const m = mount();
                 if (!m) return null;
-                if (m.state === "rclone_healthy" || m.state === "initializing" || m.state === "rclone_starting") return null;
+                if (m.state === "mounted" || m.state === "initializing" || m.state === "mounting") return null;
                 return m;
               };
               return (
@@ -417,7 +398,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                       class={`mount-badge mount-badge-${mountIssue()!.state === "error" ? "error" : "warn"}`}
                       title={mountIssue()!.stateDetail}
                     >
-                      <span class="icon">{mountIssue()!.state === "error" ? "error" : mountIssue()!.isSmbActive ? "swap_horiz" : "warning"}</span>
+                      <span class="icon">{mountIssue()!.state === "error" ? "error" : "warning"}</span>
                     </span>
                   </Show>
                   <span class="item-badge">{sub.shotCount}</span>
@@ -477,7 +458,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
         {(menu) => {
           const ms = () => mountStore.states[menu().mountId];
           const cfg = () => mountStore.configs.find((c) => c.id === menu().mountId);
-          const mountPath = () => cfg()?.mountDriveLetter ? cfg()!.mountDriveLetter + ":\\" : "";
+          const mountPath = () => cfg() ? mountStore.getMountPath(cfg()!) : "";
           return (
             <div
               class="ctx-menu"
@@ -494,15 +475,6 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
               <div class="ctx-menu-item" onClick={async () => { await revealInFileManager(mountPath()); closeMountCtxMenu(); }}><span class="icon">folder_open</span> Reveal in Explorer</div>
               <div class="ctx-menu-separator" />
               <div class="ctx-menu-item" onClick={mountCtxRestart}><span class="icon">refresh</span> Restart</div>
-              <div class="ctx-menu-item" onClick={mountCtxFlushRestart}><span class="icon">delete_sweep</span> Flush Cache & Restart</div>
-              <Show when={ms()?.isRcloneActive}>
-                <div class="ctx-menu-separator" />
-                <div class="ctx-menu-item" onClick={mountCtxSwitchSmb}><span class="icon">swap_horiz</span> Switch to SMB</div>
-              </Show>
-              <Show when={ms()?.isSmbActive}>
-                <div class="ctx-menu-separator" />
-                <div class="ctx-menu-item" onClick={mountCtxForceRclone}><span class="icon">speed</span> Force rclone</div>
-              </Show>
             </div>
           );
         }}
