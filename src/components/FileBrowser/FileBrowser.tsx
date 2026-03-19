@@ -105,6 +105,14 @@ export function FileBrowser(props: FileBrowserProps) {
   // ── Cut state ──
   const [cutPaths, setCutPaths] = createSignal<string[]>([]);
 
+  // ── Confirmation dialog ──
+  const [confirmAction, setConfirmAction] = createSignal<{
+    action: string;
+    paths: string[];
+    message: string;
+    onConfirm: () => void;
+  } | null>(null);
+
   let containerRef: HTMLDivElement | undefined;
   let contentRef: HTMLDivElement | undefined;
 
@@ -164,31 +172,57 @@ export function FileBrowser(props: FileBrowserProps) {
 
   async function doPaste() {
     const dest = store().currentPath();
+    closeCtxMenu();
     try {
       await clipboardPaste(dest);
-      // If this was a cut operation, delete originals
+      store().refresh();
+      // If this was a cut operation, confirm before deleting originals
       const cuts = cutPaths();
       if (cuts.length > 0) {
-        await deleteToTrash(cuts);
-        setCutPaths([]);
+        const count = cuts.length;
+        setConfirmAction({
+          action: "cut-cleanup",
+          paths: cuts,
+          message: `Delete ${count} original${count !== 1 ? "s" : ""} (cut operation)?`,
+          onConfirm: async () => {
+            setConfirmAction(null);
+            try {
+              await deleteToTrash(cuts);
+              setCutPaths([]);
+              store().refresh();
+            } catch (e) {
+              console.error("Cut cleanup failed:", e);
+            }
+          },
+        });
       }
-      store().refresh();
     } catch (e) {
       console.error("Paste failed:", e);
     }
-    closeCtxMenu();
   }
 
-  async function doDelete(entry: FileEntry | null) {
+  function doDelete(entry: FileEntry | null) {
     const paths = getContextPaths(entry);
     if (paths.length === 0) return;
-    try {
-      await deleteToTrash(paths);
-      store().refresh();
-    } catch (e) {
-      console.error("Delete failed:", e);
-    }
     closeCtxMenu();
+    const count = paths.length;
+    const label = count === 1
+      ? paths[0].split(/[\\/]/).pop() || paths[0]
+      : `${count} items`;
+    setConfirmAction({
+      action: "delete",
+      paths,
+      message: `Delete ${label}?`,
+      onConfirm: async () => {
+        setConfirmAction(null);
+        try {
+          await deleteToTrash(paths);
+          store().refresh();
+        } catch (e) {
+          console.error("Delete failed:", e);
+        }
+      },
+    });
   }
 
   function startRename(entry: FileEntry | null) {
@@ -476,7 +510,24 @@ export function FileBrowser(props: FileBrowserProps) {
       e.preventDefault();
       const paths = getSelectedPaths();
       if (paths.length > 0) {
-        deleteToTrash(paths).then(() => store().refresh());
+        const count = paths.length;
+        const label = count === 1
+          ? paths[0].split(/[\\/]/).pop() || paths[0]
+          : `${count} items`;
+        setConfirmAction({
+          action: "delete",
+          paths,
+          message: `Delete ${label}?`,
+          onConfirm: async () => {
+            setConfirmAction(null);
+            try {
+              await deleteToTrash(paths);
+              store().refresh();
+            } catch (e2) {
+              console.error("Delete failed:", e2);
+            }
+          },
+        });
       }
     } else if (e.key === "F2") {
       e.preventDefault();
@@ -779,6 +830,37 @@ export function FileBrowser(props: FileBrowserProps) {
             </div>
           </div>
         </div>
+      </Show>
+
+      {/* ── Confirm Action Modal ── */}
+      <Show when={confirmAction()}>
+        {(action) => (
+          <div class="modal-overlay">
+            <div class="browser-modal">
+              <div class="browser-modal-title">Confirm</div>
+              <div class="browser-modal-body">
+                <p style={{ margin: "0 0 8px 0" }}>{action().message}</p>
+                <Show when={action().paths.length <= 5}>
+                  <ul style={{ margin: 0, "padding-left": "20px", "font-size": "12px", color: "var(--text-secondary)" }}>
+                    {action().paths.map((p) => (
+                      <li>{p.split(/[\\/]/).pop()}</li>
+                    ))}
+                  </ul>
+                </Show>
+              </div>
+              <div class="browser-modal-actions">
+                <button class="modal-btn" onClick={() => setConfirmAction(null)}>Cancel</button>
+                <button
+                  class="modal-btn modal-btn-danger"
+                  onClick={() => action().onConfirm()}
+                  ref={(el) => requestAnimationFrame(() => el.focus())}
+                >
+                  {action().action === "cut-cleanup" ? "Delete Originals" : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </Show>
     </div>
   );

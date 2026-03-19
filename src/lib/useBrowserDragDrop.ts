@@ -26,10 +26,66 @@ interface ActiveDrag {
   y: number;
 }
 
+// ── Singleton global drop listener ──
+
+const handlerRegistry = new Map<string, { config: BrowserDragDropConfig }>();
+let globalListenerInit = false;
+
+function initGlobalDropListener() {
+  if (globalListenerInit) return;
+  globalListenerInit = true;
+
+  getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+    const scale = window.devicePixelRatio || 1;
+    const pos = "position" in payload ? payload.position : null;
+    const logicalX = pos ? pos.x / scale : 0;
+    const logicalY = pos ? pos.y / scale : 0;
+
+    if (payload.type === "over" || payload.type === "enter") {
+      document.querySelectorAll(".file-browser-content.drop-zone-active")
+        .forEach((el) => el.classList.remove("drop-zone-active"));
+      const el = document.elementFromPoint(logicalX, logicalY);
+      const content = el?.closest(".file-browser")?.querySelector(".file-browser-content");
+      content?.classList.add("drop-zone-active");
+    } else if (payload.type === "leave") {
+      document.querySelectorAll(".file-browser-content.drop-zone-active")
+        .forEach((el) => el.classList.remove("drop-zone-active"));
+    } else if (payload.type === "drop" && payload.paths.length > 0) {
+      document.querySelectorAll(".file-browser-content.drop-zone-active")
+        .forEach((el) => el.classList.remove("drop-zone-active"));
+
+      const el = document.elementFromPoint(logicalX, logicalY);
+      const browserEl = el?.closest(".file-browser");
+      const browserId = browserEl?.getAttribute("data-browser-id");
+
+      if (browserId) {
+        // Find the config that has this browser registered
+        for (const entry of handlerRegistry.values()) {
+          const handler = entry.config.getExternalDropHandler(browserId);
+          if (handler) {
+            handler(payload.paths);
+            return;
+          }
+        }
+      }
+      // Fallback: try first handler we can find
+      for (const entry of handlerRegistry.values()) {
+        const handler = entry.config.getExternalDropHandler("");
+        if (handler) {
+          handler(payload.paths);
+          return;
+        }
+      }
+    }
+  });
+  // No need to store unlisten — global listener lives for app lifetime
+}
+
 /**
  * Shared drag/drop hook used by DualBrowserView and FolderTabView.
  * Handles:
- *   A. Drop from Explorer (Tauri onDragDropEvent)
+ *   A. Drop from Explorer (Tauri onDragDropEvent — single global listener)
  *   B. Drag to Explorer (mouse near window edge → startNativeDrag)
  *   C. Same-browser drag onto a subfolder (move)
  *   D. Cross-browser drag (copy/move, DualBrowserView only)
@@ -40,48 +96,13 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
 
   const [activeDrag, setActiveDrag] = createSignal<ActiveDrag | null>(null);
 
+  // Unique key for this hook instance
+  const registryKey = Math.random().toString(36).slice(2);
+
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-
-    // ── A. External drop from Explorer ──
-    getCurrentWebview()
-      .onDragDropEvent((event) => {
-        const payload = event.payload;
-        const scale = window.devicePixelRatio || 1;
-        const pos = "position" in payload ? payload.position : null;
-        const logicalX = pos ? pos.x / scale : 0;
-        const logicalY = pos ? pos.y / scale : 0;
-
-        if (payload.type === "over" || payload.type === "enter") {
-          document.querySelectorAll(".file-browser-content.drop-zone-active")
-            .forEach((el) => el.classList.remove("drop-zone-active"));
-          const el = document.elementFromPoint(logicalX, logicalY);
-          const content = el?.closest(".file-browser")?.querySelector(".file-browser-content");
-          content?.classList.add("drop-zone-active");
-        } else if (payload.type === "leave") {
-          document.querySelectorAll(".file-browser-content.drop-zone-active")
-            .forEach((el) => el.classList.remove("drop-zone-active"));
-        } else if (payload.type === "drop" && payload.paths.length > 0) {
-          document.querySelectorAll(".file-browser-content.drop-zone-active")
-            .forEach((el) => el.classList.remove("drop-zone-active"));
-
-          const el = document.elementFromPoint(logicalX, logicalY);
-          const browserEl = el?.closest(".file-browser");
-          const browserId = browserEl?.getAttribute("data-browser-id");
-
-          if (browserId) {
-            const handler = config.getExternalDropHandler(browserId);
-            if (handler) {
-              handler(payload.paths);
-              return;
-            }
-          }
-          // Fallback: try first browser we can find a handler for
-          const firstHandler = config.getExternalDropHandler("");
-          firstHandler?.(payload.paths);
-        }
-      })
-      .then((fn) => { unlisten = fn; });
+    // Register with global drop listener
+    initGlobalDropListener();
+    handlerRegistry.set(registryKey, { config });
 
     // ── B/C/D. Internal drag: mousedown → mousemove → mouseup ──
 
@@ -241,7 +262,7 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
     document.addEventListener("mouseup", onMouseUp);
 
     onCleanup(() => {
-      unlisten?.();
+      handlerRegistry.delete(registryKey);
       document.removeEventListener("mousedown", onMouseDown, true);
       document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("mouseup", onMouseUp);

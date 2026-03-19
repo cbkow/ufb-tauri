@@ -1,5 +1,7 @@
 param([string]$Path)
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 if (-not $Path -or -not (Test-Path $Path)) { exit }
 
 # Find latest aerender.exe from Adobe installation
@@ -57,7 +59,7 @@ if ($isDark) {
         Title="AE Render" Width="420" Height="150"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        >
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -104,6 +106,11 @@ if ($isDark) {
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+
+$iconFile = Join-Path $appRoot 'icons\icon.ico'
+if (Test-Path $iconFile) {
+    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconFile))
+}
 
 if ($isDark) {
     $window.Add_SourceInitialized({

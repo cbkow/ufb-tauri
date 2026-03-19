@@ -100,32 +100,27 @@ pub fn rename_path(old_path: &str, new_path: &str) -> Result<(), String> {
     std::fs::rename(old_path, new_path).map_err(|e| format!("Failed to rename: {}", e))
 }
 
-/// Delete files/directories to the OS trash/recycle bin.
-/// Falls back to native shell delete (with confirmation) for network/junction paths
-/// where the Recycle Bin isn't available.
-pub fn delete_to_trash(paths: &[String]) -> Result<(), String> {
-    let mut failed: Vec<String> = Vec::new();
+/// Try to trash a single path. Returns Ok if trashed, Err if it needs fallback.
+pub fn try_trash_one(path: &str) -> Result<(), ()> {
+    trash::delete(path).map_err(|_| ())
+}
 
-    for path in paths {
-        if let Err(_) = trash::delete(path) {
-            failed.push(path.clone());
-        }
-    }
-
-    if failed.is_empty() {
+/// Fallback deletion for paths that can't be recycled (network/junction paths).
+/// On Windows, batches into a single SHFileOperationW call.
+/// On other platforms, uses direct remove.
+pub fn fallback_delete(paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
         return Ok(());
     }
 
-    // Fallback: use native shell delete for paths that couldn't be recycled
-    // (typically network/junction paths with no Recycle Bin)
     #[cfg(windows)]
     {
-        shell_delete_files(&failed)?;
+        shell_delete_files(paths)?;
     }
 
     #[cfg(not(windows))]
     {
-        for path in &failed {
+        for path in paths {
             let p = Path::new(path);
             if p.is_dir() {
                 std::fs::remove_dir_all(p)
@@ -138,6 +133,21 @@ pub fn delete_to_trash(paths: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Delete files/directories to the OS trash/recycle bin.
+/// Falls back to native shell delete (with confirmation) for network/junction paths
+/// where the Recycle Bin isn't available.
+pub fn delete_to_trash(paths: &[String]) -> Result<(), String> {
+    let mut failed: Vec<String> = Vec::new();
+
+    for path in paths {
+        if try_trash_one(path).is_err() {
+            failed.push(path.clone());
+        }
+    }
+
+    fallback_delete(&failed)
 }
 
 /// Windows: delete files using SHFileOperationW which shows the native
@@ -172,56 +182,6 @@ fn shell_delete_files(paths: &[String]) -> Result<(), String> {
         return Err(format!("Shell delete failed (error {})", result));
     }
 
-    Ok(())
-}
-
-/// Copy files to a destination directory.
-pub fn copy_files(sources: &[String], dest: &str) -> Result<(), String> {
-    let dest_path = Path::new(dest);
-    for src in sources {
-        let src_path = Path::new(src);
-        let file_name = src_path
-            .file_name()
-            .ok_or_else(|| format!("Invalid source path: {}", src))?;
-        let target = dest_path.join(file_name);
-
-        if src_path.is_dir() {
-            let mut options = fs_extra::dir::CopyOptions::new();
-            options.overwrite = false;
-            options.copy_inside = true;
-            fs_extra::dir::copy(src_path, &target, &options)
-                .map_err(|e| format!("Failed to copy dir '{}': {}", src, e))?;
-        } else {
-            let options = fs_extra::file::CopyOptions::new();
-            fs_extra::file::copy(src_path, &target, &options)
-                .map_err(|e| format!("Failed to copy file '{}': {}", src, e))?;
-        }
-    }
-    Ok(())
-}
-
-/// Move files to a destination directory.
-pub fn move_files(sources: &[String], dest: &str) -> Result<(), String> {
-    let dest_path = Path::new(dest);
-    for src in sources {
-        let src_path = Path::new(src);
-        let file_name = src_path
-            .file_name()
-            .ok_or_else(|| format!("Invalid source path: {}", src))?;
-        let target = dest_path.join(file_name);
-
-        if src_path.is_dir() {
-            let mut options = fs_extra::dir::CopyOptions::new();
-            options.overwrite = false;
-            options.copy_inside = true;
-            fs_extra::dir::move_dir(src_path, &target, &options)
-                .map_err(|e| format!("Failed to move dir '{}': {}", src, e))?;
-        } else {
-            let options = fs_extra::file::CopyOptions::new();
-            fs_extra::file::move_file(src_path, &target, &options)
-                .map_err(|e| format!("Failed to move file '{}': {}", src, e))?;
-        }
-    }
     Ok(())
 }
 
@@ -291,6 +251,24 @@ fn set_preferred_drop_effect(effect: u32) {
     }
 }
 
+/// Heuristic check: does this string look like a filesystem path?
+/// Avoids blocking I/O (no exists() calls) while filtering garbage clipboard text.
+fn looks_like_path(s: &str) -> bool {
+    // Drive letter (C:\... or C:/...)
+    if s.len() >= 3 && s.as_bytes()[1] == b':' && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/') {
+        return s.as_bytes()[0].is_ascii_alphabetic();
+    }
+    // UNC path (\\server\share)
+    if s.starts_with("\\\\") || s.starts_with("//") {
+        return true;
+    }
+    // Unix absolute path
+    if s.starts_with('/') {
+        return true;
+    }
+    false
+}
+
 /// Paste file paths from clipboard (returns list of paths).
 /// On Windows, reads CF_HDROP first; falls back to plain text.
 pub fn clipboard_paste_paths() -> Result<Vec<String>, String> {
@@ -312,7 +290,7 @@ pub fn clipboard_paste_paths() -> Result<Vec<String>, String> {
     let paths: Vec<String> = text
         .lines()
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && Path::new(l).exists())
+        .filter(|l| !l.is_empty() && looks_like_path(l))
         .collect();
     Ok(paths)
 }
@@ -331,7 +309,7 @@ fn clipboard_paste_paths_hdrop() -> Result<Vec<String>, String> {
 
     let paths: Vec<String> = file_list
         .into_iter()
-        .filter(|s| !s.is_empty() && Path::new(s).exists())
+        .filter(|s| !s.is_empty())
         .collect();
 
     Ok(paths)

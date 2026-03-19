@@ -338,17 +338,23 @@ async fn do_copy_with_progress(
         let dest_path = std::path::Path::new(&dest);
         let total = sources.len();
         let mut last_emit = std::time::Instant::now();
+        let mut errors: Vec<String> = Vec::new();
+        let mut succeeded: usize = 0;
 
         for (i, src) in sources.iter().enumerate() {
             let src_path = std::path::Path::new(src);
-            let file_name = src_path
-                .file_name()
-                .ok_or_else(|| format!("Invalid source path: {}", src))?;
+            let file_name = match src_path.file_name() {
+                Some(f) => f,
+                None => {
+                    errors.push(format!("Invalid source path: {}", src));
+                    continue;
+                }
+            };
             let target = dest_path.join(file_name);
 
-            if src_path.is_dir() {
+            let item_result = if src_path.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
-                options.overwrite = false;
+                options.overwrite = true;
                 options.copy_inside = true;
                 let app3 = app2.clone();
                 let op_id3 = op_id2.clone();
@@ -369,9 +375,11 @@ async fn do_copy_with_progress(
                     }
                     fs_extra::dir::TransitProcessResult::ContinueOrAbort
                 })
-                .map_err(|e| format!("Failed to copy dir '{}': {}", src, e))?;
+                .map_err(|e| format!("Failed to copy dir '{}': {}", src, e))
+                .map(|_| ())
             } else {
-                let options = fs_extra::file::CopyOptions::new();
+                let mut options = fs_extra::file::CopyOptions::new();
+                options.overwrite = true;
                 let app3 = app2.clone();
                 let op_id3 = op_id2.clone();
                 let fname = file_name.to_string_lossy().to_string();
@@ -391,30 +399,42 @@ async fn do_copy_with_progress(
                         last_emit = std::time::Instant::now();
                     }
                 })
-                .map_err(|e| format!("Failed to copy file '{}': {}", src, e))?;
+                .map_err(|e| format!("Failed to copy file '{}': {}", src, e))
+                .map(|_| ())
+            };
+
+            match item_result {
+                Ok(()) => succeeded += 1,
+                Err(e) => errors.push(e),
             }
         }
-        Ok::<(), String>(())
+        (succeeded, errors)
     })
     .await
     .map_err(|e| format!("Copy task failed: {}", e))?;
 
-    match &result {
-        Ok(()) => {
-            let _ = app.emit(
-                "fileop:completed",
-                serde_json::json!({ "id": &op_id }),
-            );
-        }
-        Err(e) => {
-            let _ = app.emit(
-                "fileop:error",
-                serde_json::json!({ "id": &op_id, "error": e }),
-            );
-        }
+    let (succeeded, errors) = result;
+    let failed = errors.len();
+
+    if failed > 0 && succeeded == 0 {
+        let _ = app.emit(
+            "fileop:error",
+            serde_json::json!({ "id": &op_id, "error": errors.join("; ") }),
+        );
+        return Err(errors.join("; "));
     }
 
-    result
+    let _ = app.emit(
+        "fileop:completed",
+        serde_json::json!({
+            "id": &op_id,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+        }),
+    );
+
+    Ok(())
 }
 
 /// Run a move operation on a blocking thread with progress events.
@@ -436,17 +456,23 @@ async fn do_move_with_progress(
         let dest_path = std::path::Path::new(&dest);
         let total = sources.len();
         let mut last_emit = std::time::Instant::now();
+        let mut errors: Vec<String> = Vec::new();
+        let mut succeeded: usize = 0;
 
         for (i, src) in sources.iter().enumerate() {
             let src_path = std::path::Path::new(src);
-            let file_name = src_path
-                .file_name()
-                .ok_or_else(|| format!("Invalid source path: {}", src))?;
+            let file_name = match src_path.file_name() {
+                Some(f) => f,
+                None => {
+                    errors.push(format!("Invalid source path: {}", src));
+                    continue;
+                }
+            };
             let target = dest_path.join(file_name);
 
-            if src_path.is_dir() {
+            let item_result = if src_path.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
-                options.overwrite = false;
+                options.overwrite = true;
                 options.copy_inside = true;
                 let app3 = app2.clone();
                 let op_id3 = op_id2.clone();
@@ -467,9 +493,11 @@ async fn do_move_with_progress(
                     }
                     fs_extra::dir::TransitProcessResult::ContinueOrAbort
                 })
-                .map_err(|e| format!("Failed to move dir '{}': {}", src, e))?;
+                .map_err(|e| format!("Failed to move dir '{}': {}", src, e))
+                .map(|_| ())
             } else {
-                let options = fs_extra::file::CopyOptions::new();
+                let mut options = fs_extra::file::CopyOptions::new();
+                options.overwrite = true;
                 let app3 = app2.clone();
                 let op_id3 = op_id2.clone();
                 let fname = file_name.to_string_lossy().to_string();
@@ -489,37 +517,120 @@ async fn do_move_with_progress(
                         last_emit = std::time::Instant::now();
                     }
                 })
-                .map_err(|e| format!("Failed to move file '{}': {}", src, e))?;
+                .map_err(|e| format!("Failed to move file '{}': {}", src, e))
+                .map(|_| ())
+            };
+
+            match item_result {
+                Ok(()) => succeeded += 1,
+                Err(e) => errors.push(e),
             }
         }
-        Ok::<(), String>(())
+        (succeeded, errors)
     })
     .await
     .map_err(|e| format!("Move task failed: {}", e))?;
 
-    match &result {
-        Ok(()) => {
-            let _ = app.emit(
-                "fileop:completed",
-                serde_json::json!({ "id": &op_id }),
-            );
-        }
-        Err(e) => {
-            let _ = app.emit(
-                "fileop:error",
-                serde_json::json!({ "id": &op_id, "error": e }),
-            );
-        }
+    let (succeeded, errors) = result;
+    let failed = errors.len();
+
+    if failed > 0 && succeeded == 0 {
+        let _ = app.emit(
+            "fileop:error",
+            serde_json::json!({ "id": &op_id, "error": errors.join("; ") }),
+        );
+        return Err(errors.join("; "));
     }
 
-    result
+    let _ = app.emit(
+        "fileop:completed",
+        serde_json::json!({
+            "id": &op_id,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+        }),
+    );
+
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_to_trash(paths: Vec<String>) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || crate::file_ops::delete_to_trash(&paths))
-        .await
-        .map_err(|e| format!("Delete task failed: {}", e))?
+pub async fn delete_to_trash(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let op_id = new_op_id("delete");
+    let _ = app.emit(
+        "fileop:started",
+        serde_json::json!({ "id": &op_id, "operation": "delete", "itemsTotal": paths.len() }),
+    );
+
+    let app2 = app.clone();
+    let op_id2 = op_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let total = paths.len();
+        let mut errors: Vec<String> = Vec::new();
+        let mut succeeded: usize = 0;
+        let mut trash_failed: Vec<String> = Vec::new();
+
+        // Phase 1: try trash::delete per item (fast path), emit progress
+        for (i, path) in paths.iter().enumerate() {
+            let _ = app2.emit(
+                "fileop:progress",
+                serde_json::json!({
+                    "id": &op_id2,
+                    "itemsTotal": total,
+                    "itemsDone": i,
+                    "currentFile": path,
+                }),
+            );
+
+            if crate::file_ops::try_trash_one(path).is_ok() {
+                succeeded += 1;
+            } else {
+                trash_failed.push(path.clone());
+            }
+        }
+
+        // Phase 2: batch fallback for all paths that couldn't be recycled
+        // (single SHFileOperationW call on Windows instead of one per file)
+        if !trash_failed.is_empty() {
+            match crate::file_ops::fallback_delete(&trash_failed) {
+                Ok(()) => succeeded += trash_failed.len(),
+                Err(e) => {
+                    for path in &trash_failed {
+                        errors.push(format!("{}: {}", path, e));
+                    }
+                }
+            }
+        }
+
+        (succeeded, errors)
+    })
+    .await
+    .map_err(|e| format!("Delete task failed: {}", e))?;
+
+    let (succeeded, errors) = result;
+    let failed = errors.len();
+
+    if failed > 0 && succeeded == 0 {
+        let _ = app.emit(
+            "fileop:error",
+            serde_json::json!({ "id": &op_id, "error": errors.join("; ") }),
+        );
+        return Err(errors.join("; "));
+    }
+
+    let _ = app.emit(
+        "fileop:completed",
+        serde_json::json!({
+            "id": &op_id,
+            "succeeded": succeeded,
+            "failed": failed,
+            "errors": errors,
+        }),
+    );
+
+    Ok(())
 }
 
 #[tauri::command]

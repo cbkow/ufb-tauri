@@ -5,6 +5,8 @@ param(
     [string]$TemplateFile = ""
 )
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 # DWM interop for dark title bar, AppUserModelID for taskbar icon
@@ -52,7 +54,7 @@ if ($isDark) {
         Title="$Title" Width="420" Height="195"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        >
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -148,6 +150,11 @@ if ($isDark) {
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+
+$iconFile = Join-Path $appRoot 'icons\icon.ico'
+if (Test-Path $iconFile) {
+    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconFile))
+}
 
 # Apply dark title bar via DWM if dark mode
 if ($isDark) {

@@ -1,4 +1,4 @@
-import { Show, For } from "solid-js";
+import { Show, For, createSignal } from "solid-js";
 import { fileOpsStore } from "../../stores/fileOpsStore";
 import "./FileOpsProgress.css";
 
@@ -10,6 +10,8 @@ export function FileOpsProgress() {
       <div class="fileops-bar">
         <For each={ops()}>
           {(op) => {
+            const [showErrors, setShowErrors] = createSignal(false);
+
             const percent = () => {
               if (op.totalBytes > 0)
                 return Math.round((op.copiedBytes / op.totalBytes) * 100);
@@ -19,8 +21,13 @@ export function FileOpsProgress() {
             };
 
             const label = () => {
-              if (op.status === "completed") {
+              if (op.status === "completed_with_errors") {
                 const verb = op.operation === "move" ? "Moved" : "Copied";
+                return `${verb} ${op.succeeded ?? 0}/${op.itemsTotal} items (${op.failed ?? 0} failed)`;
+              }
+              if (op.status === "completed") {
+                const verb = op.operation === "move" ? "Moved" :
+                  op.operation === "delete" ? "Deleted" : "Copied";
                 return `${verb} ${op.itemsTotal} item${op.itemsTotal !== 1 ? "s" : ""}`;
               }
               if (op.status === "error") return `Failed: ${op.error}`;
@@ -41,12 +48,15 @@ export function FileOpsProgress() {
               op.itemsTotal > 1 ? Math.round((op.itemsDone / op.itemsTotal) * 100) : 0;
 
             return (
-              <div class={`fileops-item fileops-${op.status}`}>
+              <div class={`fileops-item fileops-${op.status === "completed_with_errors" ? "warning" : op.status}`}>
                 <Show when={op.status === "active"}>
                   <span class="icon fileops-spinner">sync</span>
                 </Show>
                 <Show when={op.status === "completed"}>
                   <span class="icon fileops-check">check_circle</span>
+                </Show>
+                <Show when={op.status === "completed_with_errors"}>
+                  <span class="icon fileops-warning-icon">warning</span>
                 </Show>
                 <Show when={op.status === "error"}>
                   <span class="icon fileops-error-icon">error</span>
@@ -57,6 +67,14 @@ export function FileOpsProgress() {
                     <span class="fileops-label">{label()}</span>
                     <Show when={shortFile() && op.status === "active"}>
                       <span class="fileops-filename">{shortFile()}</span>
+                    </Show>
+                    <Show when={op.status === "completed_with_errors" && op.errors && op.errors.length > 0}>
+                      <button
+                        class="fileops-toggle-errors"
+                        onClick={() => setShowErrors(!showErrors())}
+                      >
+                        {showErrors() ? "Hide errors" : "Show errors"}
+                      </button>
                     </Show>
                   </div>
 
@@ -83,6 +101,14 @@ export function FileOpsProgress() {
                         />
                       </div>
                       <span class="fileops-percent">{percent()}%</span>
+                    </div>
+                  </Show>
+
+                  <Show when={showErrors() && op.errors}>
+                    <div class="fileops-error-list">
+                      <For each={op.errors}>
+                        {(err) => <div class="fileops-error-line">{err}</div>}
+                      </For>
                     </div>
                   </Show>
                 </div>

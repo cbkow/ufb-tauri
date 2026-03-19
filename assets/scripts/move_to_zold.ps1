@@ -1,6 +1,8 @@
 param([string]$Paths)
 
-$fileList = $Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) }
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
+$fileList = @($Paths -split '\|' | Where-Object { $_ -and (Test-Path $_) })
 if (-not $fileList -or $fileList.Count -eq 0) { exit }
 
 $sourceDir = [System.IO.Path]::GetDirectoryName($fileList[0])
@@ -61,7 +63,7 @@ $message = "Moved $count $noun to Z_OLD."
         Title="Move to Z_OLD" Width="420" Height="150"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="$bg"
-        Icon="C:\Program Files\ufb\assets\icons\ufpn.ico">
+        >
     <Window.Resources>
         <Style x:Key="PrimaryButton" TargetType="Button">
             <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
@@ -108,6 +110,11 @@ $message = "Moved $count $noun to Z_OLD."
 
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
+
+$iconFile = Join-Path $appRoot 'icons\icon.ico'
+if (Test-Path $iconFile) {
+    $window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($iconFile))
+}
 
 if ($isDark) {
     $window.Add_SourceInitialized({

@@ -9,8 +9,11 @@ export interface FileOperation {
   currentFile: string;
   itemsTotal: number;
   itemsDone: number;
-  status: "active" | "completed" | "error";
+  status: "active" | "completed" | "completed_with_errors" | "error";
   error?: string;
+  errors?: string[];
+  succeeded?: number;
+  failed?: number;
 }
 
 function createFileOpsStore() {
@@ -52,16 +55,27 @@ function createFileOpsStore() {
   });
 
   listen<any>("fileop:completed", (event) => {
-    const { id } = event.payload;
+    const { id, errors, succeeded, failed } = event.payload;
+    const hasErrors = errors && errors.length > 0;
     setOperations((ops) =>
       ops.map((op) =>
-        op.id === id ? { ...op, status: "completed" as const } : op
+        op.id === id
+          ? {
+              ...op,
+              status: hasErrors ? "completed_with_errors" as const : "completed" as const,
+              errors: errors ?? undefined,
+              succeeded: succeeded ?? op.itemsTotal,
+              failed: failed ?? 0,
+            }
+          : op
       )
     );
-    // Auto-dismiss after 3 seconds
-    setTimeout(() => {
-      setOperations((ops) => ops.filter((op) => op.id !== id));
-    }, 3000);
+    // Auto-dismiss only fully successful operations
+    if (!hasErrors) {
+      setTimeout(() => {
+        setOperations((ops) => ops.filter((op) => op.id !== id));
+      }, 3000);
+    }
   });
 
   listen<any>("fileop:error", (event) => {

@@ -9,4 +9,4 @@ Windows Registry Editor Version 5.00
 [HKEY_CLASSES_ROOT\union\shell\open]
 
 [HKEY_CLASSES_ROOT\union\shell\open\command]
-@="\"C:\\Windows\\System32\\wscript.exe\" \"C:\\Program Files\\ufb\\assets\\shell\\open_union_link.vbs\" \"%1\""
+@="\"C:\\Windows\\System32\\wscript.exe\" \"C:\\Program Files\\Union File Browser\\assets\\scripts\\open_union_link.vbs\" \"%1\""

@@ -3,6 +3,8 @@ param(
     [string]$Mode = "doc"  # "doc" or "folder"
 )
 
+$appRoot = Split-Path (Split-Path $PSScriptRoot)
+
 # Job root prefixes (case-insensitive)
 $jobRoots = @(
     "D:\Jobs_Live",
@@ -37,7 +39,7 @@ if (-not $jobName) {
 }
 
 # Read config
-$configPath = "C:\Program Files\ufb\assets\google_config\config.json"
+$configPath = Join-Path $appRoot 'assets\google_config\config.json'
 if (-not (Test-Path $configPath)) {
     [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms") | Out-Null
     [System.Windows.Forms.MessageBox]::Show(

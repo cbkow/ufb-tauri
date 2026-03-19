@@ -130,3 +130,41 @@
 .fileops-dismiss .icon {
   font-size: 14px;
 }
+
+.fileops-warning-icon {
+  color: var(--warning, #f59e0b);
+  font-size: 16px;
+}
+
+.fileops-warning {
+  opacity: 1;
+}
+
+.fileops-toggle-errors {
+  background: none;
+  border: none;
+  color: var(--accent-color);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.fileops-toggle-errors:hover {
+  text-decoration: underline;
+}
+
+.fileops-error-list {
+  max-height: 120px;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding: 4px 0;
+  font-size: 11px;
+}
+
+.fileops-error-line {
+  color: var(--error, #dc2626);
+  padding: 1px 0;
+  word-break: break-all;
+}
