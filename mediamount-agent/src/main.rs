@@ -29,12 +29,12 @@ impl Drop for MutexGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct MutexGuard {
     _lock_file: std::fs::File,
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, unix)))]
 struct MutexGuard;
 
 #[cfg(windows)]
@@ -61,7 +61,7 @@ fn ensure_single_instance() -> MutexGuard {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn ensure_single_instance() -> MutexGuard {
     use std::os::unix::io::AsRawFd;
 
@@ -94,7 +94,7 @@ fn ensure_single_instance() -> MutexGuard {
     MutexGuard { _lock_file: lock_file }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, unix)))]
 fn ensure_single_instance() -> MutexGuard {
     MutexGuard
 }
@@ -218,17 +218,17 @@ async fn main() {
     #[cfg(windows)]
     let mut ipc_server = ipc::server::IpcServer::start();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let mut ipc_server = ipc::unix_server::IpcServer::start();
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, unix)))]
     {
         log::error!("IPC server not implemented for this platform");
         process::exit(1);
     }
 
     // Main event loop
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, unix))]
     {
         // Channel for agent→UFB messages from mount orchestrators
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(128);
@@ -375,7 +375,13 @@ fn open_log() {
                 .args(["/C", "start", "", &path.to_string_lossy()])
                 .spawn();
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg(&path)
+                .spawn();
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let _ = std::process::Command::new("xdg-open")
                 .arg(&path)

@@ -326,7 +326,7 @@ impl MountClient {
                 }
             }
 
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             match connect_to_agent_unix() {
                 Ok(stream) => {
                     log::info!("MountClient: connected to agent (unix socket)");
@@ -413,7 +413,7 @@ impl MountClient {
                 }
             }
 
-            #[cfg(not(any(windows, target_os = "linux")))]
+            #[cfg(not(any(windows, unix)))]
             {
                 log::debug!("MountClient: not supported on this platform");
             }
@@ -502,8 +502,8 @@ pub fn save_mount_config(config: &MountsConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Connect to the agent's Unix domain socket (Linux).
-#[cfg(target_os = "linux")]
+/// Connect to the agent's Unix domain socket (Linux/macOS).
+#[cfg(unix)]
 fn connect_to_agent_unix() -> io::Result<std::os::unix::net::UnixStream> {
     let sock_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         std::path::PathBuf::from(runtime_dir).join("ufb/mediamount-agent.sock")

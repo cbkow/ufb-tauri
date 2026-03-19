@@ -1,7 +1,7 @@
 #[cfg(windows)]
 pub mod server;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod unix_server;
 
 use std::io::{self, Read, Write};

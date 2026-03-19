@@ -486,27 +486,29 @@ export function FileBrowser(props: FileBrowserProps) {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
-    if (e.ctrlKey && e.key === "a") {
+    const modKey = e.ctrlKey || e.metaKey;
+
+    if (modKey && e.key === "a") {
       e.preventDefault();
       store().selectAll();
-    } else if (e.ctrlKey && e.key === "c") {
+    } else if (modKey && e.key === "c") {
       e.preventDefault();
       const paths = getSelectedPaths();
       if (paths.length > 0) {
         setCutPaths([]);
         clipboardCopyPaths(paths);
       }
-    } else if (e.ctrlKey && e.key === "x") {
+    } else if (modKey && e.key === "x") {
       e.preventDefault();
       const paths = getSelectedPaths();
       if (paths.length > 0) {
         setCutPaths(paths);
         clipboardCopyPaths(paths);
       }
-    } else if (e.ctrlKey && e.key === "v") {
+    } else if (modKey && e.key === "v") {
       e.preventDefault();
       doPaste();
-    } else if (e.key === "Delete") {
+    } else if (e.key === "Delete" || (modKey && e.key === "Backspace")) {
       e.preventDefault();
       const paths = getSelectedPaths();
       if (paths.length > 0) {
@@ -537,7 +539,7 @@ export function FileBrowser(props: FileBrowserProps) {
         const entry = store().entries.find((en) => en.path === path);
         if (entry) startRename(entry);
       }
-    } else if (e.ctrlKey && e.shiftKey && e.key === "N") {
+    } else if (modKey && e.shiftKey && e.key === "N") {
       e.preventDefault();
       openNewFolderModal();
     }

@@ -176,6 +176,16 @@ impl Orchestrator {
                     .await;
             }
         }
+
+        #[cfg(target_os = "macos")]
+        {
+            let reason = "macOS SMB mounting not yet implemented".to_string();
+            log::error!("[{}] {}", self.mount_id, reason);
+            let _ = self
+                .event_tx
+                .send(MountEvent::MountFailed { reason })
+                .await;
+        }
     }
 
     async fn disconnect_drive(&mut self) {
@@ -197,6 +207,11 @@ impl Orchestrator {
                 log::warn!("[{}] Remove symlink failed (non-fatal): {}", self.mount_id, e);
             }
         }
+
+        #[cfg(target_os = "macos")]
+        {
+            log::warn!("[{}] macOS disconnect not yet implemented (no-op)", self.mount_id);
+        }
     }
 
     async fn retrieve_credentials(&self) -> (String, String) {
@@ -215,7 +230,7 @@ impl Orchestrator {
                 }
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use crate::platform::CredentialStore;
             let cred_store = crate::platform::linux::LinuxCredentialStore::new();
@@ -230,7 +245,7 @@ impl Orchestrator {
                 }
             }
         }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, unix)))]
         { (String::new(), String::new()) }
     }
 

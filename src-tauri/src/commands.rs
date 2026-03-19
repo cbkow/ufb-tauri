@@ -1086,10 +1086,15 @@ pub fn mount_smb_share(host: String, share: String, username: String, password: 
             Err(e) => Err(format!("Failed to run pkexec mount: {}", e)),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let _ = (host, share, username, password);
-        Err("SMB mounting is only available on Linux".into())
+        Err("SMB mounting not yet implemented on macOS. Use Finder > Go > Connect to Server to mount SMB shares.".into())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (host, share, username, password);
+        Err("SMB mounting is not available on this platform".into())
     }
 }
 

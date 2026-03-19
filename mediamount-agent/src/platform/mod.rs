@@ -1,7 +1,7 @@
 #[cfg(windows)]
 pub mod windows;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod linux;
 
 /// Trait for managing mount-point mappings (Linux only).
