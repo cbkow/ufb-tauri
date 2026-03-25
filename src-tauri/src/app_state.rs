@@ -218,4 +218,56 @@ impl AppState {
             manager.shutdown().await;
         }
     }
+
+    /// Reinitialize mesh sync with current settings (e.g. after farm_path change).
+    pub async fn reinit_mesh_sync(&self, handle: tauri::AppHandle) {
+        // Shutdown existing manager
+        {
+            let lock = self.mesh_sync_manager.lock().await;
+            if let Some(ref manager) = *lock {
+                manager.shutdown().await;
+            }
+        }
+
+        // Drop old manager and create new one from current settings
+        let settings = crate::settings::AppSettings::load();
+        let ms = &settings.mesh_sync;
+
+        if ms.farm_path.is_empty() {
+            log::info!("Mesh sync reinit: farmPath empty, clearing manager");
+            *self.mesh_sync_manager.lock().await = None;
+            return;
+        }
+
+        let tags: Vec<String> = ms
+            .tags
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let manager = MeshSyncManager::new(
+            ms.farm_path.clone(),
+            ms.node_id.clone(),
+            ms.http_port,
+            ms.api_secret.clone(),
+            tags,
+            Arc::clone(&self.db),
+            Arc::clone(&self.column_config_manager),
+        );
+
+        manager.set_app_handle(handle).await;
+
+        let should_enable = settings.sync.enabled;
+        *self.mesh_sync_manager.lock().await = Some(manager);
+
+        if should_enable {
+            let lock = self.mesh_sync_manager.lock().await;
+            if let Some(ref m) = *lock {
+                m.set_enabled(true).await;
+            }
+        }
+
+        log::info!("Mesh sync reinitialised (farm: {})", ms.farm_path);
+    }
 }

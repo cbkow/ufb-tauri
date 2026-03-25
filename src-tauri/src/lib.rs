@@ -185,6 +185,7 @@ pub fn run() {
             commands::set_mesh_enabled,
             commands::trigger_flush_edits,
             commands::trigger_snapshot,
+            commands::reinit_mesh_sync,
             commands::get_mesh_peers,
             // URI / Links
             commands::build_ufb_uri,

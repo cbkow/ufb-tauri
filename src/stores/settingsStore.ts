@@ -44,6 +44,7 @@ const defaultSettings: AppSettings = {
   ui: {
     fontScale: 1.0,
     browserPanelRatios: [0.2, 0.4, 0.4],
+    browserColumns: { size: true, modified: true, type: true },
   },
   sync: { enabled: false },
   meshSync: {

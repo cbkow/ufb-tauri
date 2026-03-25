@@ -43,6 +43,12 @@ export function DualBrowserView(props: DualBrowserViewProps) {
     (path: string) => browser1.selectItem(path),
   );
 
+  // Register with workspaceStore so any component can navigate the main browsers
+  workspaceStore.registerMainBrowserNav(
+    (path: string) => browser1.navigateTo(path),
+    (path: string) => browser2.navigateTo(path),
+  );
+
   const callbacks1: FileBrowserCallbacks = {
     onOpenInOtherBrowser: (path) => browser2.navigateTo(path),
     onOpenInNewTab: (path) => workspaceStore.openBrowserTab(path),

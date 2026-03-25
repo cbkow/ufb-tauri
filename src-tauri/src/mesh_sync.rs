@@ -244,8 +244,10 @@ impl MeshSyncManager {
                 let pm = self.peer_manager.clone();
                 let enabled = self.enabled.clone();
                 let is_leader = self.is_leader.clone();
+                let cmd_tx = self.command_tx.clone();
                 let handle = tokio::spawn(async move {
                     let client = reqwest::Client::new();
+                    let mut had_alive_peers = false;
                     loop {
                         if !enabled.load(Ordering::Relaxed) {
                             break;
@@ -265,6 +267,24 @@ impl MeshSyncManager {
                         if was_leader != now_leader {
                             log::info!("Leadership changed: now {} (peers: {})", if now_leader { "LEADER" } else { "FOLLOWER" }, pm.get_peer_count());
                         }
+
+                        // Detect peer count changes for catch-up
+                        let alive_count = pm.get_alive_peers().len();
+                        let has_alive_peers = alive_count > 0;
+
+                        if has_alive_peers && !had_alive_peers {
+                            if now_leader {
+                                // Leader: a peer just came back — ensure snapshot is fresh
+                                log::info!("Sync: Peer(s) reappeared, triggering snapshot for catch-up");
+                                let _ = cmd_tx.lock().await.send(SyncCommand::TakeSnapshot);
+                            } else {
+                                // Follower: re-restore snapshot from shared storage
+                                log::info!("Sync: Peers reappeared after isolation, re-restoring snapshot");
+                                let _ = cmd_tx.lock().await.send(SyncCommand::RestoreSnapshot);
+                            }
+                        }
+                        had_alive_peers = has_alive_peers;
+
                         pm.cleanup_stale_peers();
                         tokio::time::sleep(std::time::Duration::from_millis(PEER_LOOP_INTERVAL_MS)).await;
                     }

@@ -93,6 +93,30 @@ function getActiveTab(): WorkspaceTab | undefined {
   return state.tabs.find((t) => t.id === activeTabId());
 }
 
+// ── Main browser navigation (registered by DualBrowserView) ──
+let _navigateLeft: ((path: string) => void) | undefined;
+let _navigateRight: ((path: string) => void) | undefined;
+
+function registerMainBrowserNav(
+  left: (path: string) => void,
+  right: (path: string) => void,
+) {
+  _navigateLeft = left;
+  _navigateRight = right;
+}
+
+/** Switch to main tab and navigate the left browser */
+function navigateMainLeft(path: string) {
+  setActiveTabId("main");
+  _navigateLeft?.(path);
+}
+
+/** Switch to main tab and navigate the right browser */
+function navigateMainRight(path: string) {
+  setActiveTabId("main");
+  _navigateRight?.(path);
+}
+
 export const workspaceStore = {
   get tabs() { return state.tabs; },
   activeTabId,
@@ -104,4 +128,7 @@ export const workspaceStore = {
   openNotesTab,
   openTranscodeQueue,
   closeTab,
+  registerMainBrowserNav,
+  navigateMainLeft,
+  navigateMainRight,
 };

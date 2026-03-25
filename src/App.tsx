@@ -1,4 +1,4 @@
-import { onMount, onCleanup, createSignal, Show, For, Switch, Match, createMemo } from "solid-js";
+import { onMount, onCleanup, createSignal, createEffect, on, Show, For, Switch, Match, createMemo } from "solid-js";
 import { settingsStore } from "./stores/settingsStore";
 import { subscriptionStore } from "./stores/subscriptionStore";
 import { workspaceStore } from "./stores/workspaceStore";
@@ -83,7 +83,34 @@ export default function App() {
     };
     window.addEventListener("keydown", handleZoom);
     onCleanup(() => window.removeEventListener("keydown", handleZoom));
+
+    // ── F5 / Ctrl+R → refresh browsers (prevent webview reload) ──
+    const handleRefreshKey = (e: KeyboardEvent) => {
+      if (e.key === "F5" || ((e.ctrlKey || e.metaKey) && e.key === "r")) {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("ufb:refresh"));
+      }
+    };
+    window.addEventListener("keydown", handleRefreshKey);
+    onCleanup(() => window.removeEventListener("keydown", handleRefreshKey));
+
+    // ── Window focus → refresh browsers ──
+    let focusDebounce: ReturnType<typeof setTimeout> | null = null;
+    const handleWindowFocus = () => {
+      if (focusDebounce) clearTimeout(focusDebounce);
+      focusDebounce = setTimeout(() => {
+        focusDebounce = null;
+        window.dispatchEvent(new CustomEvent("ufb:refresh"));
+      }, 500);
+    };
+    window.addEventListener("focus", handleWindowFocus);
+    onCleanup(() => window.removeEventListener("focus", handleWindowFocus));
   });
+
+  // ── Tab switch → refresh browsers ──
+  createEffect(on(workspaceStore.activeTabId, () => {
+    window.dispatchEvent(new CustomEvent("ufb:refresh"));
+  }, { defer: true }));
 
   return (
     <Show when={ready()} fallback={<div class="loading">Loading...</div>}>

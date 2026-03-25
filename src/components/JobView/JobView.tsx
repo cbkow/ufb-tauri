@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, createEffect, on, For, onMount, Show } from "solid-js";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { listDirectory } from "../../lib/tauri";
 import { settingsStore } from "../../stores/settingsStore";
@@ -28,6 +28,11 @@ export function JobView(props: JobViewProps) {
       console.error("Failed to load job folders:", err);
     }
   });
+
+  // Refresh browsers when switching sub-tabs
+  createEffect(on(activeTab, () => {
+    window.dispatchEvent(new CustomEvent("ufb:refresh"));
+  }, { defer: true }));
 
   function buildNotesUrl(mode: "doc" | "folder"): string | null {
     const { scriptUrl, parentFolderId } = settingsStore.settings.googleDrive;

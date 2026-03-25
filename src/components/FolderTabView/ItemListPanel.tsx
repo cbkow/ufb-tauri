@@ -11,11 +11,14 @@ import {
   getFolderMetadata,
   upsertItemMetadata,
   updateColumn,
+  clipboardPaste,
+  clipboardCopyPaths,
 } from "../../lib/tauri";
 import type { FileEntry, ColumnDefinition } from "../../lib/types";
 import { renderCellValue as sharedRenderCellValue, formatDate } from "../../lib/cellRenderers";
 import { makeColumnResizer } from "../../lib/useColumnResize";
 import { ColumnManagerDialog } from "./ColumnManagerDialog";
+import { workspaceStore } from "../../stores/workspaceStore";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
 import "./ItemListPanel.css";
 
@@ -30,6 +33,8 @@ interface ItemListPanelProps {
   hideAddButton?: boolean;
   /** Increment this signal to trigger a refresh */
   refreshTrigger?: () => number;
+  /** Unique ID for drag-drop integration */
+  browserId?: string;
 }
 
 /** Template/placeholder folder names to hide from the item list */
@@ -75,6 +80,37 @@ export function ItemListPanel(props: ItemListPanelProps) {
   const [showColumnManager, setShowColumnManager] = createSignal(false);
   const [overrideWidths, setOverrideWidths] = createSignal<Record<number, number>>({});
   const [saveError, setSaveError] = createSignal<string | null>(null);
+
+  let panelRef: HTMLDivElement | undefined;
+
+  // ── Keyboard shortcuts (paste) ──
+
+  function onKeyDown(e: KeyboardEvent) {
+    const tag = (e.target as HTMLElement)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+    const modKey = e.ctrlKey || e.metaKey;
+
+    if (modKey && e.key === "c") {
+      e.preventDefault();
+      const sel = props.selectedItem();
+      if (sel) {
+        clipboardCopyPaths([sel]).catch((err) => console.error("Copy failed:", err));
+      }
+    } else if (modKey && e.key === "v") {
+      e.preventDefault();
+      doPaste();
+    }
+  }
+
+  async function doPaste() {
+    try {
+      await clipboardPaste(props.folderPath);
+      refresh();
+    } catch (err) {
+      console.error("Paste failed:", err);
+    }
+  }
 
   function showError(msg: string) {
     setSaveError(msg);
@@ -175,10 +211,24 @@ export function ItemListPanel(props: ItemListPanelProps) {
     }
   }
 
+  // Refresh on global ufb:refresh event (F5, window focus, tab switch)
+  let globalRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
+  function onGlobalRefresh() {
+    if (!globalRefreshDebounce) {
+      globalRefreshDebounce = setTimeout(() => {
+        globalRefreshDebounce = null;
+        refresh();
+        loadMetadata();
+      }, 300);
+    }
+  }
+
   onMount(() => {
     refresh();
     loadColumns();
     loadMetadata();
+    panelRef?.addEventListener("keydown", onKeyDown);
+    window.addEventListener("ufb:refresh", onGlobalRefresh);
   });
 
   // Listen for mesh sync changes and refresh UI
@@ -194,22 +244,30 @@ export function ItemListPanel(props: ItemListPanelProps) {
     }
   }));
 
-  // Metadata changed on a peer — reload metadata for this folder
+  // Metadata changed on a peer — reload metadata and folder listing
   unlistens.push(listen("mesh:metadata-changed", (event: any) => {
     const payload = event?.payload;
     // Reload if it's for our job, or if no filter info available
     if (!payload?.job_path || payload.job_path === props.jobPath) {
       loadMetadata();
+      refresh();
     }
   }));
 
   // Full data refresh after snapshot restore
   unlistens.push(listen("mesh:data-refreshed", () => {
+    refresh();
     loadColumns();
     loadMetadata();
+    // Also refresh FileBrowser stores (right-side panels)
+    window.dispatchEvent(new CustomEvent("ufb:refresh"));
   }));
 
-  onCleanup(() => { unlistens.forEach(p => p.then(fn => fn())); });
+  onCleanup(() => {
+    unlistens.forEach(p => p.then(fn => fn()));
+    panelRef?.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("ufb:refresh", onGlobalRefresh);
+  });
 
   // Re-fetch when folder changes
   createEffect(on(() => props.folderPath, () => {
@@ -361,7 +419,15 @@ export function ItemListPanel(props: ItemListPanelProps) {
   }
 
   return (
-    <div class="item-list-panel" onClick={() => { closeCtxMenu(); setColHeaderMenu(null); }}>
+    <div
+      class="item-list-panel"
+      ref={panelRef}
+      tabIndex={0}
+      data-drop-path={props.folderPath}
+      data-browser-id={props.browserId}
+      onClick={() => { closeCtxMenu(); setColHeaderMenu(null); }}
+      onMouseDown={() => panelRef?.focus()}
+    >
       <div class="item-list-header">
         <span class="item-list-header-title">
           {props.folderPath.split(/[\\/]/).pop() ?? "Items"}
@@ -416,6 +482,8 @@ export function ItemListPanel(props: ItemListPanelProps) {
               return (
                 <div
                   class={`item-row ${props.selectedItem() === item.path ? "selected" : ""}`}
+                  data-path={item.path}
+                  data-is-dir="true"
                   onClick={() => props.onSelectItem(item.path)}
                   onDblClick={() => props.onDoubleClickItem(item.path)}
                   onContextMenu={(e) => onItemContextMenu(e, item)}
@@ -454,6 +522,17 @@ export function ItemListPanel(props: ItemListPanelProps) {
             <div class="ctx-menu-item" onClick={() => { props.onSelectItem(menu().item.path); closeCtxMenu(); }}>
               <span class="icon">open_in_new</span> Open
             </div>
+            <div class="ctx-menu-separator" />
+            <div class="ctx-menu-item" onClick={() => { workspaceStore.navigateMainLeft(menu().item.path); closeCtxMenu(); }}>
+              <span class="icon">arrow_back</span> Open in Left Browser
+            </div>
+            <div class="ctx-menu-item" onClick={() => { workspaceStore.navigateMainRight(menu().item.path); closeCtxMenu(); }}>
+              <span class="icon">arrow_forward</span> Open in Right Browser
+            </div>
+            <div class="ctx-menu-item" onClick={() => { workspaceStore.openBrowserTab(menu().item.path); closeCtxMenu(); }}>
+              <span class="icon">tab</span> Open in New Tab
+            </div>
+            <div class="ctx-menu-separator" />
             <div class="ctx-menu-item" onClick={ctxToggleTracked}>
               <span class="icon">{metadataMap()[menu().item.path]?.isTracked ? "star" : "star_border"}</span>
               {metadataMap()[menu().item.path]?.isTracked ? "Untrack" : "Track"}
@@ -461,6 +540,9 @@ export function ItemListPanel(props: ItemListPanelProps) {
             <div class="ctx-menu-separator" />
             <div class="ctx-menu-item" onClick={ctxCopyPath}>
               <span class="icon">content_copy</span> Copy Path
+            </div>
+            <div class="ctx-menu-item" onClick={() => { closeCtxMenu(); doPaste(); }}>
+              <span class="icon">content_paste</span> Paste Here
             </div>
             <div class="ctx-menu-item" onClick={ctxCopyUfbLink}>
               <span class="icon">link</span> Copy ufb:/// Link

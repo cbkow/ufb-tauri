@@ -1,6 +1,6 @@
 import { createSignal, createResource, createMemo, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
 import type { CredentialInfo } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
@@ -170,9 +170,14 @@ export function SettingsDialog(props: SettingsDialogProps) {
     }
   }
 
-  async function saveAndRestart() {
+  async function saveAndApplyMesh() {
     await settingsStore.save();
-    await relaunchApp();
+    try {
+      await reinitMeshSync();
+      setMeshStatusTick((n) => n + 1);
+    } catch (e) {
+      console.error("Failed to reinit mesh sync:", e);
+    }
   }
 
   const [showMountDialog, setShowMountDialog] = createSignal(false);
@@ -596,8 +601,8 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 </Show>
 
                 <div class="settings-restart-row">
-                  <button class="settings-btn settings-btn-primary" onClick={saveAndRestart}>
-                    Save &amp; Restart
+                  <button class="settings-btn settings-btn-primary" onClick={saveAndApplyMesh}>
+                    Save &amp; Apply
                   </button>
                   <span class="settings-hint-inline">Sync configuration changes require a restart to take effect.</span>
                 </div>

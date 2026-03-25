@@ -10,6 +10,7 @@ import {
   createDatePrefixedItem,
   detectFolderLayoutMode,
   getFolderAddMode,
+  copyFiles,
 } from "../../lib/tauri";
 import { useBrowserDragDrop } from "../../lib/useBrowserDragDrop";
 import "./FolderTabView.css";
@@ -33,6 +34,7 @@ export function FolderTabView(props: FolderTabViewProps) {
   // Create browser stores at component init (stable references)
   const mainBrowser = createBrowserStore();
   const rendersBrowser = createBrowserStore();
+  const itemListBrowserId = `itemlist-${mainBrowser.id}`;
 
   // ── Drag/drop support ──
   let externalDropMain: ((paths: string[]) => void) | undefined;
@@ -50,6 +52,13 @@ export function FolderTabView(props: FolderTabViewProps) {
       return externalDropMain;
     },
     enableCrossBrowserDrag: false,
+    onDropToPath: (paths, destPath) => {
+      copyFiles(paths, destPath)
+        .then(() => {
+          setRefreshTrigger((n) => n + 1);
+        })
+        .catch((err) => console.error("Drop to item list failed:", err));
+    },
   });
 
   onMount(async () => {
@@ -178,6 +187,7 @@ export function FolderTabView(props: FolderTabViewProps) {
       onAddItem={handleAddItem}
       hideAddButton={addMode() === "none"}
       refreshTrigger={refreshTrigger}
+      browserId={itemListBrowserId}
     />
   );
 

@@ -10,6 +10,11 @@ interface BrowserDragDropConfig {
   getExternalDropHandler: (browserId: string) => ((paths: string[]) => void) | undefined;
   /** Enable cross-browser drag (copy/move between two browsers). True for DualBrowserView. */
   enableCrossBrowserDrag?: boolean;
+  /**
+   * Handle drops on a panel identified by data-drop-path (e.g. ItemListPanel).
+   * Called with (droppedPaths, destinationPath).
+   */
+  onDropToPath?: (paths: string[], destPath: string) => void;
 }
 
 interface InternalDrag {
@@ -43,16 +48,21 @@ function initGlobalDropListener() {
     const logicalY = pos ? pos.y / scale : 0;
 
     if (payload.type === "over" || payload.type === "enter") {
-      document.querySelectorAll(".file-browser-content.drop-zone-active")
+      document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
       const el = document.elementFromPoint(logicalX, logicalY);
-      const content = el?.closest(".file-browser")?.querySelector(".file-browser-content");
-      content?.classList.add("drop-zone-active");
+      const browserContent = el?.closest(".file-browser")?.querySelector(".file-browser-content");
+      if (browserContent) {
+        browserContent.classList.add("drop-zone-active");
+      } else {
+        const panelEl = el?.closest(".item-list-panel[data-drop-path]");
+        panelEl?.querySelector(".item-list-scroll")?.classList.add("drop-zone-active");
+      }
     } else if (payload.type === "leave") {
-      document.querySelectorAll(".file-browser-content.drop-zone-active")
+      document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
     } else if (payload.type === "drop" && payload.paths.length > 0) {
-      document.querySelectorAll(".file-browser-content.drop-zone-active")
+      document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
 
       const el = document.elementFromPoint(logicalX, logicalY);
@@ -65,6 +75,17 @@ function initGlobalDropListener() {
           const handler = entry.config.getExternalDropHandler(browserId);
           if (handler) {
             handler(payload.paths);
+            return;
+          }
+        }
+      }
+      // Check if dropped on an ItemListPanel with data-drop-path
+      const panelEl = el?.closest(".item-list-panel[data-drop-path]");
+      const dropPath = panelEl?.getAttribute("data-drop-path");
+      if (dropPath) {
+        for (const entry of handlerRegistry.values()) {
+          if (entry.config.onDropToPath) {
+            entry.config.onDropToPath(payload.paths, dropPath);
             return;
           }
         }
@@ -111,20 +132,25 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return;
 
       const target = e.target as HTMLElement;
-      const row = target.closest(".file-row, .grid-item");
+      const row = target.closest(".file-row, .grid-item, .item-row");
       if (!row) return;
+
+      // Try FileBrowser first, then ItemListPanel
       const browserEl = target.closest(".file-browser");
-      const browserId = browserEl?.getAttribute("data-browser-id");
+      let browserId = browserEl?.getAttribute("data-browser-id") ?? null;
+
+      if (!browserId) {
+        const panelEl = target.closest(".item-list-panel[data-browser-id]");
+        browserId = panelEl?.getAttribute("data-browser-id") ?? null;
+      }
       if (!browserId) return;
 
       const store = config.getBrowserStore(browserId);
-      if (!store) return;
-
       const entryPath = row.getAttribute("data-path");
       if (!entryPath) return;
 
       pendingDrag = {
-        paths: store.selection.has(entryPath)
+        paths: store && store.selection.has(entryPath)
           ? [...store.selection]
           : [entryPath],
         sourceBrowserId: browserId,
@@ -135,7 +161,7 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
 
     function updateDropTarget(x: number, y: number, sourceBrowserId: string) {
       // Clear old highlights
-      document.querySelectorAll(".file-browser-content.drop-zone-active")
+      document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
       document.querySelectorAll(".file-row.drop-target, .grid-item.drop-target")
         .forEach((el) => el.classList.remove("drop-target"));
@@ -154,11 +180,20 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
         // Different browser — highlight whole content area
         const content = browserEl?.querySelector(".file-browser-content");
         content?.classList.add("drop-zone-active");
+      } else if (!targetBrowserId) {
+        // Check if hovering over ItemListPanel
+        const panelEl = el?.closest(".item-list-panel[data-drop-path]");
+        if (panelEl) {
+          const panelBrowserId = panelEl.getAttribute("data-browser-id");
+          if (panelBrowserId !== sourceBrowserId) {
+            panelEl.querySelector(".item-list-scroll")?.classList.add("drop-zone-active");
+          }
+        }
       }
     }
 
     function clearDropTarget() {
-      document.querySelectorAll(".file-browser-content.drop-zone-active")
+      document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
       document.querySelectorAll(".file-row.drop-target, .grid-item.drop-target")
         .forEach((el) => el.classList.remove("drop-target"));
@@ -248,6 +283,15 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
                 }
               })
               .catch((err) => console.error("Cross-browser drag failed:", err));
+          }
+        } else if (!targetBrowserId && config.onDropToPath) {
+          // E. Drop onto ItemListPanel
+          const panelEl = el?.closest(".item-list-panel[data-drop-path]");
+          const dropPath = panelEl?.getAttribute("data-drop-path");
+          if (dropPath && !drag.paths.includes(dropPath)) {
+            config.onDropToPath(drag.paths, dropPath);
+            const srcStore = config.getBrowserStore(drag.sourceBrowserId);
+            srcStore?.refresh();
           }
         }
 

@@ -3,6 +3,7 @@
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  outline: none;
 }
 
 .item-list-header {
@@ -336,6 +337,13 @@
   color: var(--text-disabled);
   font-size: 13px;
   text-align: center;
+}
+
+/* ── Drag-and-drop ── */
+.item-list-scroll.drop-zone-active {
+  outline: 2px dashed var(--accent-color);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent-color) 5%, transparent);
 }
 
 /* ── Context menus ── */

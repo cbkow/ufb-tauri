@@ -607,3 +607,46 @@
   padding: var(--spacing-md) var(--spacing-xl);
   border-top: 1px solid var(--border-color);
 }
+
+/* ── Column visibility menu (header right-click) ── */
+.col-vis-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+}
+
+.col-vis-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 150px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-xs) 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.col-vis-header {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 12px;
+  color: var(--text-disabled);
+}
+
+.col-vis-item {
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.col-vis-item .icon {
+  font-size: 18px;
+  color: var(--text-secondary);
+}
+
+.col-vis-item:hover {
+  background: var(--bg-hover);
+}

@@ -161,6 +161,8 @@ export const triggerFlushEdits = () => invoke<void>("trigger_flush_edits");
 
 export const triggerSnapshot = () => invoke<void>("trigger_snapshot");
 
+export const reinitMeshSync = () => invoke<void>("reinit_mesh_sync");
+
 export const getMeshPeers = () => invoke<PeerInfo[]>("get_mesh_peers");
 
 // ── URI / Links ──

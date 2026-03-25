@@ -212,8 +212,26 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
       }, 1000);
     }
   });
-  // Clean up listener if store is used inside a reactive owner
-  try { onCleanup(() => { unlisten.then(fn => fn()); }); } catch {}
+
+  // Refresh on global ufb:refresh event (F5, window focus, tab switch)
+  let globalRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
+  function onGlobalRefresh() {
+    if (currentPath() && !globalRefreshDebounce) {
+      globalRefreshDebounce = setTimeout(() => {
+        globalRefreshDebounce = null;
+        navigateTo(currentPath(), false);
+      }, 300);
+    }
+  }
+  window.addEventListener("ufb:refresh", onGlobalRefresh);
+
+  // Clean up listeners if store is used inside a reactive owner
+  try {
+    onCleanup(() => {
+      unlisten.then(fn => fn());
+      window.removeEventListener("ufb:refresh", onGlobalRefresh);
+    });
+  } catch {}
 
   // Init with path if provided
   if (initialPath) {

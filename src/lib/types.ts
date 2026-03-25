@@ -168,9 +168,16 @@ export interface AppearanceSettings {
   customPickerColorB: number;
 }
 
+export interface BrowserColumnVisibility {
+  size: boolean;
+  modified: boolean;
+  type: boolean;
+}
+
 export interface UiSettings {
   fontScale: number;
   browserPanelRatios: number[];
+  browserColumns: BrowserColumnVisibility;
 }
 
 export interface MeshSyncSettings {

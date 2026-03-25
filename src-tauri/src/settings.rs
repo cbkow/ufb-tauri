@@ -47,11 +47,30 @@ pub struct AppearanceSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BrowserColumnVisibility {
+    #[serde(default = "default_true")]
+    pub size: bool,
+    #[serde(default = "default_true")]
+    pub modified: bool,
+    #[serde(default = "default_true", alias = "r#type")]
+    pub r#type: bool,
+}
+
+impl Default for BrowserColumnVisibility {
+    fn default() -> Self {
+        Self { size: true, modified: true, r#type: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UiSettings {
     #[serde(default = "default_one_f32", alias = "font_scale")]
     pub font_scale: f32,
     #[serde(default = "default_panel_ratios", alias = "browser_panel_ratios")]
     pub browser_panel_ratios: Vec<f32>,
+    #[serde(default)]
+    pub browser_columns: BrowserColumnVisibility,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -173,6 +192,7 @@ impl Default for UiSettings {
         Self {
             font_scale: 1.0,
             browser_panel_ratios: vec![0.20, 0.40, 0.40],
+            browser_columns: BrowserColumnVisibility::default(),
         }
     }
 }

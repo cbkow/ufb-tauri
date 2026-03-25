@@ -767,6 +767,15 @@ pub async fn trigger_snapshot(state: State<'_, AppState>) -> Result<(), String> 
 }
 
 #[tauri::command]
+pub async fn reinit_mesh_sync(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    state.reinit_mesh_sync(app_handle).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_mesh_peers(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::peer_manager::PeerInfo>, String> {
