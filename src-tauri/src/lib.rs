@@ -18,6 +18,7 @@ pub mod thumbnails;
 pub mod udp_notify;
 pub mod mount_client;
 pub mod explorer_pins;
+pub mod shell_context_menu;
 pub mod transcode;
 pub mod utils;
 
@@ -172,6 +173,7 @@ pub fn run() {
             commands::clipboard_copy_paths,
             commands::clipboard_paste,
             commands::reveal_in_file_manager,
+            commands::show_shell_context_menu,
             commands::open_file,
             // Search
             commands::search_files,

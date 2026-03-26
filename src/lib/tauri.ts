@@ -124,6 +124,9 @@ export const clipboardPaste = (dest: string) =>
 export const revealInFileManager = (path: string) =>
   invoke<void>("reveal_in_file_manager", { path });
 
+export const showShellContextMenu = (path: string) =>
+  invoke<void>("show_shell_context_menu", { path });
+
 export const openFile = (path: string) => invoke<void>("open_file", { path });
 
 // ── Search ──

@@ -6,6 +6,7 @@ import { mountStore } from "../../stores/mountStore";
 import {
   openFile,
   revealInFileManager,
+  showShellContextMenu,
   clipboardCopyPaths,
   clipboardPaste,
   deleteToTrash,
@@ -676,6 +677,7 @@ export function FileBrowser(props: FileBrowserProps) {
               <div class="ctx-item" onClick={() => doCopyUfbLink(ctxEntry())}>Copy ufb:/// Link</div>
               <div class="ctx-item" onClick={() => doCopyUnionLink(ctxEntry())}>Copy union:/// Link</div>
               <div class="ctx-item" onClick={() => doReveal(ctxEntry())}>Reveal in Explorer</div>
+              <div class="ctx-item" onClick={() => { const e = ctxEntry(); if (e) showShellContextMenu(e.path); closeCtxMenu(); }}>More...</div>
               <Show when={hasVideoInSelection()}>
                 <div class="ctx-sep" />
                 <div class="ctx-item" onClick={() => doTranscode(ctxEntry())}>Transcode to MP4</div>

@@ -5,6 +5,7 @@ import {
   buildUfbUri,
   buildUnionUri,
   revealInFileManager,
+  showShellContextMenu,
   deleteToTrash,
   renamePath,
   getColumnDefs,
@@ -552,6 +553,9 @@ export function ItemListPanel(props: ItemListPanelProps) {
             </div>
             <div class="ctx-menu-item" onClick={ctxReveal}>
               <span class="icon">folder_open</span> Reveal in Explorer
+            </div>
+            <div class="ctx-menu-item" onClick={async () => { const m = ctxMenu(); if (m) await showShellContextMenu(m.item.path); closeCtxMenu(); }}>
+              <span class="icon">more_horiz</span> More...
             </div>
             <div class="ctx-menu-separator" />
             <div class="ctx-menu-item" onClick={ctxRename}>

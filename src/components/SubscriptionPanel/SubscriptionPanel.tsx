@@ -2,7 +2,7 @@ import { createSignal, createMemo, onMount, For, Show } from "solid-js";
 import { subscriptionStore } from "../../stores/subscriptionStore";
 import { workspaceStore } from "../../stores/workspaceStore";
 import { mountStore } from "../../stores/mountStore";
-import { buildUfbUri, buildUnionUri, revealInFileManager, pickFolder, getSpecialPaths, getDrives } from "../../lib/tauri";
+import { buildUfbUri, buildUnionUri, revealInFileManager, showShellContextMenu, pickFolder, getSpecialPaths, getDrives } from "../../lib/tauri";
 import type { Subscription } from "../../lib/types";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
 import "./SubscriptionPanel.css";
@@ -424,6 +424,8 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
             <div class="ctx-menu-item" onClick={ctxOpenLeft}><span class="icon">arrow_back</span> Open in Left Browser</div>
             <div class="ctx-menu-item" onClick={ctxOpenRight}><span class="icon">arrow_forward</span> Open in Right Browser</div>
             <div class="ctx-menu-separator" />
+            <div class="ctx-menu-item" onClick={async () => { const m = ctxMenu(); if (m) await showShellContextMenu(m.bookmark.path); closeCtxMenu(); }}><span class="icon">more_horiz</span> More...</div>
+            <div class="ctx-menu-separator" />
             <div class="ctx-menu-item ctx-menu-danger" onClick={ctxDelete}><span class="icon">delete</span> Delete</div>
           </div>
         )}
@@ -447,6 +449,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
             <div class="ctx-menu-item" onClick={subCtxCopyUfbLink}><span class="icon">link</span> Copy ufb:/// Link</div>
             <div class="ctx-menu-item" onClick={subCtxCopyUnionLink}><span class="icon">link</span> Copy union:/// Link</div>
             <div class="ctx-menu-item" onClick={subCtxReveal}><span class="icon">folder_open</span> Reveal in Explorer</div>
+            <div class="ctx-menu-item" onClick={async () => { const m = subCtxMenu(); if (m) await showShellContextMenu(m.sub.jobPath); closeSubCtxMenu(); }}><span class="icon">more_horiz</span> More...</div>
             <div class="ctx-menu-separator" />
             <div class="ctx-menu-item ctx-menu-danger" onClick={subCtxUnsubscribe}><span class="icon">remove_circle_outline</span> Unsubscribe</div>
           </div>
@@ -473,6 +476,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
               <div class="ctx-menu-item" onClick={() => { navigate(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_back</span> Open in Left Browser</div>
               <div class="ctx-menu-item" onClick={() => { navigateRight(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_forward</span> Open in Right Browser</div>
               <div class="ctx-menu-item" onClick={async () => { await revealInFileManager(mountPath()); closeMountCtxMenu(); }}><span class="icon">folder_open</span> Reveal in Explorer</div>
+              <div class="ctx-menu-item" onClick={async () => { await showShellContextMenu(mountPath()); closeMountCtxMenu(); }}><span class="icon">more_horiz</span> More...</div>
               <div class="ctx-menu-separator" />
               <div class="ctx-menu-item" onClick={mountCtxRestart}><span class="icon">refresh</span> Restart</div>
             </div>

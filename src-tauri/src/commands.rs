@@ -678,6 +678,11 @@ pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn show_shell_context_menu(path: String) -> Result<(), String> {
+    crate::shell_context_menu::show_shell_context_menu(&path)
+}
+
+#[tauri::command]
 pub fn open_file(path: String) -> Result<(), String> {
     crate::file_ops::open_file(&path)
 }
