@@ -179,12 +179,35 @@ impl Orchestrator {
 
         #[cfg(target_os = "macos")]
         {
-            let reason = "macOS SMB mounting not yet implemented".to_string();
-            log::error!("[{}] {}", self.mount_id, reason);
-            let _ = self
-                .event_tx
-                .send(MountEvent::MountFailed { reason })
-                .await;
+            // macOS: open smb:// to mount, then symlink from stable path
+            let mount_result = crate::platform::macos::macos_smb_mount(
+                &self.config.nas_share_path,
+                &username,
+                &password,
+            );
+
+            match mount_result {
+                Ok(volumes_path) => {
+                    // Create symlink from stable path to actual /Volumes/ mount point
+                    use crate::platform::DriveMapping;
+                    let dm = crate::platform::macos::MacosMountMapping::new();
+                    let mount_point = self.config.mount_path();
+                    if let Err(e) = dm.switch(&mount_point, &volumes_path) {
+                        log::error!("[{}] Symlink failed: {}", self.mount_id, e);
+                        let _ = self
+                            .event_tx
+                            .send(MountEvent::MountFailed { reason: e })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    log::error!("[{}] Mount failed: {}", self.mount_id, e);
+                    let _ = self
+                        .event_tx
+                        .send(MountEvent::MountFailed { reason: e })
+                        .await;
+                }
+            }
         }
     }
 
@@ -210,7 +233,24 @@ impl Orchestrator {
 
         #[cfg(target_os = "macos")]
         {
-            log::warn!("[{}] macOS disconnect not yet implemented (no-op)", self.mount_id);
+            use crate::platform::DriveMapping;
+            let dm = crate::platform::macos::MacosMountMapping::new();
+            let mount_point = self.config.mount_path();
+
+            // Read the symlink target (actual /Volumes/ path) before removing
+            if let Ok(volumes_path) = dm.read_target(&mount_point) {
+                // Remove the symlink first
+                if let Err(e) = dm.remove(&mount_point) {
+                    log::warn!("[{}] Remove symlink failed (non-fatal): {}", self.mount_id, e);
+                }
+                // Unmount the actual SMB mount
+                if let Err(e) = crate::platform::macos::macos_smb_unmount(&volumes_path) {
+                    log::warn!("[{}] Unmount failed (non-fatal): {}", self.mount_id, e);
+                }
+            } else {
+                // No symlink — just try to remove it in case it's stale
+                let _ = dm.remove(&mount_point);
+            }
         }
     }
 
@@ -230,10 +270,25 @@ impl Orchestrator {
                 }
             }
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use crate::platform::CredentialStore;
             let cred_store = crate::platform::linux::LinuxCredentialStore::new();
+            match cred_store.retrieve(&self.config.credential_key) {
+                Ok(creds) => creds,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] No credentials found for {}: {}, trying without",
+                        self.mount_id, self.config.credential_key, e
+                    );
+                    (String::new(), String::new())
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::platform::CredentialStore;
+            let cred_store = crate::platform::macos::MacosCredentialStore::new();
             match cred_store.retrieve(&self.config.credential_key) {
                 Ok(creds) => creds,
                 Err(e) => {

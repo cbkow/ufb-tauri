@@ -214,6 +214,10 @@ async fn main() {
 
     let _mutex_guard = ensure_single_instance();
 
+    // macOS: ensure /opt/ufb/mounts/ exists (one-time setup with admin prompt)
+    #[cfg(target_os = "macos")]
+    ensure_macos_mount_dir();
+
     // Start IPC server
     #[cfg(windows)]
     let mut ipc_server = ipc::server::IpcServer::start();
@@ -331,6 +335,38 @@ async fn main() {
     // Force exit — background tasks (IPC listener, config watcher) would
     // otherwise keep the tokio runtime alive indefinitely.
     process::exit(0);
+}
+
+/// macOS: ensure the stable symlink directory exists at /opt/ufb/mounts/.
+/// This is a one-time operation that requires admin privileges.
+/// Uses osascript to prompt the user for their password.
+#[cfg(target_os = "macos")]
+fn ensure_macos_mount_dir() {
+    let mount_dir = std::path::Path::new("/opt/ufb/mounts");
+    if mount_dir.exists() {
+        return;
+    }
+
+    log::info!("First run: creating /opt/ufb/mounts/ (requires admin)");
+
+    let script = r#"do shell script "mkdir -p /opt/ufb/mounts && chown root:staff /opt/ufb/mounts && chmod 775 /opt/ufb/mounts" with administrator privileges"#;
+
+    let result = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            log::info!("Created /opt/ufb/mounts/ successfully");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Failed to create /opt/ufb/mounts/: {}", stderr.trim());
+        }
+        Err(e) => {
+            log::error!("Failed to run osascript: {}", e);
+        }
+    }
 }
 
 /// Launch UFB executable (next to our binary, in dev build output, or in PATH).

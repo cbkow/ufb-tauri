@@ -37,6 +37,12 @@ pub struct MountConfig {
     #[serde(default)]
     pub mount_path_linux: Option<String>,
 
+    // ── macOS mount path ──
+
+    /// User-facing mount path on macOS — symlink in /opt/ufb/mounts/ (e.g. "/opt/ufb/mounts/nas-main")
+    #[serde(default)]
+    pub mount_path_macos: Option<String>,
+
     /// Whether subfolders of this mount are treated as subscribable jobs (default true)
     #[serde(default = "default_true")]
     pub is_jobs_folder: bool,
@@ -103,7 +109,7 @@ pub struct MountConfig {
 impl MountConfig {
     /// Base directory for auto-derived mount paths on Linux.
     /// Uses ~/.local/share/ufb/mnt/ which is user-writable without root.
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn linux_mnt_base(&self) -> std::path::PathBuf {
         let base = if let Some(home) = std::env::var_os("HOME") {
             std::path::PathBuf::from(home).join(".local/share/ufb/mnt")
@@ -116,13 +122,21 @@ impl MountConfig {
 
     /// The path apps use to access the mount.
     /// Windows: "M:\\" (drive letter).
-    /// Linux: mount_path_linux, or auto-derived /media/$USER/ufb/<id>
+    /// macOS: mount_path_macos, or auto-derived /opt/ufb/mounts/<id>
+    /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
     pub fn mount_path(&self) -> String {
         #[cfg(windows)]
         {
             format!("{}:\\", self.mount_drive_letter)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref p) = self.mount_path_macos {
+                if !p.is_empty() { return p.clone(); }
+            }
+            format!("/opt/ufb/mounts/{}", self.id)
+        }
+        #[cfg(target_os = "linux")]
         {
             if let Some(ref p) = self.mount_path_linux {
                 if !p.is_empty() { return p.clone(); }
@@ -133,7 +147,7 @@ impl MountConfig {
 
     /// The path where SMB is mounted on Linux.
     /// Auto-derived to /media/$USER/ufb/<id>-smb if not set.
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     pub fn smb_target_path(&self) -> String {
         if let Some(ref p) = self.smb_mount_path {
             if !p.is_empty() { return p.clone(); }
@@ -235,6 +249,7 @@ mod tests {
                 mount_drive_letter: "M".into(),
                 smb_mount_path: None,
                 mount_path_linux: None,
+                mount_path_macos: None,
                 is_jobs_folder: true,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),
@@ -281,6 +296,7 @@ mod tests {
                 mount_drive_letter: "M".into(),
                 smb_mount_path: None,
                 mount_path_linux: None,
+                mount_path_macos: None,
                 is_jobs_folder: true,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),

@@ -1,8 +1,11 @@
 #[cfg(windows)]
 pub mod windows;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 /// Trait for managing mount-point mappings (Linux only).
 /// Uses symlinks to point user-facing paths to the actual CIFS mount.
@@ -65,7 +68,29 @@ pub fn is_drive_in_use(path_or_letter: &str) -> bool {
         }
         false
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        // Check `mount` command output for the path
+        if let Ok(output) = std::process::Command::new("mount").output() {
+            if output.status.success() {
+                let mounts = String::from_utf8_lossy(&output.stdout);
+                let normalized = path_or_letter.trim_end_matches('/');
+                for line in mounts.lines() {
+                    // mount output format: "//server/share on /Volumes/share (smbfs, ...)"
+                    if let Some(on_pos) = line.find(" on ") {
+                        let after_on = &line[on_pos + 4..];
+                        let mount_point = after_on.split(' ').next().unwrap_or("");
+                        if mount_point.trim_end_matches('/') == normalized {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        // Also check if the path exists (symlink or directory)
+        std::path::Path::new(path_or_letter).exists()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         std::path::Path::new(path_or_letter).exists()
     }
