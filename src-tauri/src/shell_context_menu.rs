@@ -152,7 +152,59 @@ fn show_menu_blocking(path: &str, cursor_x: i32, cursor_y: i32) -> Result<(), St
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: reveal the file in Finder and show its context menu.
+/// Uses Finder's "Reveal" + System Events to trigger the contextual menu.
+/// Note: requires Accessibility permissions for System Events on first use.
+#[cfg(target_os = "macos")]
+pub fn show_shell_context_menu(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+
+    log::info!("show_shell_context_menu (macOS): {}", path);
+
+    // Reveal in Finder and trigger contextual menu via System Events.
+    // This selects the file in Finder and simulates Ctrl+Click to show the context menu.
+    let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"tell application "Finder"
+    activate
+    reveal POSIX file "{}"
+end tell
+delay 0.3
+tell application "System Events"
+    tell process "Finder"
+        set frontmost to true
+        keystroke return using {{control down}}
+    end tell
+end tell"#,
+        escaped_path
+    );
+
+    // Spawn non-blocking — Finder will handle the menu
+    let path_owned = path.to_string();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+
+        match result {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!("Context menu script failed for {}: {}", path_owned, stderr.trim());
+            }
+            Err(e) => {
+                log::warn!("Failed to run osascript for {}: {}", path_owned, e);
+            }
+            _ => {}
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn show_shell_context_menu(_path: &str) -> Result<(), String> {
-    Err("Shell context menu is only available on Windows".to_string())
+    Err("Shell context menu is only available on Windows and macOS".to_string())
 }
