@@ -49,7 +49,20 @@ impl TrayManager {
             Some(cancel_tx)
         };
 
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        let cancel_tx = {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            let cmd_tx_clone = cmd_tx.clone();
+            std::thread::Builder::new()
+                .name("tray".into())
+                .spawn(move || {
+                    macos_tray::run_tray(cmd_tx_clone, _state_rx, cancel_rx);
+                })
+                .expect("Failed to spawn tray thread");
+            Some(cancel_tx)
+        };
+
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let cancel_tx = {
             log::info!("Tray icon not implemented for this platform");
             let _ = (cmd_tx, _state_rx);
@@ -647,6 +660,174 @@ mod linux_tray {
         }
 
         // Fallback: 16x16 transparent icon
+        tray_icon::Icon::from_rgba(vec![0u8; 16 * 16 * 4], 16, 16)
+            .expect("Failed to create fallback icon")
+    }
+}
+
+/// macOS tray using tray-icon + muda crates (NSStatusBar, no GTK needed).
+#[cfg(target_os = "macos")]
+mod macos_tray {
+    use super::TrayCommand;
+    use crate::messages::AgentToUfb;
+    use tokio::sync::mpsc;
+
+    pub fn run_tray(
+        cmd_tx: mpsc::Sender<TrayCommand>,
+        mut state_rx: mpsc::Receiver<AgentToUfb>,
+        mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tray_icon::TrayIconBuilder;
+        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, MenuEvent, IsMenuItem};
+
+        let menu = Menu::new();
+        let item_title = MenuItem::new("MediaMount", false, None);
+        let sep_top = PredefinedMenuItem::separator();
+        let sep_mounts = PredefinedMenuItem::separator();
+        let item_open_ufb = MenuItem::new("Open UFB", true, None);
+        let item_open_log = MenuItem::new("Open log", true, None);
+        let item_autostart = MenuItem::new(
+            if crate::platform::is_auto_start_enabled() { "Disable auto-start" } else { "Start at login" },
+            true,
+            None,
+        );
+        let item_quit = MenuItem::new("Quit", true, None);
+
+        let _ = menu.append(&item_title);
+        let _ = menu.append(&sep_top);
+        let _ = menu.append(&sep_mounts);
+        let _ = menu.append(&item_open_ufb);
+        let _ = menu.append(&item_open_log);
+        let _ = menu.append(&item_autostart);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_quit);
+
+        let menu_handle = menu.clone();
+        let icon = load_icon();
+
+        let _tray = match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("MediaMount Agent")
+            .with_icon(icon)
+            .build()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("Failed to create tray icon: {}", e);
+                return;
+            }
+        };
+
+        log::info!("macOS tray icon created");
+
+        let mut mounts: std::collections::HashMap<String, crate::messages::MountStateUpdateMsg> =
+            std::collections::HashMap::new();
+        let mut mount_items: Vec<(String, MenuItem, MenuItem)> = Vec::new();
+        const MOUNT_INSERT_BASE: usize = 2;
+
+        let menu_event_rx = MenuEvent::receiver();
+
+        loop {
+            if let Ok(()) = cancel_rx.try_recv() {
+                break;
+            }
+
+            // Drain state updates
+            let mut changed = false;
+            while let Ok(msg) = state_rx.try_recv() {
+                if let AgentToUfb::MountStateUpdate(update) = msg {
+                    mounts.insert(update.mount_id.clone(), update);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                let total = mounts.len();
+                let mounted_count = mounts.values().filter(|m| m.state == "mounted").count();
+                let tip = if total == 0 {
+                    "MediaMount".to_string()
+                } else if mounted_count == total {
+                    format!("MediaMount \u{2014} all mounted ({}/{})", mounted_count, total)
+                } else {
+                    format!("MediaMount \u{2014} {}/{} mounted", mounted_count, total)
+                };
+                let _ = _tray.set_tooltip(Some(&tip));
+
+                let mut sorted_ids: Vec<String> = mounts.keys().cloned().collect();
+                sorted_ids.sort();
+
+                for mount_id in &sorted_ids {
+                    let ms = &mounts[mount_id];
+                    let dot = if ms.state == "mounted" { "\u{25CF}" } else { "\u{2715}" };
+                    let label = format!("{} {} {}", ms.mount_id, dot, ms.state_detail);
+
+                    if let Some(entry) = mount_items.iter().find(|(id, _, _)| id == mount_id) {
+                        entry.1.set_text(&label);
+                    } else {
+                        let status_item = MenuItem::new(&label, false, None);
+                        let restart_item = MenuItem::new(&format!("  Restart {}", mount_id), true, None);
+
+                        let pos = MOUNT_INSERT_BASE + mount_items.len() * 2;
+                        let _ = menu_handle.insert(&status_item as &dyn IsMenuItem, pos);
+                        let _ = menu_handle.insert(&restart_item as &dyn IsMenuItem, pos + 1);
+
+                        mount_items.push((mount_id.clone(), status_item, restart_item));
+                    }
+                }
+            }
+
+            // Process menu events
+            if let Ok(event) = menu_event_rx.try_recv() {
+                let cmd = if event.id == item_open_ufb.id() {
+                    Some(TrayCommand::OpenUfb)
+                } else if event.id == item_open_log.id() {
+                    Some(TrayCommand::OpenLog)
+                } else if event.id == item_autostart.id() {
+                    let currently_enabled = crate::platform::is_auto_start_enabled();
+                    if let Err(e) = crate::platform::set_auto_start(!currently_enabled) {
+                        log::error!("Failed to toggle auto-start: {}", e);
+                    }
+                    item_autostart.set_text(
+                        if !currently_enabled { "Disable auto-start" } else { "Start at login" }
+                    );
+                    None
+                } else if event.id == item_quit.id() {
+                    Some(TrayCommand::Quit)
+                } else {
+                    mount_items.iter()
+                        .find(|(_, _, restart)| event.id == restart.id())
+                        .map(|(mount_id, _, _)| {
+                            TrayCommand::MountEvent(mount_id.clone(), crate::state::MountEvent::Restart)
+                        })
+                };
+
+                if let Some(cmd) = cmd {
+                    let _ = cmd_tx.blocking_send(cmd);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        log::info!("macOS tray icon removed");
+    }
+
+    fn load_icon() -> tray_icon::Icon {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for name in &["icon.png", "../../src-tauri/icons/icon.png", "../Resources/icon.png"] {
+                    let path = dir.join(name);
+                    if let Ok(img) = image::open(&path) {
+                        let rgba = img.into_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+                            return icon;
+                        }
+                    }
+                }
+            }
+        }
+
         tray_icon::Icon::from_rgba(vec![0u8; 16 * 16 * 4], 16, 16)
             .expect("Failed to create fallback icon")
     }

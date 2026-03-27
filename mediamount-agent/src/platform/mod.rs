@@ -218,12 +218,86 @@ pub fn is_auto_start_enabled() -> bool {
     desktop_file.exists()
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Manage auto-start at login (macOS: LaunchAgent plist).
+#[cfg(target_os = "macos")]
+pub fn set_auto_start(enabled: bool) -> Result<(), String> {
+    let plist_dir = if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join("Library/LaunchAgents")
+    } else {
+        return Err("Cannot determine HOME directory".into());
+    };
+
+    let plist_path = plist_dir.join("com.unionfiles.mediamount-agent.plist");
+
+    if enabled {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("Failed to get exe path: {}", e))?;
+
+        std::fs::create_dir_all(&plist_dir)
+            .map_err(|e| format!("Failed to create LaunchAgents dir: {}", e))?;
+
+        let contents = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.unionfiles.mediamount-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#,
+            exe_path.display()
+        );
+
+        std::fs::write(&plist_path, contents)
+            .map_err(|e| format!("Failed to write plist: {}", e))?;
+
+        // Load the agent
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", &plist_path.to_string_lossy()])
+            .output();
+
+        log::info!("Auto-start enabled at {}", plist_path.display());
+    } else {
+        if plist_path.exists() {
+            // Unload first
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .output();
+
+            std::fs::remove_file(&plist_path)
+                .map_err(|e| format!("Failed to remove plist: {}", e))?;
+        }
+        log::info!("Auto-start disabled");
+    }
+    Ok(())
+}
+
+/// Check if auto-start is enabled (macOS).
+#[cfg(target_os = "macos")]
+pub fn is_auto_start_enabled() -> bool {
+    if let Some(home) = std::env::var_os("HOME") {
+        let plist_path = std::path::PathBuf::from(home)
+            .join("Library/LaunchAgents/com.unionfiles.mediamount-agent.plist");
+        plist_path.exists()
+    } else {
+        false
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn set_auto_start(_enabled: bool) -> Result<(), String> {
     Err("Auto-start not implemented for this platform".into())
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn is_auto_start_enabled() -> bool {
     false
 }
