@@ -187,13 +187,18 @@ fn shell_delete_files(paths: &[String]) -> Result<(), String> {
 
 /// Copy file paths to clipboard.
 /// On Windows, uses CF_HDROP format so Explorer recognizes them for paste.
+/// On macOS, uses NSPasteboard with file URLs so Finder recognizes them for paste.
 /// On other platforms, falls back to plain text (one path per line).
 pub fn clipboard_copy_paths(paths: &[String]) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         clipboard_copy_paths_windows(paths)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        clipboard_copy_paths_macos(paths)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let text = paths.join("\n");
         let mut clipboard =
@@ -251,6 +256,101 @@ fn set_preferred_drop_effect(effect: u32) {
     }
 }
 
+/// macOS: write file URLs to NSPasteboard so Finder and apps can paste files.
+/// Paths are canonicalized to resolve symlinks (e.g. /opt/ufb/mounts/nas → /Volumes/share).
+#[cfg(target_os = "macos")]
+fn clipboard_copy_paths_macos(paths: &[String]) -> Result<(), String> {
+    use objc2_foundation::NSString;
+    use objc2_app_kit::NSPasteboard;
+
+    let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
+
+    // Build file URL strings, canonicalizing to resolve symlinks
+    let file_urls: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let resolved = std::fs::canonicalize(p)
+                .unwrap_or_else(|_| std::path::PathBuf::from(p));
+            let path_str = resolved.to_string_lossy().to_string();
+            // Encode as file:// URL
+            format!("file://{}", urlencoding::encode(&path_str).replace("%2F", "/"))
+        })
+        .collect();
+
+    if file_urls.is_empty() {
+        return Err("No valid file paths to copy".into());
+    }
+
+    // Clear pasteboard and declare file URL type
+    unsafe { pasteboard.clearContents() };
+
+    // Write all file URLs as a newline-separated string in the public.file-url type.
+    // For multiple files, we write each as a separate pasteboard item using declareTypes + setString.
+    // The standard macOS approach for multiple files is to write them as a property list of URLs.
+    let pb_type = NSString::from_str("NSFilenamesPboardType");
+    let ns_type_array = objc2_foundation::NSArray::from_slice(&[&*pb_type]);
+    unsafe { pasteboard.declareTypes_owner(&ns_type_array, None) };
+
+    // Build a property list string of file paths (Finder expects this format)
+    let resolved_paths: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let resolved = std::fs::canonicalize(p)
+                .unwrap_or_else(|_| std::path::PathBuf::from(p));
+            resolved.to_string_lossy().to_string()
+        })
+        .collect();
+
+    // NSFilenamesPboardType expects a plist-encoded array of paths
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<array>\n{}</array>\n</plist>",
+        resolved_paths.iter().map(|p| format!("<string>{}</string>\n", p)).collect::<String>()
+    );
+
+    let ns_plist = NSString::from_str(&plist);
+    let success = unsafe { pasteboard.setString_forType(&ns_plist, &pb_type) };
+
+    if success {
+        Ok(())
+    } else {
+        Err("Failed to write file paths to pasteboard".into())
+    }
+}
+
+/// macOS: read file URLs from NSPasteboard.
+#[cfg(target_os = "macos")]
+fn clipboard_paste_paths_macos() -> Result<Vec<String>, String> {
+    use objc2_foundation::NSString;
+    use objc2_app_kit::NSPasteboard;
+
+    let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
+
+    // Read file URL strings from pasteboard
+    let pb_type = NSString::from_str("public.file-url");
+    let items = unsafe { pasteboard.pasteboardItems() };
+
+    let mut paths = Vec::new();
+
+    if let Some(items) = items {
+        for item in items.iter() {
+            if let Some(url_string) = unsafe { item.stringForType(&pb_type) } {
+                let s: String = url_string.to_string();
+                // Convert file:// URL to path
+                if let Some(path) = s.strip_prefix("file://") {
+                    let decoded = urlencoding::decode(path)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| path.to_string());
+                    paths.push(decoded);
+                }
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
 /// Heuristic check: does this string look like a filesystem path?
 /// Avoids blocking I/O (no exists() calls) while filtering garbage clipboard text.
 fn looks_like_path(s: &str) -> bool {
@@ -271,10 +371,20 @@ fn looks_like_path(s: &str) -> bool {
 
 /// Paste file paths from clipboard (returns list of paths).
 /// On Windows, reads CF_HDROP first; falls back to plain text.
+/// On macOS, reads NSPasteboard file URLs first; falls back to plain text.
 pub fn clipboard_paste_paths() -> Result<Vec<String>, String> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(paths) = clipboard_paste_paths_hdrop() {
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(paths) = clipboard_paste_paths_macos() {
             if !paths.is_empty() {
                 return Ok(paths);
             }

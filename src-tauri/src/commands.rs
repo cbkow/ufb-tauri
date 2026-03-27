@@ -933,11 +933,14 @@ pub async fn pick_folder(title: Option<String>) -> Result<Option<String>, String
 // ── Drag ──
 
 /// Start a native OS drag operation with the given file paths.
-/// DoDragDrop is blocking — runs as a sync command on the main thread.
-/// DoDragDrop pumps its own message loop so the UI stays responsive.
+/// Windows: DoDragDrop is blocking — runs as a sync command on the main thread.
+/// macOS: Uses the `drag` crate via tauri-plugin-drag's underlying library.
 #[tauri::command]
-pub fn start_native_drag(paths: Vec<String>) -> Result<String, String> {
-    crate::drag_out::start_native_drag(&paths)
+pub fn start_native_drag(
+    #[allow(unused)] window: tauri::WebviewWindow,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    crate::drag_out::start_native_drag(&window, &paths)
 }
 
 // ── Backup ──

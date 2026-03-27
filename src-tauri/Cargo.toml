@@ -99,11 +99,24 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Native file dialogs
 rfd = "0.15"
 
-# Drag plugin (for now, may replace with custom OLE)
+# Drag plugin + underlying drag crate for macOS native drag-out
 tauri-plugin-drag = "2.1.0"
+drag = "2.1.0"
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
+
+# macOS native APIs (NSPasteboard clipboard, NSDraggingItem drag-out, NSMenu context menu)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSURL", "NSString", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = [
+  "NSPasteboard",
+  "NSPasteboardItem",
+  "NSDragging",
+  "NSDraggingItem",
+  "NSWorkspace",
+] }
 
 # Windows APIs (OLE drag-drop)
 [target.'cfg(windows)'.dependencies]
