@@ -110,8 +110,9 @@ pub fn translate_path_to(
         return to_native_path(path, target_os);
     }
 
-    // Try each mapping rule
+    // Try each mapping rule (skip disabled mappings)
     for mapping in mappings {
+        if !mapping.enabled { continue; }
         let source_prefix = match source_os {
             "win" => &mapping.win,
             "mac" => &mapping.mac,

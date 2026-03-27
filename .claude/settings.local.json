@@ -7,7 +7,8 @@
       "Bash(ls -la /c/Users/chris/Documents/GitHub/MinRender/*/)",
       "Bash(wc -l /c/Users/chris/Documents/GitHub/ufb-tauri/src-tauri/src/*.rs)",
       "Bash(cd C:/Users/chris/Documents/GitHub/ufb-tauri/mediamount-agent && cargo test 2>&1)",
-      "Bash(C:/Users/chris/Documents/GitHub/ufb-tauri/src-tauri/external/rclone/rclone.exe version:*)"
+      "Bash(C:/Users/chris/Documents/GitHub/ufb-tauri/src-tauri/external/rclone/rclone.exe version:*)",
+      "Bash(xargs basename:*)"
     ]
   }
 }

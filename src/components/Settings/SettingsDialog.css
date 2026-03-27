@@ -460,6 +460,38 @@
   font-size: 11px;
 }
 
+.pm-toggle-cell {
+  width: 20px;
+  flex-shrink: 0;
+}
+
+.pm-toggle {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin: 0 4px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.pm-label-input {
+  max-width: 120px;
+  flex-shrink: 0;
+}
+
+.pm-label-cell {
+  max-width: 120px;
+  flex-shrink: 0;
+}
+
+.pm-row-disabled {
+  opacity: 0.5;
+}
+
+.pm-row-disabled .pm-cell.pm-input {
+  pointer-events: none;
+}
+
 /* ── Mounts ── */
 
 .mount-connection-status {

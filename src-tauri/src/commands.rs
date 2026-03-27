@@ -24,6 +24,14 @@ pub async fn subscribe_to_job(
 ) -> Result<Subscription, String> {
     let mappings = load_mappings();
     let canonical_path = to_canonical_path(&job_path, &mappings);
+
+    // On non-Windows, verify the path was actually translated to Windows-canonical format.
+    // If not, no active mapping covers this location and we'd corrupt the DB with a native path.
+    #[cfg(not(target_os = "windows"))]
+    if !canonical_path.contains(':') {
+        return Err("No active path mapping covers this location. Enable or add a mapping in Settings > Paths.".into());
+    }
+
     let mut result = state.subscription_manager.subscribe_to_job(&canonical_path, &job_name)?;
     // Localize path for frontend
     result.job_path = from_canonical_path(&result.job_path, &mappings);

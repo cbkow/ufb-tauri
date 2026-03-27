@@ -286,6 +286,8 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
                 <div class="path-mappings-table">
                   <div class="path-mappings-header">
+                    <span class="pm-toggle-cell pm-header" />
+                    <span class="pm-cell pm-label-cell pm-header">Label</span>
                     <span class="pm-cell pm-header">Windows</span>
                     <span class="pm-cell pm-header">macOS</span>
                     <span class="pm-cell pm-header">Linux</span>
@@ -293,11 +295,29 @@ export function SettingsDialog(props: SettingsDialogProps) {
                   </div>
                   <For each={settingsStore.settings.pathMappings}>
                     {(mapping, i) => (
-                      <div class="path-mappings-row">
+                      <div class={`path-mappings-row ${!mapping.enabled ? "pm-row-disabled" : ""}`}>
+                        <input
+                          type="checkbox"
+                          class="pm-toggle"
+                          checked={mapping.enabled}
+                          onChange={(e) => {
+                            settingsStore.setSettings("pathMappings", i(), "enabled", e.currentTarget.checked);
+                            settingsStore.save();
+                          }}
+                        />
+                        <SettingsInput
+                          class="pm-cell pm-label-input"
+                          value={mapping.label}
+                          placeholder="e.g., Office"
+                          onCommit={(v) => {
+                            settingsStore.setSettings("pathMappings", i(), "label", v);
+                            settingsStore.save();
+                          }}
+                        />
                         <SettingsInput
                           class="pm-cell pm-input"
                           value={mapping.win}
-                          placeholder="C:/Volumes/jobs"
+                          placeholder="Z:\jobs"
                           onCommit={(v) => {
                             settingsStore.setSettings("pathMappings", i(), "win", v);
                             settingsStore.save();
@@ -306,7 +326,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                         <SettingsInput
                           class="pm-cell pm-input"
                           value={mapping.mac}
-                          placeholder="/Volumes/jobs"
+                          placeholder="/opt/ufb/mounts/nas"
                           onCommit={(v) => {
                             settingsStore.setSettings("pathMappings", i(), "mac", v);
                             settingsStore.save();
@@ -341,7 +361,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                   class="settings-btn"
                   style={{ "margin-top": "var(--spacing-md)" }}
                   onClick={() => {
-                    const newMapping: PathMapping = { win: "", mac: "", lin: "" };
+                    const newMapping: PathMapping = { win: "", mac: "", lin: "", enabled: true, label: "" };
                     settingsStore.setSettings("pathMappings", [
                       ...settingsStore.settings.pathMappings,
                       newMapping,

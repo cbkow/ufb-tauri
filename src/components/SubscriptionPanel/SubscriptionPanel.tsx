@@ -2,6 +2,7 @@ import { createSignal, createMemo, onMount, For, Show } from "solid-js";
 import { subscriptionStore } from "../../stores/subscriptionStore";
 import { workspaceStore } from "../../stores/workspaceStore";
 import { mountStore } from "../../stores/mountStore";
+import { platformStore } from "../../stores/platformStore";
 import { buildUfbUri, buildUnionUri, revealInFileManager, showShellContextMenu, pickFolder, getSpecialPaths, getDrives } from "../../lib/tauri";
 import type { Subscription } from "../../lib/types";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
@@ -383,17 +384,31 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 if (m.state === "mounted" || m.state === "initializing" || m.state === "mounting") return null;
                 return m;
               };
+              // On non-Windows, a drive-letter path means no active mapping could translate it
+              const isUnresolved = () => {
+                if (platformStore.platform === "win") return false;
+                return /^[A-Za-z]:[/\\]/.test(sub.jobPath);
+              };
               return (
                 <div
-                  class="panel-item"
-                  onClick={() => workspaceStore.openJobTab(sub.jobPath, sub.jobName)}
-                  onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(sub.jobPath); } }}
+                  class={`panel-item ${isUnresolved() ? "panel-item-disabled" : ""}`}
+                  onClick={() => { if (!isUnresolved()) workspaceStore.openJobTab(sub.jobPath, sub.jobName); }}
+                  onMouseDown={(e) => { if (e.button === 1 && !isUnresolved()) { e.preventDefault(); navigateRight(sub.jobPath); } }}
                   onContextMenu={(e) => onSubContextMenu(e, sub)}
-                  title={mountIssue() ? `${sub.jobPath}\nMount: ${mountIssue()!.stateDetail}` : sub.jobPath}
+                  title={isUnresolved()
+                    ? `Path not mapped: ${sub.jobPath}\nEnable a mapping in Settings > Paths`
+                    : mountIssue()
+                      ? `${sub.jobPath}\nMount: ${mountIssue()!.stateDetail}`
+                      : sub.jobPath}
                 >
                   <span class={`sync-indicator sync-${sub.syncStatus.toLowerCase()}`} />
                   <span class="item-label truncate">{sub.jobName}</span>
-                  <Show when={mountIssue()}>
+                  <Show when={isUnresolved()}>
+                    <span class="mount-badge mount-badge-warn" title="Path mapping unavailable">
+                      <span class="icon">link_off</span>
+                    </span>
+                  </Show>
+                  <Show when={!isUnresolved() && mountIssue()}>
                     <span
                       class={`mount-badge mount-badge-${mountIssue()!.state === "error" ? "error" : "warn"}`}
                       title={mountIssue()!.stateDetail}

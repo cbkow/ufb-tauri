@@ -2,6 +2,8 @@ use crate::columns::ColumnConfigManager;
 use crate::db::Database;
 use crate::mesh_sync::SyncCommand;
 use crate::peer_manager::PeerManager;
+use crate::settings::AppSettings;
+use crate::utils::from_canonical_path;
 use axum::extract::{Path as AxumPath, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -171,12 +173,14 @@ async fn handle_metadata_update(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // Emit Tauri event so frontend refreshes metadata
+    // Emit Tauri event so frontend refreshes metadata.
+    // Translate canonical (Windows) paths to native OS paths for the frontend.
     if let Some(ref handle) = state.app_handle {
         use tauri::Emitter;
+        let mappings = AppSettings::load().path_mappings;
         let _ = handle.emit("mesh:metadata-changed", serde_json::json!({
-            "job_path": body.job_path,
-            "item_path": body.item_path,
+            "job_path": from_canonical_path(&body.job_path, &mappings),
+            "item_path": from_canonical_path(&body.item_path, &mappings),
             "folder_name": body.folder_name,
         }));
     }
@@ -316,10 +320,16 @@ async fn handle_table_update(
         });
     }
 
-    // Emit Tauri event so frontend refreshes
+    // Emit Tauri event so frontend refreshes.
+    // Translate any job_path in the payload from canonical to native OS format.
     if let Some(ref handle) = state.app_handle {
         use tauri::Emitter;
-        let _ = handle.emit("mesh:table-changed", &body);
+        let mut emit_body = body.clone();
+        if let Some(jp) = emit_body.get("job_path").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            let mappings = AppSettings::load().path_mappings;
+            emit_body["job_path"] = serde_json::Value::String(from_canonical_path(&jp, &mappings));
+        }
+        let _ = handle.emit("mesh:table-changed", &emit_body);
     }
 
     Ok(Json(serde_json::json!({"status": "ok"})))

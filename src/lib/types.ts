@@ -202,6 +202,8 @@ export interface PathMapping {
   win: string;
   mac: string;
   lin: string;
+  enabled: boolean;
+  label: string;
 }
 
 export interface AppSettings {

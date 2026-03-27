@@ -106,7 +106,8 @@ pub struct SyncSettings {
 
 /// A path mapping rule for cross-OS URI translation.
 /// Each triplet maps equivalent paths across Windows, macOS, and Linux.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Mappings can be toggled on/off and labeled for roaming users who switch locations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathMapping {
     #[serde(default)]
@@ -115,6 +116,22 @@ pub struct PathMapping {
     pub mac: String,
     #[serde(default)]
     pub lin: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl Default for PathMapping {
+    fn default() -> Self {
+        Self {
+            win: String::new(),
+            mac: String::new(),
+            lin: String::new(),
+            enabled: true,
+            label: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
