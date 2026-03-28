@@ -3,7 +3,6 @@
 //! Creates per-user registry entries (HKCU) that make folders appear in
 //! Explorer's nav pane with a custom name and icon. No admin rights needed.
 
-use std::path::Path;
 use std::process::Command;
 
 #[cfg(windows)]
@@ -38,10 +37,6 @@ pub fn collect_nav_pins(state: &crate::app_state::AppState) -> Vec<NavPinEntry> 
 
     entries
 }
-
-/// All our CLSIDs live under this prefix for easy identification/cleanup.
-/// We use a namespace UUID v5 approach: hash the path to get a deterministic GUID.
-const CLSID_NAMESPACE: &str = "UFB-NavPin";
 
 /// Our app icon filename (expected next to the exe).
 const ICON_FILENAME: &str = "icon.ico";

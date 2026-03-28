@@ -937,7 +937,7 @@ pub async fn pick_folder(title: Option<String>) -> Result<Option<String>, String
 /// macOS: Uses the `drag` crate, dispatched to main thread via app.run_on_main_thread.
 #[tauri::command]
 pub async fn start_native_drag(
-    app: tauri::AppHandle,
+    #[allow(unused)] app: tauri::AppHandle,
     #[allow(unused)] window: tauri::WebviewWindow,
     paths: Vec<String>,
 ) -> Result<String, String> {

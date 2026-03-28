@@ -323,7 +323,7 @@ impl PeerManager {
                 .collect()
         };
 
-        for (node_id, endpoint, is_alive, _has_udp, _last_seen) in peer_list {
+        for (node_id, endpoint, _is_alive, _has_udp, _last_seen) in peer_list {
             let url = format!("http://{}:{}/api/status", endpoint.ip, endpoint.port);
             match client.get(&url).timeout(std::time::Duration::from_secs(3)).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -471,9 +471,19 @@ pub fn get_local_ip_for_farm(farm_path: &str) -> String {
     get_local_ip()
 }
 
-/// Try to extract the NAS host IP from a mount point by parsing `mount` output.
+/// Windows: extract host from a UNC path like `\\192.168.40.100\share`.
+#[cfg(windows)]
+fn resolve_mount_host(farm_path: &str) -> Option<String> {
+    let normalized = farm_path.replace('/', "\\");
+    let stripped = normalized.trim_start_matches('\\');
+    let host = stripped.split('\\').next().unwrap_or("");
+    if host.is_empty() { None } else { Some(host.to_string()) }
+}
+
+/// Unix: extract the NAS host IP from a mount point by parsing `mount` output.
 /// Given a farm_path like "/opt/ufb/mounts/gfxnas-sync", resolves symlinks to
 /// the real mount point (e.g. "/Volumes/ufb"), then finds the host in `mount`.
+#[cfg(not(windows))]
 fn resolve_mount_host(farm_path: &str) -> Option<String> {
     // Resolve symlinks to get the real mount point
     let real_path = std::fs::canonicalize(farm_path).ok()?;

@@ -12,16 +12,6 @@ pub struct FileEntry {
     pub extension: String,
 }
 
-/// Check if a path is a symlink pointing to a directory.
-fn is_dir_symlink(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
 /// List directory contents, returning file entries sorted (dirs first, then by name).
 pub fn list_directory(path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = Path::new(path);
