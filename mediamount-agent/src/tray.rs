@@ -49,17 +49,13 @@ impl TrayManager {
             Some(cancel_tx)
         };
 
+        // macOS: tray runs on the main thread (see main.rs macos_main_tray).
+        // TrayManager::start is a no-op on macOS.
         #[cfg(target_os = "macos")]
         let cancel_tx = {
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-            let cmd_tx_clone = cmd_tx.clone();
-            std::thread::Builder::new()
-                .name("tray".into())
-                .spawn(move || {
-                    macos_tray::run_tray(cmd_tx_clone, _state_rx, cancel_rx);
-                })
-                .expect("Failed to spawn tray thread");
-            Some(cancel_tx)
+            log::info!("macOS tray managed by main thread");
+            let _ = (cmd_tx, _state_rx);
+            None
         };
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -665,8 +661,9 @@ mod linux_tray {
     }
 }
 
-/// macOS tray using tray-icon + muda crates (NSStatusBar, no GTK needed).
-#[cfg(target_os = "macos")]
+/// macOS tray — DEPRECATED: now handled by companion Swift MenuBarExtra app.
+/// This module is kept for reference but not compiled on macOS.
+#[cfg(all(target_os = "macos", feature = "_unused_macos_tray"))]
 mod macos_tray {
     use super::TrayCommand;
     use crate::messages::AgentToUfb;

@@ -202,22 +202,8 @@ fn install_panic_hook() {
 
 // ── Main ──
 
-#[tokio::main]
-async fn main() {
-    init_logging();
-    install_panic_hook();
-
-    log::info!(
-        "mediamount-agent v{} starting",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    let _mutex_guard = ensure_single_instance();
-
-    // macOS: ensure /opt/ufb/mounts/ exists (one-time setup with admin prompt)
-    #[cfg(target_os = "macos")]
-    ensure_macos_mount_dir();
-
+/// The async event loop — runs on the main thread (Windows/Linux) or a background thread (macOS).
+async fn run_event_loop() {
     // Start IPC server
     #[cfg(windows)]
     let mut ipc_server = ipc::server::IpcServer::start();
@@ -231,7 +217,6 @@ async fn main() {
         process::exit(1);
     }
 
-    // Main event loop
     #[cfg(any(windows, unix))]
     {
         // Channel for agent→UFB messages from mount orchestrators
@@ -240,7 +225,8 @@ async fn main() {
         // Tray receives a copy of state updates
         let (tray_state_tx, tray_state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(64);
 
-        // Start tray icon
+        // Start tray icon — on macOS, tray runs on the main thread (see main()),
+        // so TrayManager::start spawns a no-op; the real tray is started separately.
         let (mut _tray_manager, mut tray_cmd_rx) = tray::TrayManager::start(tray_state_rx);
 
         // Start mount service
@@ -331,10 +317,43 @@ async fn main() {
     }
 
     log::info!("mediamount-agent exiting");
-
-    // Force exit — background tasks (IPC listener, config watcher) would
-    // otherwise keep the tokio runtime alive indefinitely.
     process::exit(0);
+}
+
+/// macOS: headless agent — tray UI handled by companion Swift MenuBarExtra app.
+/// The Swift app communicates with this agent via the same Unix socket IPC.
+#[cfg(target_os = "macos")]
+#[tokio::main]
+async fn main() {
+    init_logging();
+    install_panic_hook();
+
+    log::info!(
+        "mediamount-agent v{} starting (headless — tray via companion app)",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let _mutex_guard = ensure_single_instance();
+    ensure_macos_mount_dir();
+
+    run_event_loop().await;
+}
+
+/// Windows/Linux: tokio runs on the main thread, tray on a spawned thread.
+#[cfg(not(target_os = "macos"))]
+#[tokio::main]
+async fn main() {
+    init_logging();
+    install_panic_hook();
+
+    log::info!(
+        "mediamount-agent v{} starting",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let _mutex_guard = ensure_single_instance();
+
+    run_event_loop().await;
 }
 
 /// macOS: ensure the stable symlink directory exists at /opt/ufb/mounts/.

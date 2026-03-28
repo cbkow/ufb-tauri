@@ -142,7 +142,16 @@ pub fn translate_path_to(
 
         if matches {
             let remainder = &norm_path[norm_source.len()..];
-            let translated = format!("{}{}", target_prefix, remainder);
+            // Ensure a separator between target prefix and remainder.
+            // The source prefix may include a trailing slash that gets consumed,
+            // but the target prefix may not have one.
+            let target_norm = target_prefix.trim_end_matches('/').trim_end_matches('\\');
+            let remainder_trimmed = remainder.trim_start_matches('/').trim_start_matches('\\');
+            let translated = if remainder_trimmed.is_empty() {
+                target_norm.to_string()
+            } else {
+                format!("{}/{}", target_norm, remainder_trimmed)
+            };
             return to_native_path(&translated, target_os);
         }
     }

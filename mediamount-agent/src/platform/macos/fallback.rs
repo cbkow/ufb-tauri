@@ -17,17 +17,28 @@ pub fn macos_smb_mount(
     username: &str,
     _password: &str,
 ) -> Result<String, String> {
+    // Extract expected share name for matching
+    let expected_name = nas_share_path
+        .trim_end_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    // Check if already mounted (e.g. from a previous session or manual Finder mount)
+    let already_mounted = find_existing_volume(&expected_name);
+    if let Some(existing) = already_mounted {
+        log::info!("macOS: share already mounted at {}", existing);
+        return Ok(existing);
+    }
+
     // Snapshot /Volumes/ before mount
     let before = list_volumes();
 
     // Convert UNC path to smb:// URL
-    // \\server\share → smb://user@server/share
     let smb_url = unc_to_smb_url(nas_share_path, username);
     log::info!("macOS: mounting via `open {}`", smb_url);
 
-    // Note: `open smb://` uses the system's Finder-based SMB mount.
-    // Credentials are typically handled by the macOS Keychain after first interactive login,
-    // or by the username embedded in the URL. Password is not passed via URL for security.
     let output = Command::new("open")
         .arg(&smb_url)
         .output()
@@ -94,6 +105,24 @@ fn unc_to_smb_url(unc_path: &str, username: &str) -> String {
     }
 }
 
+/// Check if a volume matching the expected name is already mounted.
+fn find_existing_volume(expected_name: &str) -> Option<String> {
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.eq_ignore_ascii_case(expected_name) {
+                    let path = format!("/Volumes/{}", name);
+                    // Verify it's actually a mount point (not just an empty dir)
+                    if std::fs::read_dir(&path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// List current entries in /Volumes/.
 fn list_volumes() -> HashSet<String> {
     let mut volumes = HashSet::new();
@@ -108,10 +137,10 @@ fn list_volumes() -> HashSet<String> {
 }
 
 /// Poll /Volumes/ for a new entry that appeared after the mount command.
-/// Retries for up to 10 seconds.
+/// Retries for up to 60 seconds (user may need to enter credentials in a dialog).
 fn poll_for_new_volume(before: &HashSet<String>, nas_share_path: &str) -> Result<String, String> {
     // Extract the expected share name from UNC path for matching
-    // \\server\share → "share"
+    // \\server\share\subfolder → "subfolder"
     let expected_name = nas_share_path
         .trim_end_matches('\\')
         .rsplit('\\')
@@ -119,7 +148,9 @@ fn poll_for_new_volume(before: &HashSet<String>, nas_share_path: &str) -> Result
         .unwrap_or("")
         .to_string();
 
-    for attempt in 0..20 {
+    log::info!("macOS: polling /Volumes/ for '{}' (timeout 60s)", expected_name);
+
+    for attempt in 0..120 {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let after = list_volumes();
@@ -149,13 +180,13 @@ fn poll_for_new_volume(before: &HashSet<String>, nas_share_path: &str) -> Result
             }
         }
 
-        if attempt % 4 == 3 {
-            log::debug!("macOS: waiting for mount to appear in /Volumes/ ({}s)...", (attempt + 1) / 2);
+        if attempt % 10 == 9 {
+            log::info!("macOS: still waiting for mount in /Volumes/ ({}s)...", (attempt + 1) / 2);
         }
     }
 
     Err(format!(
-        "Timed out waiting for SMB mount to appear in /Volumes/ (expected '{}')",
+        "Timed out after 60s waiting for SMB mount to appear in /Volumes/ (expected '{}')",
         expected_name
     ))
 }

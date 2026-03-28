@@ -25,6 +25,7 @@ export interface MountConfig {
   mountDriveLetter: string;
   smbMountPath?: string;
   mountPathLinux?: string;
+  mountPathMacos?: string;
   isJobsFolder: boolean;
 }
 
@@ -79,8 +80,13 @@ function getMountForPath(path: string): MountStateUpdate | undefined {
   } else {
     // Linux/macOS: match against mount path fields
     for (const cfg of state.configs) {
-      const linuxPaths = [cfg.mountPathLinux, cfg.smbMountPath].filter(Boolean) as string[];
-      for (const mp of linuxPaths) {
+      const mountPath = getMountPath(cfg);
+      if (mountPath && (path === mountPath || path.startsWith(mountPath + "/"))) {
+        return state.states[cfg.id];
+      }
+      // Also check explicit path fields
+      const extraPaths = [cfg.mountPathLinux, cfg.mountPathMacos, cfg.smbMountPath].filter(Boolean) as string[];
+      for (const mp of extraPaths) {
         if (path === mp || path.startsWith(mp + "/")) {
           return state.states[cfg.id];
         }
@@ -147,10 +153,15 @@ function getMountPath(cfg: MountConfig): string {
   if (platformStore.platform === "win") {
     return cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "";
   }
-  // Linux/macOS: explicit path or auto-derived from mount ID
+  if (platformStore.platform === "mac") {
+    // macOS: explicit path or auto-derived /opt/ufb/mounts/{id}
+    if (cfg.mountPathMacos) return cfg.mountPathMacos;
+    if (cfg.id) return `/opt/ufb/mounts/${cfg.id}`;
+    return "";
+  }
+  // Linux: explicit path or auto-derived from mount ID
   if (cfg.mountPathLinux) return cfg.mountPathLinux;
   if (cfg.smbMountPath) return cfg.smbMountPath;
-  // Auto-derived (matches agent's config.mount_path() on Linux)
   const home = platformStore.home;
   if (home && cfg.id) return `${home}/.local/share/ufb/mnt/${cfg.id}`;
   return "";

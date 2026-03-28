@@ -44,40 +44,48 @@ function initGlobalDropListener() {
   getCurrentWebview().onDragDropEvent((event) => {
     const payload = event.payload;
     const pos = "position" in payload ? payload.position : null;
-    // Position handling differs by platform:
-    // - Windows: Tauri reports physical pixels, divide by devicePixelRatio
-    // - macOS: Tauri reports logical coordinates relative to the window (including title bar),
-    //   but elementFromPoint expects coordinates relative to the webview viewport.
-    //   Subtract the webview's offset from the window top (title bar height).
     const scale = window.devicePixelRatio || 1;
     const rawX = pos ? pos.x : 0;
     const rawY = pos ? pos.y : 0;
     const isMac = navigator.platform.toLowerCase().includes("mac");
-    let logicalX: number;
-    let logicalY: number;
-    if (isMac) {
-      // On macOS, the position includes the title bar offset.
-      // window.screenY gives the window's screen position; we need the
-      // content area offset. The simplest approach: use outerHeight - innerHeight
-      // as the chrome (title bar + toolbar) height.
-      const chromeHeight = window.outerHeight - window.innerHeight;
-      logicalX = rawX;
-      logicalY = rawY - chromeHeight;
-    } else {
-      logicalX = rawX / scale;
-      logicalY = rawY / scale;
-    }
+    // macOS: Tauri reports logical coordinates, no scaling needed
+    // Windows: Tauri reports physical pixels, divide by scale
+    const logicalX = isMac ? rawX : rawX / scale;
+    const logicalY = isMac ? rawY : rawY / scale;
 
     if (payload.type === "over" || payload.type === "enter") {
       document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
-      const el = document.elementFromPoint(logicalX, logicalY);
-      const browserContent = el?.closest(".file-browser")?.querySelector(".file-browser-content");
-      if (browserContent) {
-        browserContent.classList.add("drop-zone-active");
-      } else {
-        const panelEl = el?.closest(".item-list-panel[data-drop-path]");
-        panelEl?.querySelector(".item-list-scroll")?.classList.add("drop-zone-active");
+
+      // Use bounding rect hit-testing instead of elementFromPoint for hover highlights.
+      // This is more reliable across platforms — elementFromPoint can miss due to
+      // coordinate system differences between Tauri's reported position and the DOM.
+      let highlighted = false;
+      const browsers = document.querySelectorAll<HTMLElement>(".file-browser");
+      for (const browser of browsers) {
+        const rect = browser.getBoundingClientRect();
+        if (logicalX >= rect.left && logicalX <= rect.right &&
+            logicalY >= rect.top && logicalY <= rect.bottom) {
+          const content = browser.querySelector(".file-browser-content");
+          if (content) {
+            content.classList.add("drop-zone-active");
+            highlighted = true;
+          }
+          break;
+        }
+      }
+
+      // If no browser matched, check item list panels
+      if (!highlighted) {
+        const panels = document.querySelectorAll<HTMLElement>(".item-list-panel[data-drop-path]");
+        for (const panel of panels) {
+          const rect = panel.getBoundingClientRect();
+          if (logicalX >= rect.left && logicalX <= rect.right &&
+              logicalY >= rect.top && logicalY <= rect.bottom) {
+            panel.querySelector(".item-list-scroll")?.classList.add("drop-zone-active");
+            break;
+          }
+        }
       }
     } else if (payload.type === "leave") {
       document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
