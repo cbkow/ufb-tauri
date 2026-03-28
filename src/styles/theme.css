@@ -61,6 +61,8 @@ html, body, #root {
   font-size: var(--font-size);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
 }
 
 /* Scrollbar styling */

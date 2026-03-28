@@ -2,6 +2,7 @@ import { createSignal, onMount, onCleanup } from "solid-js";
 import type { BrowserStore } from "../stores/fileStore";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { copyFiles, moveFiles, startNativeDrag } from "./tauri";
+import { platformStore } from "../stores/platformStore";
 
 interface BrowserDragDropConfig {
   /** Look up a BrowserStore by its DOM data-browser-id */
@@ -42,10 +43,30 @@ function initGlobalDropListener() {
 
   getCurrentWebview().onDragDropEvent((event) => {
     const payload = event.payload;
-    const scale = window.devicePixelRatio || 1;
     const pos = "position" in payload ? payload.position : null;
-    const logicalX = pos ? pos.x / scale : 0;
-    const logicalY = pos ? pos.y / scale : 0;
+    // Position handling differs by platform:
+    // - Windows: Tauri reports physical pixels, divide by devicePixelRatio
+    // - macOS: Tauri reports logical coordinates relative to the window (including title bar),
+    //   but elementFromPoint expects coordinates relative to the webview viewport.
+    //   Subtract the webview's offset from the window top (title bar height).
+    const scale = window.devicePixelRatio || 1;
+    const rawX = pos ? pos.x : 0;
+    const rawY = pos ? pos.y : 0;
+    const isMac = navigator.platform.toLowerCase().includes("mac");
+    let logicalX: number;
+    let logicalY: number;
+    if (isMac) {
+      // On macOS, the position includes the title bar offset.
+      // window.screenY gives the window's screen position; we need the
+      // content area offset. The simplest approach: use outerHeight - innerHeight
+      // as the chrome (title bar + toolbar) height.
+      const chromeHeight = window.outerHeight - window.innerHeight;
+      logicalX = rawX;
+      logicalY = rawY - chromeHeight;
+    } else {
+      logicalX = rawX / scale;
+      logicalY = rawY / scale;
+    }
 
     if (payload.type === "over" || payload.type === "enter") {
       document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
@@ -204,7 +225,7 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
         setActiveDrag((prev) => prev ? { ...prev, x: e.clientX, y: e.clientY } : null);
         updateDropTarget(e.clientX, e.clientY, activeDrag()!.sourceBrowserId);
 
-        // B. If cursor reaches window edge, hand off to native OS drag-out
+        // B. If cursor reaches window edge, hand off to native OS drag-out (Windows only)
         const margin = 6;
         const nearEdge =
           e.clientX <= margin ||

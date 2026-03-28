@@ -934,13 +934,37 @@ pub async fn pick_folder(title: Option<String>) -> Result<Option<String>, String
 
 /// Start a native OS drag operation with the given file paths.
 /// Windows: DoDragDrop is blocking — runs as a sync command on the main thread.
-/// macOS: Uses the `drag` crate via tauri-plugin-drag's underlying library.
+/// macOS: Uses the `drag` crate, dispatched to main thread via app.run_on_main_thread.
 #[tauri::command]
-pub fn start_native_drag(
+pub async fn start_native_drag(
+    app: tauri::AppHandle,
     #[allow(unused)] window: tauri::WebviewWindow,
     paths: Vec<String>,
 ) -> Result<String, String> {
-    crate::drag_out::start_native_drag(&window, &paths)
+    #[cfg(target_os = "windows")]
+    {
+        // Windows OLE drag blocks on the calling thread (pumps own message loop)
+        crate::drag_out::start_native_drag(&window, &paths)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let window_clone = window.clone();
+        let paths_clone = paths.clone();
+
+        app.run_on_main_thread(move || {
+            let result = crate::drag_out::start_native_drag(&window_clone, &paths_clone);
+            let _ = tx.send(result);
+        }).map_err(|e| format!("Failed to dispatch to main thread: {}", e))?;
+
+        rx.recv().map_err(|e| format!("Drag thread error: {}", e))?
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (app, window);
+        Err("Native drag not implemented on this platform".into())
+    }
 }
 
 // ── Backup ──

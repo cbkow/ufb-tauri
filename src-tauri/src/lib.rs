@@ -81,7 +81,6 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_drag::init())
         .manage(state)
         .setup(move |app| {
             // Deep-link listener for URIs arriving while app is running

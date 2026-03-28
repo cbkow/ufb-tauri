@@ -138,22 +138,22 @@ fn build_cf_hdrop(
     }
 }
 
-/// macOS: use the `drag` crate (same library underlying tauri-plugin-drag)
-/// to initiate a native drag session with file URLs.
-/// Paths are canonicalized to resolve symlinks (e.g. /opt/ufb/mounts/nas → /Volumes/share).
+/// macOS: use the `drag` crate to initiate a native drag session.
+/// Called on the main thread via app.run_on_main_thread() from the command handler.
+/// The drag session is non-blocking on macOS — beginDraggingSession returns immediately
+/// and macOS manages the drag lifecycle.
 #[cfg(target_os = "macos")]
 pub fn start_native_drag(window: &tauri::WebviewWindow, paths: &[String]) -> std::result::Result<String, String> {
     use std::path::PathBuf;
-    use std::sync::mpsc;
 
     if paths.is_empty() {
         return Ok("cancelled".to_string());
     }
 
-    // Canonicalize paths to resolve symlinks — gives receiving apps real /Volumes/ paths
+    // Canonicalize paths to resolve symlinks (e.g. /opt/ufb/mounts/nas → /Volumes/share)
     let resolved: Vec<PathBuf> = paths
         .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter_map(|p| std::fs::canonicalize(p).ok().or_else(|| Some(PathBuf::from(p))))
         .collect();
 
     if resolved.is_empty() {
@@ -161,41 +161,34 @@ pub fn start_native_drag(window: &tauri::WebviewWindow, paths: &[String]) -> std
     }
 
     let item = drag::DragItem::Files(resolved);
-    // Use a transparent 1x1 image as drag preview (the OS will show file icons)
+    // 1x1 transparent PNG as drag preview — macOS will show file icons
     let image = drag::Image::Raw(vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG header
-        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, // RGBA
-        0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, // IDAT
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+        0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
         0x54, 0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02,
         0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00,
         0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
-        0x60, 0x82, // IEND
+        0x60, 0x82,
     ]);
 
-    let (tx, rx) = mpsc::channel();
-    let tx_clone = tx.clone();
-
+    // start_drag on macOS is non-blocking — it starts the session and returns.
+    // The callback fires when the drag ends.
     let result = drag::start_drag(
         window,
         item,
         image,
         move |result, _cursor_pos| {
-            let _ = tx_clone.send(result);
+            log::info!("macOS drag result: {:?}", result);
         },
         drag::Options::default(),
     );
 
-    if let Err(e) = result {
-        return Err(format!("Drag failed: {}", e));
-    }
-
-    // Wait for the drag result
-    match rx.recv() {
-        Ok(drag::DragResult::Dropped) => Ok("copied".to_string()),
-        Ok(drag::DragResult::Cancel) => Ok("cancelled".to_string()),
-        Err(_) => Ok("cancelled".to_string()),
+    match result {
+        Ok(()) => Ok("started".to_string()),
+        Err(e) => Err(format!("Drag failed: {}", e)),
     }
 }
 
