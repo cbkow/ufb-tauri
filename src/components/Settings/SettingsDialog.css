@@ -529,6 +529,23 @@
 .mount-state-dot.error { background: #f44336; }
 .mount-state-dot.neutral { background: var(--text-tertiary); }
 
+.mount-enable-toggle {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.mount-config-disabled {
+  opacity: 0.5;
+}
+
+.mount-config-disabled .mount-config-name,
+.mount-config-disabled .mount-config-detail {
+  text-decoration: line-through;
+}
+
 .mount-item-name {
   font-weight: 600;
   font-size: 12px;

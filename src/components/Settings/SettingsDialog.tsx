@@ -942,18 +942,33 @@ function MountsSection(props: {
       <Show when={Object.keys(mountStore.states).length > 0}>
         <h3>Live Status</h3>
         <For each={Object.values(mountStore.states) as MountStateUpdate[]}>
-          {(ms) => (
-            <div class="mount-item">
-              <div class="mount-item-header">
-                <span class={`mount-state-dot ${ms.state === "mounted" ? "healthy" : ms.state === "error" ? "error" : "neutral"}`} />
-                <span class="mount-item-name">{ms.mountId}</span>
-                <span class="mount-item-state">{ms.stateDetail}</span>
+          {(ms) => {
+            const cfg = () => props.mountConfig().mounts.find((m) => m.id === ms.mountId);
+            return (
+              <div class="mount-item">
+                <div class="mount-item-header">
+                  <input
+                    type="checkbox"
+                    class="mount-enable-toggle"
+                    checked={cfg()?.enabled ?? true}
+                    onChange={(e) => {
+                      const updated = props.mountConfig().mounts.map((m) =>
+                        m.id === ms.mountId ? { ...m, enabled: e.currentTarget.checked } : m
+                      );
+                      mountStore.saveConfig({ ...props.mountConfig(), mounts: updated });
+                    }}
+                    title={cfg()?.enabled ? "Disable this mount" : "Enable this mount"}
+                  />
+                  <span class={`mount-state-dot ${ms.state === "mounted" ? "healthy" : ms.state === "error" ? "error" : "neutral"}`} />
+                  <span class="mount-item-name">{ms.mountId}</span>
+                  <span class="mount-item-state">{ms.stateDetail}</span>
+                </div>
+                <div class="mount-controls">
+                  <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
+                </div>
               </div>
-              <div class="mount-controls">
-                <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
-              </div>
-            </div>
-          )}
+            );
+          }}
         </For>
       </Show>
 
@@ -962,9 +977,20 @@ function MountsSection(props: {
       <Show when={!editingMount()}>
         <For each={props.mountConfig().mounts}>
           {(cfg) => (
-            <div class="mount-config-item">
+            <div class={`mount-config-item ${!cfg.enabled ? "mount-config-disabled" : ""}`}>
               <div class="mount-config-header">
-                <span class={`mount-state-dot ${cfg.enabled ? "healthy" : "neutral"}`} />
+                <input
+                  type="checkbox"
+                  class="mount-enable-toggle"
+                  checked={cfg.enabled}
+                  onChange={(e) => {
+                    const updated = props.mountConfig().mounts.map((m) =>
+                      m.id === cfg.id ? { ...m, enabled: e.currentTarget.checked } : m
+                    );
+                    mountStore.saveConfig({ ...props.mountConfig(), mounts: updated });
+                  }}
+                  title={cfg.enabled ? "Disable this mount" : "Enable this mount"}
+                />
                 <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
                 <span class="mount-config-detail">{cfg.nasSharePath} → {mountStore.getMountPath(cfg) || "(not set)"}</span>
               </div>
