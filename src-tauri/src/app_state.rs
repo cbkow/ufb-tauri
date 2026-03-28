@@ -105,14 +105,40 @@ impl AppState {
         TranscodeManager::new(ffmpeg, ffprobe, exiftool)
     }
 
-    /// Resolve a binary: check bundled next to exe first, then system PATH.
+    /// Resolve a binary: check bundled locations first, then system PATH.
     fn resolve_binary(exe_dir: &std::path::Path, name: &str, ext: &str) -> std::path::PathBuf {
+        let bin_name = format!("{}{}", name, ext);
+
         // 1. Bundled next to exe
-        let bundled = exe_dir.join(format!("{}{}", name, ext));
+        let bundled = exe_dir.join(&bin_name);
         if bundled.exists() {
             return bundled;
         }
-        // 2. System PATH (Linux/macOS)
+
+        // 2. macOS: check app bundle Resources/ and Frameworks/ directories
+        #[cfg(target_os = "macos")]
+        {
+            // Production .app bundle: exe is in Contents/MacOS/, resources in Contents/Resources/
+            if let Some(contents_dir) = exe_dir.parent() {
+                let resources = contents_dir.join("Resources").join(&bin_name);
+                if resources.exists() {
+                    return resources;
+                }
+                let frameworks = contents_dir.join("Frameworks").join(&bin_name);
+                if frameworks.exists() {
+                    return frameworks;
+                }
+            }
+            // Dev build: check external/ffmpeg-macos/bin/ relative to manifest
+            let dev_path = exe_dir.join("../../external/ffmpeg-macos/bin").join(&bin_name);
+            if let Ok(resolved) = std::fs::canonicalize(&dev_path) {
+                if resolved.exists() {
+                    return resolved;
+                }
+            }
+        }
+
+        // 3. System PATH (Linux/macOS)
         #[cfg(not(target_os = "windows"))]
         if let Ok(output) = std::process::Command::new("which").arg(name).output() {
             if output.status.success() {
@@ -122,8 +148,9 @@ impl AppState {
                 }
             }
         }
-        // 3. Bare name fallback
-        std::path::PathBuf::from(format!("{}{}", name, ext))
+
+        // 4. Bare name fallback
+        std::path::PathBuf::from(bin_name)
     }
 
     /// Set the Tauri app handle on the transcode manager and start the worker.

@@ -688,6 +688,39 @@ fn extract_blend(file_path: &str) -> Result<Vec<u8>, String> {
 
 // ── 6. PDF/AI/EPS — pdfium renderer ──
 
+/// Try to bind to pdfium: check bundled location next to the executable first,
+/// then fall back to system library search.
+fn find_pdfium_bindings() -> Result<Box<dyn pdfium_render::prelude::PdfiumLibraryBindings>, pdfium_render::prelude::PdfiumError> {
+    // Check next to our executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidates = [
+                exe_dir.join("libpdfium.dylib"),
+                exe_dir.join("libpdfium.so"),
+                exe_dir.join("pdfium.dll"),
+                // macOS .app bundle: Contents/Frameworks/
+                exe_dir.join("../Frameworks/libpdfium.dylib"),
+                // Dev build: external/ffmpeg-macos/lib/ or external/ffmpeg/bin/
+                exe_dir.join("../../external/ffmpeg-macos/lib/libpdfium.dylib"),
+                exe_dir.join("../../external/ffmpeg/bin/pdfium.dll"),
+            ];
+            for candidate in &candidates {
+                if let Ok(resolved) = std::fs::canonicalize(candidate) {
+                    if resolved.exists() {
+                        if let Ok(bindings) = pdfium_render::prelude::Pdfium::bind_to_library(
+                            resolved.to_string_lossy().as_ref(),
+                        ) {
+                            return Ok(bindings);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to system library search
+    pdfium_render::prelude::Pdfium::bind_to_system_library()
+}
+
 fn extract_pdf(file_path: &str) -> Result<Vec<u8>, String> {
     // AI files with PDF compatibility start with %PDF — read and check
     let ext = Path::new(file_path)
@@ -711,11 +744,10 @@ fn extract_pdf(file_path: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    // Try to find pdfium library
-    let pdfium = pdfium_render::prelude::Pdfium::new(
-        pdfium_render::prelude::Pdfium::bind_to_system_library()
-            .map_err(|e| format!("pdfium bind: {}", e))?,
-    );
+    // Try to find pdfium library — check bundled location first, then system
+    let bindings = find_pdfium_bindings()
+        .map_err(|e| format!("pdfium bind: {}", e))?;
+    let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
 
     let doc = pdfium
         .load_pdf_from_file(file_path, None)

@@ -34,15 +34,39 @@ fn build_video_thumb() {
 
     // Link FFmpeg libraries
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=avformat");
-    println!("cargo:rustc-link-lib=dylib=avcodec");
-    println!("cargo:rustc-link-lib=dylib=avutil");
-    println!("cargo:rustc-link-lib=dylib=swscale");
+
+    if cfg!(target_os = "macos") {
+        // macOS: static linking — no dylibs to ship or sign
+        println!("cargo:rustc-link-lib=static=avformat");
+        println!("cargo:rustc-link-lib=static=avcodec");
+        println!("cargo:rustc-link-lib=static=avutil");
+        println!("cargo:rustc-link-lib=static=swscale");
+        println!("cargo:rustc-link-lib=static=swresample");
+        println!("cargo:rustc-link-lib=static=x264");
+        println!("cargo:rustc-link-lib=static=mp3lame");
+
+        // System frameworks required by FFmpeg on macOS
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
+        println!("cargo:rustc-link-lib=framework=CoreMedia");
+        println!("cargo:rustc-link-lib=framework=CoreVideo");
+        println!("cargo:rustc-link-lib=framework=VideoToolbox");
+        println!("cargo:rustc-link-lib=framework=Security");
+        println!("cargo:rustc-link-lib=z");
+        println!("cargo:rustc-link-lib=bz2");
+        println!("cargo:rustc-link-lib=iconv");
+    } else {
+        // Windows/Linux: dynamic linking
+        println!("cargo:rustc-link-lib=dylib=avformat");
+        println!("cargo:rustc-link-lib=dylib=avcodec");
+        println!("cargo:rustc-link-lib=dylib=avutil");
+        println!("cargo:rustc-link-lib=dylib=swscale");
+    }
 
     // Tell Rust we have FFmpeg
     println!("cargo:rustc-cfg=has_ffmpeg");
 
-    // Copy FFmpeg DLLs to the output directory so they're found at runtime
+    // Copy runtime binaries (ffmpeg, ffprobe, DLLs) to the output directory
     let out_dir = std::env::var("OUT_DIR").unwrap();
     // OUT_DIR is something like target/debug/build/ufb-tauri-xxx/out
     // We need the target/debug or target/release directory
@@ -58,19 +82,16 @@ fn build_video_thumb() {
                 let entry = entry.unwrap();
                 let filename = entry.file_name();
                 let name = filename.to_string_lossy();
-                let is_lib = if cfg!(target_os = "windows") {
-                    name.ends_with(".dll")
-                } else if cfg!(target_os = "macos") {
-                    name.contains(".dylib")
-                } else {
-                    name.contains(".so")
-                };
-                let is_executable = if cfg!(target_os = "windows") {
-                    name == "ffmpeg.exe" || name == "ffprobe.exe"
+
+                // On Windows: copy DLLs + executables
+                // On macOS/Linux: copy only executables (static linking, no dylibs needed)
+                let should_copy = if cfg!(target_os = "windows") {
+                    name.ends_with(".dll") || name == "ffmpeg.exe" || name == "ffprobe.exe" || name == "pdfium.dll"
                 } else {
                     name == "ffmpeg" || name == "ffprobe"
                 };
-                if is_lib || is_executable {
+
+                if should_copy {
                     let dest = target_dir.join(&filename);
                     if !dest.exists() {
                         let _ = std::fs::copy(entry.path(), &dest);
@@ -83,15 +104,20 @@ fn build_video_thumb() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let exiftool_name = if cfg!(target_os = "windows") { "exiftool.exe" } else { "exiftool" };
 
-        // Check local external/exiftool/ first, then UFB project's external/exiftool/
-        let exiftool_candidates = vec![
-            manifest_dir.join("external").join("exiftool").join(exiftool_name),
+        // Check platform-specific exiftool first, then generic, then UFB project
+        let mut exiftool_candidates = Vec::new();
+        if cfg!(target_os = "macos") {
+            // macOS Perl distribution (script + lib/)
+            exiftool_candidates.push(manifest_dir.join("external").join("exiftool-macos").join(exiftool_name));
+        }
+        exiftool_candidates.push(manifest_dir.join("external").join("exiftool").join(exiftool_name));
+        exiftool_candidates.push(
             manifest_dir.parent()
                 .and_then(|p| p.parent())
                 .and_then(|p| p.parent())
                 .map(|github_dir| github_dir.join("UFB").join("external").join("exiftool").join(exiftool_name))
                 .unwrap_or_default(),
-        ];
+        );
 
         for src in exiftool_candidates {
             if src.exists() {
@@ -99,9 +125,12 @@ fn build_video_thumb() {
                 if !dest.exists() {
                     let _ = std::fs::copy(&src, &dest);
                 }
-                // Also copy exiftool_files directory (Perl runtime + libs)
-                let src_files_dir = src.parent().unwrap().join("exiftool_files");
-                let dest_files_dir = target_dir.join("exiftool_files");
+                // Copy supporting files: exiftool_files/ (Windows) or lib/ (macOS/Unix Perl modules)
+                let (src_files_dir, dest_files_dir) = if cfg!(target_os = "macos") {
+                    (src.parent().unwrap().join("lib"), target_dir.join("lib"))
+                } else {
+                    (src.parent().unwrap().join("exiftool_files"), target_dir.join("exiftool_files"))
+                };
                 if src_files_dir.is_dir() && !dest_files_dir.exists() {
                     fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
                         std::fs::create_dir_all(dst)?;
@@ -137,8 +166,15 @@ fn find_ffmpeg_dir() -> Option<PathBuf> {
         }
     }
 
-    // 2. Check local external directory
-    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("external").join("ffmpeg");
+    // 2. Check platform-specific external directory
+    let manifest_dir_local = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if cfg!(target_os = "macos") {
+        let macos_dir = manifest_dir_local.join("external").join("ffmpeg-macos");
+        if macos_dir.exists() {
+            return Some(macos_dir);
+        }
+    }
+    let local = manifest_dir_local.join("external").join("ffmpeg");
     if local.exists() {
         return Some(local);
     }
