@@ -215,6 +215,24 @@ impl MountClient {
         self.state.lock().await.connected
     }
 
+    /// Quick synchronous check if the agent socket exists (not a full connection test).
+    pub fn is_agent_running(&self) -> bool {
+        #[cfg(windows)]
+        {
+            // On Windows, check if the named pipe exists
+            std::path::Path::new(PIPE_NAME).exists()
+        }
+        #[cfg(unix)]
+        {
+            let sock_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+                std::path::PathBuf::from(runtime_dir).join("ufb/mediamount-agent.sock")
+            } else {
+                std::path::PathBuf::from("/tmp/ufb-mediamount-agent.sock")
+            };
+            sock_path.exists()
+        }
+    }
+
     /// Send a command to the agent via the persistent connection.
     pub async fn send_command(&self, cmd: UfbToAgent) -> Result<(), String> {
         self.cmd_tx

@@ -56,10 +56,7 @@ struct MediaMountTrayApp: App {
                 Divider()
 
                 Button("Quit Agent") {
-                    agent.sendQuit()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        NSApplication.shared.terminate(nil)
-                    }
+                    agent.quitAgent()
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 3)
@@ -269,6 +266,35 @@ class AgentConnection: ObservableObject {
 
     func sendQuit() {
         sendMessage(["type": "quit"])
+    }
+
+    /// Send quit command, then wait briefly for graceful shutdown.
+    func quitAgent() {
+        sendQuit()
+        // Give the agent a moment to process the quit
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            // Check if agent is still running by trying the socket
+            let sockPath = self?.socketPath ?? "/tmp/ufb-mediamount-agent.sock"
+            if FileManager.default.fileExists(atPath: sockPath) {
+                // Socket still exists — agent may not have exited
+                self?.forceKillAgent()
+            }
+            DispatchQueue.main.async {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+
+    /// Force-kill the agent process if it didn't exit gracefully.
+    func forceKillAgent() {
+        // Find and kill mediamount-agent processes
+        let task = Process()
+        task.launchPath = "/usr/bin/pkill"
+        task.arguments = ["-f", "mediamount-agent"]
+        try? task.run()
+        task.waitUntilExit()
+        // Clean up stale socket
+        try? FileManager.default.removeItem(atPath: socketPath)
     }
 
     private func sendMessage(_ dict: [String: Any]) {

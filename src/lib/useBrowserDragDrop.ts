@@ -161,17 +161,17 @@ export function useBrowserDragDrop(config: BrowserDragDropConfig) {
       if (e.ctrlKey || e.metaKey || e.shiftKey) return;
 
       const target = e.target as HTMLElement;
-      const row = target.closest(".file-row, .grid-item, .item-row");
+
+      // Don't initiate drag from item-list panels (metadata/tracker panels).
+      // These panels have editable fields and drag interferes with interaction.
+      if (target.closest(".item-list-panel")) return;
+
+      const row = target.closest(".file-row, .grid-item");
       if (!row) return;
 
-      // Try FileBrowser first, then ItemListPanel
+      // Only start drag from FileBrowser panels
       const browserEl = target.closest(".file-browser");
       let browserId = browserEl?.getAttribute("data-browser-id") ?? null;
-
-      if (!browserId) {
-        const panelEl = target.closest(".item-list-panel[data-browser-id]");
-        browserId = panelEl?.getAttribute("data-browser-id") ?? null;
-      }
       if (!browserId) return;
 
       const store = config.getBrowserStore(browserId);

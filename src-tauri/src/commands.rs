@@ -1635,7 +1635,7 @@ pub fn mount_launch_agent() -> Result<(), String> {
         "mediamount-agent"
     };
 
-    // Search order: next to UFB exe, then dev build path, then PATH
+    // Search order: next to UFB exe, bundle Resources, dev build path, then PATH
     let mut agent_path = std::path::PathBuf::from(agent_name);
 
     if let Ok(exe) = std::env::current_exe() {
@@ -1645,11 +1645,21 @@ pub fn mount_launch_agent() -> Result<(), String> {
             if sidecar.exists() {
                 agent_path = sidecar;
             } else {
+                // macOS .app bundle: Contents/MacOS/ or Contents/Resources/
+                #[cfg(target_os = "macos")]
+                if let Some(contents_dir) = dir.parent() {
+                    let resources = contents_dir.join("Resources").join(agent_name);
+                    if resources.exists() {
+                        agent_path = resources;
+                    }
+                }
                 // Dev: UFB is in src-tauri/target/debug/,
                 // agent is in mediamount-agent/target/debug/
-                let dev_path = dir.join("../../../mediamount-agent/target/debug").join(agent_name);
-                if let Ok(canon) = std::fs::canonicalize(&dev_path) {
-                    agent_path = canon;
+                if !agent_path.exists() || agent_path == std::path::PathBuf::from(agent_name) {
+                    let dev_path = dir.join("../../../mediamount-agent/target/debug").join(agent_name);
+                    if let Ok(canon) = std::fs::canonicalize(&dev_path) {
+                        agent_path = canon;
+                    }
                 }
             }
         }
@@ -1672,6 +1682,29 @@ pub fn mount_launch_agent() -> Result<(), String> {
         std::process::Command::new(&agent_path)
             .spawn()
             .map_err(|e| format!("Failed to launch agent at {}: {}", agent_path.display(), e))?;
+    }
+
+    // macOS: also launch the Swift tray companion app if available
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                // Production: MediaMountTray.app in Contents/Resources/
+                let tray_candidates = [
+                    dir.join("../Resources/MediaMountTray.app"),
+                    dir.join("../../../mediamount-tray/MediaMountTray.app"),
+                ];
+                for tray_path in &tray_candidates {
+                    if tray_path.exists() {
+                        log::info!("Launching tray app: {}", tray_path.display());
+                        let _ = std::process::Command::new("open")
+                            .arg(tray_path)
+                            .spawn();
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

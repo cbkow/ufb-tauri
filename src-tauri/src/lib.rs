@@ -123,6 +123,15 @@ pub fn run() {
                 state.set_mesh_app_handle(app_handle.clone()).await;
                 state.enable_mesh_sync_if_configured(&settings).await;
                 state.set_transcode_app_handle(app_handle.clone()).await;
+
+                // Auto-launch the mediamount-agent if not already running
+                if !state.mount_client.is_agent_running() {
+                    log::info!("Agent not running, auto-launching...");
+                    if let Err(e) = crate::commands::mount_launch_agent() {
+                        log::warn!("Failed to auto-launch agent: {}", e);
+                    }
+                }
+
                 state.mount_client.start(app_handle.clone());
 
                 // Sync Explorer nav pane pins for Jobs folders

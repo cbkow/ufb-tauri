@@ -43,6 +43,7 @@ pub enum UfbToAgent {
     ReloadConfig,
     GetStates,
     Ping,
+    Quit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use crate::columns::ColumnConfigManager;
 use crate::db::Database;
 use crate::http_server::{HttpState, MeshHttpServer};
-use crate::peer_manager::{get_local_ip, PeerManager};
+use crate::peer_manager::{get_local_ip_for_farm, PeerManager};
 use crate::udp_notify::UdpNotify;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -183,8 +183,8 @@ impl MeshSyncManager {
                 log::error!("Failed to start UDP: {}", e);
             }
 
-            // 2. Send immediate heartbeat
-            let ip = get_local_ip();
+            // 2. Send immediate heartbeat (use farm-aware IP for correct interface)
+            let ip = get_local_ip_for_farm(&self.farm_path);
             if let Err(e) = self.udp_notify.send_heartbeat(&ip, self.http_port, &self.tags).await {
                 log::warn!("Failed to send initial heartbeat: {}", e);
             }
@@ -299,6 +299,7 @@ impl MeshSyncManager {
                 let enabled = self.enabled.clone();
                 let http_port = self.http_port;
                 let tags = self.tags.clone();
+                let farm_path_for_udp = self.farm_path.clone();
                 let handle = tokio::spawn(async move {
                     let mut heartbeat_interval = tokio::time::interval(
                         std::time::Duration::from_millis(UDP_HEARTBEAT_INTERVAL_MS),
@@ -314,7 +315,7 @@ impl MeshSyncManager {
 
                         tokio::select! {
                             _ = heartbeat_interval.tick() => {
-                                let ip = get_local_ip();
+                                let ip = get_local_ip_for_farm(&farm_path_for_udp);
                                 if let Err(e) = udp.send_heartbeat(&ip, http_port, &tags).await {
                                     log::warn!("Heartbeat send failed: {}", e);
                                 }
@@ -983,10 +984,13 @@ fn restore_from_snapshot(db: &Arc<Database>, farm_path: &str) {
         // Restore each table individually so a missing table doesn't block the rest
         let tables: &[(&str, &str)] = &[
             ("subscriptions",
-             "DELETE FROM main.subscriptions;
-              INSERT OR REPLACE INTO main.subscriptions (id, job_path, job_name, is_active, subscribed_time, last_sync_time, sync_status, shot_count)
+             "-- Merge subscriptions: add new, remove deleted, preserve existing
+              INSERT OR IGNORE INTO main.subscriptions (id, job_path, job_name, is_active, subscribed_time, last_sync_time, sync_status, shot_count)
                   SELECT id, job_path, job_name, is_active, subscribed_time, last_sync_time, sync_status, shot_count
-                  FROM snap.subscriptions;"),
+                  FROM snap.subscriptions
+                  WHERE job_path NOT IN (SELECT job_path FROM main.subscriptions);
+              DELETE FROM main.subscriptions
+              WHERE job_path NOT IN (SELECT job_path FROM snap.subscriptions);"),
             ("column_definitions",
              "DELETE FROM main.column_definitions;
               INSERT OR REPLACE INTO main.column_definitions (id, job_path, folder_name, column_name, column_type, column_order, column_width, is_visible, default_value)
@@ -998,10 +1002,27 @@ fn restore_from_snapshot(db: &Arc<Database>, farm_path: &str) {
                   SELECT id, column_id, option_name, option_color
                   FROM snap.column_options;"),
             ("item_metadata",
-             "DELETE FROM main.item_metadata;
-              INSERT OR REPLACE INTO main.item_metadata (item_path, job_path, folder_name, metadata_json, is_tracked, created_time, modified_time, device_id)
+             "-- Insert new rows from snapshot that don't exist locally
+              INSERT OR IGNORE INTO main.item_metadata (item_path, job_path, folder_name, metadata_json, is_tracked, created_time, modified_time, device_id)
                   SELECT item_path, job_path, folder_name, metadata_json, is_tracked, created_time, modified_time, device_id
-                  FROM snap.item_metadata;"),
+                  FROM snap.item_metadata
+                  WHERE item_path NOT IN (SELECT item_path FROM main.item_metadata);
+              -- Update existing rows only if snapshot has a newer modified_time
+              UPDATE main.item_metadata SET
+                  job_path = snap_row.job_path,
+                  folder_name = snap_row.folder_name,
+                  metadata_json = snap_row.metadata_json,
+                  is_tracked = snap_row.is_tracked,
+                  modified_time = snap_row.modified_time,
+                  device_id = snap_row.device_id
+              FROM (SELECT * FROM snap.item_metadata) AS snap_row
+              WHERE main.item_metadata.item_path = snap_row.item_path
+                AND (main.item_metadata.modified_time IS NULL
+                     OR snap_row.modified_time > main.item_metadata.modified_time);
+              -- Remove rows that exist locally but not in snapshot (deleted by other peers)
+              DELETE FROM main.item_metadata
+              WHERE item_path NOT IN (SELECT item_path FROM snap.item_metadata)
+                AND job_path IN (SELECT DISTINCT job_path FROM snap.item_metadata);"),
             ("column_presets",
              "DELETE FROM main.column_presets;
               INSERT OR REPLACE INTO main.column_presets (id, preset_name, columns_json, created_time, modified_time)

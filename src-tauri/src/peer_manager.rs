@@ -125,9 +125,11 @@ impl PeerManager {
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create node dir: {}", e))?;
 
+        let resolved_ip = get_local_ip_for_farm(&self.farm_path);
+
         let endpoint = PeerEndpoint {
             node_id: self.node_id.clone(),
-            ip: get_local_ip(),
+            ip: resolved_ip,
             port: self.port,
             timestamp_ms: crate::utils::current_time_ms(),
             tags: self.tags.clone(),
@@ -135,7 +137,7 @@ impl PeerManager {
 
         let json = serde_json::to_string_pretty(&endpoint)
             .map_err(|e| format!("Failed to serialize endpoint: {}", e))?;
-        std::fs::write(dir.join("endpoint.json"), json)
+        std::fs::write(dir.join("endpoint.json"), &json)
             .map_err(|e| format!("Failed to write endpoint: {}", e))
     }
 
@@ -448,12 +450,78 @@ impl PeerManager {
     }
 }
 
-/// Get local IP address using the UDP socket trick:
-/// Connect a UDP socket to 8.8.8.8:80 and read the local address.
+/// Get local IP address using the UDP socket trick.
+/// Falls back to 8.8.8.8 (internet-facing interface).
 pub fn get_local_ip() -> String {
+    get_local_ip_for_target("8.8.8.8")
+}
+
+/// Get the local IP that can reach the farm share.
+/// Resolves the farm_path to its NAS mount IP, then uses the UDP trick
+/// to find which local interface routes to it. Critical for roaming Macs
+/// that have multiple network interfaces.
+pub fn get_local_ip_for_farm(farm_path: &str) -> String {
+    if let Some(nas_ip) = resolve_mount_host(farm_path) {
+        let ip = get_local_ip_for_target(&nas_ip);
+        if ip != "127.0.0.1" {
+            return ip;
+        }
+        log::warn!("Farm host {} resolved but local IP is loopback, using fallback", nas_ip);
+    }
+    get_local_ip()
+}
+
+/// Try to extract the NAS host IP from a mount point by parsing `mount` output.
+/// Given a farm_path like "/opt/ufb/mounts/gfxnas-sync", resolves symlinks to
+/// the real mount point (e.g. "/Volumes/ufb"), then finds the host in `mount`.
+fn resolve_mount_host(farm_path: &str) -> Option<String> {
+    // Resolve symlinks to get the real mount point
+    let real_path = std::fs::canonicalize(farm_path).ok()?;
+    let real_str = real_path.to_string_lossy();
+
+    // Parse mount output to find the host for this mount point
+    let output = std::process::Command::new("mount")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mount_output = String::from_utf8_lossy(&output.stdout);
+    for line in mount_output.lines() {
+        // Format: //user@host/share on /mount/point (type, options)
+        if let Some(on_pos) = line.find(" on ") {
+            let mount_point = line[on_pos + 4..].split(' ').next().unwrap_or("");
+            // Match: farm path equals or is under this mount point.
+            // Skip trivial mounts like "/" that match everything.
+            if mount_point.len() > 1 && real_str.starts_with(mount_point) {
+                let source = &line[..on_pos];
+                // Extract host from //user@host/share or //host/share
+                let stripped = source.trim_start_matches('/');
+                if let Some(at_pos) = stripped.find('@') {
+                    let after_at = &stripped[at_pos + 1..];
+                    let host = after_at.split('/').next().unwrap_or("");
+                    if !host.is_empty() {
+                        return Some(host.to_string());
+                    }
+                } else {
+                    let host = stripped.split('/').next().unwrap_or("");
+                    if !host.is_empty() {
+                        return Some(host.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Get local IP by routing toward a specific target IP.
+pub fn get_local_ip_for_target(target: &str) -> String {
+    let target_addr = format!("{}:80", target);
     match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(sock) => {
-            if sock.connect("8.8.8.8:80").is_ok() {
+            if sock.connect(&target_addr).is_ok() {
                 if let Ok(addr) = sock.local_addr() {
                     return addr.ip().to_string();
                 }

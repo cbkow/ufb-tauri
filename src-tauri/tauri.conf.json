@@ -49,12 +49,22 @@
     },
     "resources": [
       "icons/32x32.png",
+      "icons/forTray/*",
       "assets/scripts/*",
       "assets/shell/shell.nss",
       "assets/shell/import/*",
       "assets/shell/regEntry/*",
-      "assets/projectTemplate/**/*"
-    ]
+      "assets/projectTemplate/**/*",
+      "external/ffmpeg-macos/bin/ffmpeg",
+      "external/ffmpeg-macos/bin/ffprobe",
+      "external/ffmpeg-macos/lib/libpdfium.dylib",
+      "external/exiftool-macos/exiftool",
+      "external/exiftool-macos/lib/**/*"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "frameworks": []
+    }
   },
   "plugins": {
     "deep-link": {

@@ -698,6 +698,8 @@ fn find_pdfium_bindings() -> Result<Box<dyn pdfium_render::prelude::PdfiumLibrar
                 exe_dir.join("libpdfium.dylib"),
                 exe_dir.join("libpdfium.so"),
                 exe_dir.join("pdfium.dll"),
+                // macOS .app bundle: Contents/Resources/external/ffmpeg-macos/lib/
+                exe_dir.join("../Resources/external/ffmpeg-macos/lib/libpdfium.dylib"),
                 // macOS .app bundle: Contents/Frameworks/
                 exe_dir.join("../Frameworks/libpdfium.dylib"),
                 // Dev build: external/ffmpeg-macos/lib/ or external/ffmpeg/bin/

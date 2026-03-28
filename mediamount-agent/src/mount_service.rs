@@ -130,6 +130,11 @@ impl MountService {
                 self.send_to_mount(&msg.mount_id, MountEvent::Restart, &msg.command_id)
                     .await;
             }
+            UfbToAgent::Quit => {
+                log::info!("Quit command received via IPC, shutting down...");
+                self.shutdown().await;
+                std::process::exit(0);
+            }
         }
     }
 

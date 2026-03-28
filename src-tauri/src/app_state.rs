@@ -115,18 +115,24 @@ impl AppState {
             return bundled;
         }
 
-        // 2. macOS: check app bundle Resources/ and Frameworks/ directories
+        // 2. macOS: check app bundle Resources/ directories
         #[cfg(target_os = "macos")]
         {
-            // Production .app bundle: exe is in Contents/MacOS/, resources in Contents/Resources/
             if let Some(contents_dir) = exe_dir.parent() {
+                // Production .app bundle: Resources/external/ffmpeg-macos/bin/
+                let bundled_ffmpeg = contents_dir.join("Resources/external/ffmpeg-macos/bin").join(&bin_name);
+                if bundled_ffmpeg.exists() {
+                    return bundled_ffmpeg;
+                }
+                // Production: Resources/external/exiftool-macos/
+                let bundled_exiftool = contents_dir.join("Resources/external/exiftool-macos").join(&bin_name);
+                if bundled_exiftool.exists() {
+                    return bundled_exiftool;
+                }
+                // Direct in Resources/
                 let resources = contents_dir.join("Resources").join(&bin_name);
                 if resources.exists() {
                     return resources;
-                }
-                let frameworks = contents_dir.join("Frameworks").join(&bin_name);
-                if frameworks.exists() {
-                    return frameworks;
                 }
             }
             // Dev build: check external/ffmpeg-macos/bin/ relative to manifest

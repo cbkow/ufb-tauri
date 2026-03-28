@@ -33,6 +33,16 @@ planning/
 # Claude Code local settings
 .claude/settings.local.json
 
+# Build/signing scripts (contain signing identity references)
+scripts/
+
+# macOS Quick Actions (local install)
+macos-quickactions/
+
+# Swift tray app build artifacts
+mediamount-tray/MediaMountTray
+mediamount-tray/MediaMountTray.app/
+
 # OS files
 .DS_Store
 Thumbs.db
