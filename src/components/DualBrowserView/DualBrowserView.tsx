@@ -69,8 +69,7 @@ export function DualBrowserView(props: DualBrowserViewProps) {
     getExternalDropHandler: (id) => {
       if (id === browser1.id) return externalDrop1;
       if (id === browser2.id) return externalDrop2;
-      // Fallback for empty id
-      return externalDrop1;
+      return undefined;
     },
     enableCrossBrowserDrag: true,
   });

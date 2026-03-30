@@ -94,9 +94,18 @@ function initGlobalDropListener() {
       document.querySelectorAll(".file-browser-content.drop-zone-active, .item-list-scroll.drop-zone-active")
         .forEach((el) => el.classList.remove("drop-zone-active"));
 
-      const el = document.elementFromPoint(logicalX, logicalY);
-      const browserEl = el?.closest(".file-browser");
-      const browserId = browserEl?.getAttribute("data-browser-id");
+      // Use bounding rect hit-testing (same as hover) — elementFromPoint is
+      // unreliable across platforms due to coordinate system differences.
+      let browserId: string | null = null;
+      const browsers = document.querySelectorAll<HTMLElement>(".file-browser");
+      for (const browser of browsers) {
+        const rect = browser.getBoundingClientRect();
+        if (logicalX >= rect.left && logicalX <= rect.right &&
+            logicalY >= rect.top && logicalY <= rect.bottom) {
+          browserId = browser.getAttribute("data-browser-id");
+          break;
+        }
+      }
 
       if (browserId) {
         // Find the config that has this browser registered
@@ -109,8 +118,16 @@ function initGlobalDropListener() {
         }
       }
       // Check if dropped on an ItemListPanel with data-drop-path
-      const panelEl = el?.closest(".item-list-panel[data-drop-path]");
-      const dropPath = panelEl?.getAttribute("data-drop-path");
+      let dropPath: string | null = null;
+      const panels = document.querySelectorAll<HTMLElement>(".item-list-panel[data-drop-path]");
+      for (const panel of panels) {
+        const rect = panel.getBoundingClientRect();
+        if (logicalX >= rect.left && logicalX <= rect.right &&
+            logicalY >= rect.top && logicalY <= rect.bottom) {
+          dropPath = panel.getAttribute("data-drop-path");
+          break;
+        }
+      }
       if (dropPath) {
         for (const entry of handlerRegistry.values()) {
           if (entry.config.onDropToPath) {

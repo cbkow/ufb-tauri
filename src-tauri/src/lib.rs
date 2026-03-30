@@ -83,7 +83,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .setup(move |app| {
-            // Deep-link listener for URIs arriving while app is running
+            // Deep-link listener for URIs arriving while app is running (or during cold start on macOS,
+            // where the OS delivers the URL via Apple Events, not CLI args).
             let handle_dl = app.handle().clone();
             app.deep_link().on_open_url(move |event| {
                 if let Some(url) = event.urls().first() {
@@ -91,6 +92,11 @@ pub fn run() {
                     if uri.starts_with("union://") {
                         handle_union_uri(&uri);
                     } else if uri.starts_with("ufb://") {
+                        // Store in pending_deep_link so the frontend can fetch it on mount
+                        // (covers macOS cold start where webview isn't ready yet)
+                        let state: tauri::State<'_, AppState> = handle_dl.state();
+                        *state.pending_deep_link.lock().unwrap() = Some(uri.clone());
+                        // Also emit for the case where the app is already running
                         let _ = handle_dl.emit("deep-link-uri", uri);
                     }
                 }

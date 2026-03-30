@@ -1161,8 +1161,12 @@ fn find_bundled_template_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
     let candidates = [
+        // Windows / dev: next to exe
         exe_dir.join("assets/projectTemplate"),
+        // Dev build: one level up
         exe_dir.join("../assets/projectTemplate"),
+        // macOS .app bundle: Contents/Resources/
+        exe_dir.join("../Resources/assets/projectTemplate"),
     ];
     candidates.into_iter().find(|p| p.is_dir())
 }
@@ -1411,8 +1415,12 @@ pub async fn create_job_from_template(
     let exe_dir = exe.parent().ok_or("Failed to get exe directory")?;
 
     let candidates = [
+        // Windows / dev: next to exe
         exe_dir.join("assets/projectTemplate"),
+        // Dev build: one level up
         exe_dir.join("../assets/projectTemplate"),
+        // macOS .app bundle: Contents/Resources/
+        exe_dir.join("../Resources/assets/projectTemplate"),
     ];
     let template_dir = candidates
         .iter()

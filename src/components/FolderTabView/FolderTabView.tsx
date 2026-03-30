@@ -49,7 +49,7 @@ export function FolderTabView(props: FolderTabViewProps) {
     getExternalDropHandler: (id) => {
       if (id === mainBrowser.id) return externalDropMain;
       if (id === rendersBrowser.id) return externalDropRenders;
-      return externalDropMain;
+      return undefined;
     },
     enableCrossBrowserDrag: false,
     onDropToPath: (paths, destPath) => {
