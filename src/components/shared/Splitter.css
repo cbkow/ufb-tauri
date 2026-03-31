@@ -31,40 +31,41 @@
   min-height: 0;
 }
 
-/* The grabbable divider */
+/* The grabbable divider — reads as a gap between rounded panels */
 .splitter-handle {
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg-secondary);
+  background: var(--bg-primary);
   position: relative;
   z-index: 2;
 }
 
 .splitter-handle-h {
-  width: 5px;
+  width: var(--panel-gap, 5px);
   cursor: col-resize;
 }
 
 .splitter-handle-v {
-  height: 5px;
+  height: var(--panel-gap, 5px);
   cursor: row-resize;
 }
 
 .splitter-handle-line {
-  background: var(--border-color);
+  background: rgba(255, 255, 255, 0.06);
   border-radius: 1px;
+  transition: background 0.1s, width 0.1s, height 0.1s;
 }
 
 .splitter-handle-h .splitter-handle-line {
   width: 1px;
-  height: 32px;
+  height: 24px;
 }
 
 .splitter-handle-v .splitter-handle-line {
   height: 1px;
-  width: 32px;
+  width: 24px;
 }
 
 .splitter-handle:hover .splitter-handle-line,
@@ -74,17 +75,17 @@
 
 .splitter-handle:hover,
 .splitter-handle-active {
-  background: var(--bg-tertiary);
+  background: var(--bg-primary);
 }
 
 .splitter-handle-h:hover .splitter-handle-line,
 .splitter-handle-h.splitter-handle-active .splitter-handle-line {
   width: 2px;
-  height: 48px;
+  height: 40px;
 }
 
 .splitter-handle-v:hover .splitter-handle-line,
 .splitter-handle-v.splitter-handle-active .splitter-handle-line {
   height: 2px;
-  width: 48px;
+  width: 40px;
 }

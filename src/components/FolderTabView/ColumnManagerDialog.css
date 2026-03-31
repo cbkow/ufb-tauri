@@ -2,6 +2,8 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   z-index: 2000;
   display: flex;
   align-items: center;
@@ -9,14 +11,16 @@
 }
 
 .col-mgr-dialog {
-  background: var(--bg-primary);
+  background: var(--bg-popup);
   border: 1px solid var(--border-color);
-  border-radius: var(--radius-lg, 8px);
+  border-radius: var(--radius-lg);
   width: 420px;
   max-height: 80vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
 }
 
 .col-mgr-header {

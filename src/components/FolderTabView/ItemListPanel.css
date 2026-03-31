@@ -4,6 +4,10 @@
   height: 100%;
   overflow: hidden;
   outline: none;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .item-list-header {
@@ -352,11 +356,13 @@
   position: fixed;
   z-index: 1000;
   min-width: 180px;
-  background: var(--bg-primary);
+  background: var(--bg-popup);
   border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   padding: var(--spacing-xs) 0;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
 }
 
 .item-list-panel .ctx-menu-header {

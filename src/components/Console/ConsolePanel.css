@@ -3,6 +3,10 @@
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .console-header {
@@ -12,7 +16,9 @@
   padding: var(--spacing-sm) var(--spacing-md);
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
-  font-weight: 600;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
 .console-controls {

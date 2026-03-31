@@ -12,12 +12,15 @@
   flex-direction: column;
   height: 100%;
   width: 100%;
+  padding: var(--panel-gap);
+  gap: var(--panel-gap);
 }
 
 .app-layout {
   flex: 1;
   min-height: 0;
   width: 100%;
+  gap: var(--panel-gap);
 }
 
 .main-content {
@@ -26,19 +29,24 @@
   height: 100%;
   width: 100%;
   overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-color);
 }
 
 /* ── Tab bar ── */
 .tab-bar {
   display: flex;
   align-items: flex-end;
-  background: var(--bg-secondary);
+  background: var(--bg-menubar);
   height: 36px;
   min-height: 36px;
   flex-shrink: 0;
   user-select: none;
   padding: 0 4px;
   gap: 2px;
+  border-bottom: 1px solid var(--border-color);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 
 .tab-bar-tabs {
@@ -56,31 +64,31 @@
 .tab-item {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
+  gap: 5px;
+  padding: 5px 12px;
   cursor: pointer;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 11px;
   white-space: nowrap;
   min-width: 0;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  background: var(--bg-secondary);
+  background: transparent;
   transition: background 0.1s;
 }
 
 .tab-item:hover {
-  background: var(--bg-tertiary);
+  background: var(--bg-button-hover);
   color: var(--text-primary);
 }
 
 .tab-item.active {
-  background: var(--bg-tertiary);
+  background: var(--bg-secondary);
   color: var(--text-primary);
 }
 
 .tab-icon {
-  font-size: 16px;
-  color: var(--text-secondary);
+  font-size: 14px;
+  color: var(--text-disabled);
 }
 
 .tab-item.active .tab-icon {
@@ -132,6 +140,7 @@
   flex: 1;
   overflow: hidden;
   position: relative;
+  padding: var(--panel-gap);
 }
 
 .tab-panel {
