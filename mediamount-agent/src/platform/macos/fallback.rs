@@ -1,6 +1,14 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+/// Global mutex to serialize macOS mount operations.
+/// Prevents concurrent snapshot-open-poll cycles from misidentifying each other's volumes.
+static MOUNT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn mount_mutex() -> &'static Mutex<()> {
+    MOUNT_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Mount an SMB share on macOS using `open smb://`.
 ///
@@ -17,6 +25,9 @@ pub fn macos_smb_mount(
     username: &str,
     _password: &str,
 ) -> Result<String, String> {
+    // Serialize mount operations so concurrent mounts don't misidentify each other's volumes
+    let _guard = mount_mutex().lock().unwrap();
+
     // Extract expected share name for matching
     let expected_name = nas_share_path
         .trim_end_matches('\\')
@@ -26,7 +37,7 @@ pub fn macos_smb_mount(
         .to_string();
 
     // Check if already mounted (e.g. from a previous session or manual Finder mount)
-    let already_mounted = find_existing_volume(&expected_name);
+    let already_mounted = find_existing_volume(&expected_name, nas_share_path);
     if let Some(existing) = already_mounted {
         log::info!("macOS: share already mounted at {}", existing);
         return Ok(existing);
@@ -105,19 +116,63 @@ fn unc_to_smb_url(unc_path: &str, username: &str) -> String {
     }
 }
 
-/// Check if a volume matching the expected name is already mounted.
-fn find_existing_volume(expected_name: &str) -> Option<String> {
-    if let Ok(entries) = std::fs::read_dir("/Volumes") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.eq_ignore_ascii_case(expected_name) {
+/// Check if a volume matching the expected name is already mounted from the correct server.
+fn find_existing_volume(expected_name: &str, nas_share_path: &str) -> Option<String> {
+    let candidates: Vec<String> = if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                if name.eq_ignore_ascii_case(expected_name)
+                    || strip_macos_dedup_suffix(&name)
+                        .map(|base| base.eq_ignore_ascii_case(expected_name))
+                        .unwrap_or(false)
+                {
                     let path = format!("/Volumes/{}", name);
                     // Verify it's actually a mount point (not just an empty dir)
                     if std::fs::read_dir(&path).map(|mut d| d.next().is_some()).unwrap_or(false) {
                         return Some(path);
                     }
                 }
+                None
+            })
+            .collect()
+    } else {
+        return None;
+    };
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Verify the candidate is actually mounted from the expected server/share
+    let smb_fragment = nas_share_path
+        .trim_start_matches('\\')
+        .replace('\\', "/")
+        .to_lowercase();
+
+    let mount_output = Command::new("mount").output().ok()?;
+    let mount_text = String::from_utf8_lossy(&mount_output.stdout);
+
+    for candidate in &candidates {
+        for line in mount_text.lines() {
+            if line.contains(candidate) && line.to_lowercase().contains(&smb_fragment) {
+                return Some(candidate.clone());
             }
+        }
+    }
+
+    None
+}
+
+/// Strip a macOS dedup suffix like "-1", "-2" from a volume name.
+/// Returns the base name if a suffix was stripped, or None if no suffix present.
+/// Correctly handles names that already contain hyphens (e.g. "my-share-1" → "my-share").
+fn strip_macos_dedup_suffix(name: &str) -> Option<&str> {
+    if let Some(pos) = name.rfind('-') {
+        let after = &name[pos + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return Some(&name[..pos]);
         }
     }
     None
@@ -163,21 +218,15 @@ fn poll_for_new_volume(before: &HashSet<String>, nas_share_path: &str) -> Result
                     return Ok(format!("/Volumes/{}", entry));
                 }
             }
-            // Accept name with -1, -2 suffix
+            // Accept name with macOS dedup suffix (-1, -2, etc.)
             for entry in &new_entries {
-                let base = entry.split('-').next().unwrap_or(entry);
-                if base.eq_ignore_ascii_case(&expected_name) {
-                    return Ok(format!("/Volumes/{}", entry));
+                if let Some(base) = strip_macos_dedup_suffix(entry) {
+                    if base.eq_ignore_ascii_case(&expected_name) {
+                        return Ok(format!("/Volumes/{}", entry));
+                    }
                 }
             }
-            // If we can't match by name, take any new volume that appeared
-            if let Some(entry) = new_entries.first() {
-                log::warn!(
-                    "macOS: new volume '{}' doesn't match expected '{}', using anyway",
-                    entry, expected_name
-                );
-                return Ok(format!("/Volumes/{}", entry));
-            }
+            // No match — keep polling. Do NOT grab an arbitrary volume.
         }
 
         if attempt % 10 == 9 {
@@ -217,5 +266,34 @@ mod tests {
             unc_to_smb_url(r"\\server.local\share\subfolder", "admin"),
             "smb://admin@server.local/share/subfolder"
         );
+    }
+
+    #[test]
+    fn test_strip_macos_dedup_suffix_simple() {
+        assert_eq!(strip_macos_dedup_suffix("media-1"), Some("media"));
+        assert_eq!(strip_macos_dedup_suffix("media-2"), Some("media"));
+        assert_eq!(strip_macos_dedup_suffix("media-12"), Some("media"));
+    }
+
+    #[test]
+    fn test_strip_macos_dedup_suffix_hyphenated_name() {
+        assert_eq!(strip_macos_dedup_suffix("my-share-1"), Some("my-share"));
+        assert_eq!(strip_macos_dedup_suffix("my-share-2"), Some("my-share"));
+    }
+
+    #[test]
+    fn test_strip_macos_dedup_suffix_no_suffix() {
+        assert_eq!(strip_macos_dedup_suffix("media"), None);
+        assert_eq!(strip_macos_dedup_suffix("my-share"), None);
+        assert_eq!(strip_macos_dedup_suffix("archive-2023data"), None);
+    }
+
+    #[test]
+    fn test_strip_macos_dedup_suffix_edge_cases() {
+        // Name ending in hyphen-digits that is part of the real name
+        // The function strips it, but callers only use the result when it matches expected_name
+        assert_eq!(strip_macos_dedup_suffix("archive-2023"), Some("archive"));
+        // Trailing hyphen with no digits
+        assert_eq!(strip_macos_dedup_suffix("media-"), None);
     }
 }

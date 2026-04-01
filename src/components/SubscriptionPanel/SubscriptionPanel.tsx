@@ -293,19 +293,20 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 const ms = () => mountStore.states[cfg.id];
                 const stateClass = () => {
                   const s = ms()?.state;
-                  if (!s || s === "mounted") return "mount-healthy";
+                  if (s === "mounted") return "mount-healthy";
                   if (s === "mounting" || s === "initializing") return "mount-starting";
                   if (s === "error") return "mount-error";
-                  if (s === "stopped") return "mount-warn";
+                  if (!s || s === "stopped") return "mount-warn";
                   return "mount-error";
                 };
                 const stateLabel = () => {
                   const s = ms()?.state;
-                  if (!s || s === "mounted") return "Mounted";
+                  if (s === "mounted") return "Mounted";
                   if (s === "mounting" || s === "initializing") return "Starting";
                   if (s === "error") return "Error";
                   if (s === "stopped") return "Stopped";
-                  return s ?? "Unknown";
+                  if (!s) return "Unknown";
+                  return s;
                 };
                 return (
                   <div

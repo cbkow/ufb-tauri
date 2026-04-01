@@ -109,7 +109,7 @@ async function loadStates() {
     // Load configs for path matching
     const cfg = await mountGetConfig();
     console.log("[mountStore] configs:", cfg.mounts?.length, cfg.mounts);
-    setState("configs", cfg.mounts ?? []);
+    setState("configs", (cfg.mounts ?? []).filter((m) => m.enabled));
   } catch (e) {
     console.error("Failed to load mount states:", e);
   }
