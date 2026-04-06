@@ -24,18 +24,30 @@ struct MediaMountTrayApp: App {
                         .padding(.vertical, 4)
                 } else {
                     ForEach(agent.mounts) { mount in
-                        HStack {
-                            Circle()
-                                .fill(mount.state == "mounted" ? Color.green : Color.red)
-                                .frame(width: 8, height: 8)
-                            Text(mount.displayName)
-                            Spacer()
-                            Text(mount.stateDetail)
-                                .foregroundColor(.secondary)
-                                .font(.caption)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(mount.state == "mounted" ? Color.green : Color.red)
+                                    .frame(width: 8, height: 8)
+                                Text(mount.displayName)
+                                    .font(.system(size: 12))
+                                Text("— \(mount.stateDetail)")
+                                    .foregroundColor(.secondary)
+                                    .font(.system(size: 11))
+                            }
+                            HStack(spacing: 6) {
+                                if mount.state == "mounted" || mount.state == "mounting" || mount.state == "initializing" {
+                                    Button("Disconnect") { agent.stopMount(mount.id) }
+                                } else {
+                                    Button("Connect") { agent.startMount(mount.id) }
+                                }
+                                Button("Restart") { agent.restartMount(mount.id) }
+                            }
+                            .font(.caption)
+                            .padding(.leading, 14)
                         }
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 3)
+                        .padding(.vertical, 4)
                     }
                 }
 
@@ -262,6 +274,18 @@ class AgentConnection: ObservableObject {
         default:
             break
         }
+    }
+
+    func startMount(_ mountId: String) {
+        sendMessage(["type": "start_mount", "mountId": mountId, "commandId": ""])
+    }
+
+    func stopMount(_ mountId: String) {
+        sendMessage(["type": "stop_mount", "mountId": mountId, "commandId": ""])
+    }
+
+    func restartMount(_ mountId: String) {
+        sendMessage(["type": "restart_mount", "mountId": mountId, "commandId": ""])
     }
 
     func sendQuit() {

@@ -257,6 +257,12 @@ export const mountIsConnected = () =>
 export const mountRestart = (mountId: string) =>
   invoke<void>("mount_restart", { mountId });
 
+export const mountStart = (mountId: string) =>
+  invoke<void>("mount_start", { mountId });
+
+export const mountStop = (mountId: string) =>
+  invoke<void>("mount_stop", { mountId });
+
 export const mountSaveConfig = (config: import("./types").MountsConfig) =>
   invoke<void>("mount_save_config", { config });
 

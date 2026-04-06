@@ -54,18 +54,21 @@ impl Orchestrator {
 
         loop {
             tokio::select! {
-                Some(event) = self.event_rx.recv() => {
-                    let is_stop = matches!(event, MountEvent::Stop);
-                    self.handle_event(event).await;
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            self.handle_event(event).await;
 
-                    // After restart, if we're in Mounting state and no error, transition to Mounted
-                    if matches!(self.state, MountState::Mounting) {
-                        self.handle_event(MountEvent::RequestStateUpdate).await;
-                    }
-
-                    if is_stop {
-                        log::info!("[{}] Stop processed, orchestrator exiting", self.mount_id);
-                        break;
+                            // After restart or start, if we're in Mounting state and no error, transition to Mounted
+                            if matches!(self.state, MountState::Mounting) {
+                                self.handle_event(MountEvent::RequestStateUpdate).await;
+                            }
+                        }
+                        None => {
+                            // Channel closed — mount removed from config, exit
+                            log::info!("[{}] Event channel closed, orchestrator exiting", self.mount_id);
+                            break;
+                        }
                     }
                 }
             }

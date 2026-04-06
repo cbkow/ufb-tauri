@@ -102,6 +102,7 @@ mod windows_tray {
 
     // Menu item IDs
     const IDM_RESTART_BASE: u32 = 1000; // 1000 + mount_index for per-mount restart
+    const IDM_TOGGLE_BASE: u32 = 1100; // 1100 + mount_index for per-mount connect/disconnect
     const IDM_OPEN_UFB: u32 = 2001;
     const IDM_OPEN_LOG: u32 = 2002;
     const IDM_TOGGLE_AUTOSTART: u32 = 2003;
@@ -333,6 +334,15 @@ mod windows_tray {
                     let icon = if ms.state == "mounted" { "\u{25CF}" } else { "\u{2715}" };
                     let label = format!("{} {} {}", ms.mount_id, icon, ms.state_detail);
                     append_menu_item(menu, 0, &label, MF_DISABLED | MF_GRAYED);
+                    // Connect/Disconnect toggle for this mount
+                    let toggle_id = IDM_TOGGLE_BASE + i as u32;
+                    let is_active = ms.state == "mounted" || ms.state == "mounting" || ms.state == "initializing";
+                    let toggle_label = if is_active {
+                        format!("  Disconnect {}", ms.mount_id)
+                    } else {
+                        format!("  Connect {}", ms.mount_id)
+                    };
+                    append_menu_item(menu, toggle_id, &toggle_label, MF_STRING);
                     // Restart button for this mount (base ID + index)
                     let restart_id = IDM_RESTART_BASE + i as u32;
                     let restart_label = format!("  Restart {}", ms.mount_id);
@@ -449,6 +459,22 @@ mod windows_tray {
                 None
             }
             IDM_QUIT => Some(TrayCommand::Quit),
+            id if id >= IDM_TOGGLE_BASE && id < IDM_TOGGLE_BASE + 100 => {
+                let index = (id - IDM_TOGGLE_BASE) as usize;
+                let mut mount_ids: Vec<&String> = state.mounts.keys().collect();
+                mount_ids.sort();
+                mount_ids.get(index).and_then(|mid| {
+                    state.mounts.get(*mid).map(|ms| {
+                        let is_active = ms.state == "mounted" || ms.state == "mounting" || ms.state == "initializing";
+                        let event = if is_active {
+                            crate::state::MountEvent::Stop
+                        } else {
+                            crate::state::MountEvent::Start
+                        };
+                        TrayCommand::MountEvent((*mid).clone(), event)
+                    })
+                })
+            }
             id if id >= IDM_RESTART_BASE && id < IDM_RESTART_BASE + 100 => {
                 let index = (id - IDM_RESTART_BASE) as usize;
                 let mut mount_ids: Vec<&String> = state.mounts.keys().collect();
@@ -535,8 +561,8 @@ mod linux_tray {
         let mut mounts: std::collections::HashMap<String, crate::messages::MountStateUpdateMsg> =
             std::collections::HashMap::new();
 
-        // Per-mount menu items keyed by mount_id: (status_item, restart_item)
-        let mut mount_items: Vec<(String, MenuItem, MenuItem)> = Vec::new();
+        // Per-mount menu items keyed by mount_id: (status_item, toggle_item, restart_item)
+        let mut mount_items: Vec<(String, MenuItem, MenuItem, MenuItem)> = Vec::new();
         // Position in the menu where mount items start (after title + sep_top)
         const MOUNT_INSERT_BASE: usize = 2;
 
@@ -581,22 +607,31 @@ mod linux_tray {
                     let ms = &mounts[mount_id];
                     let dot = if ms.state == "mounted" { "\u{25CF}" } else { "\u{2715}" };
                     let label = format!("{} {} {}", ms.mount_id, dot, ms.state_detail);
+                    let is_active = ms.state == "mounted" || ms.state == "mounting" || ms.state == "initializing";
+                    let toggle_label = if is_active {
+                        format!("  Disconnect {}", mount_id)
+                    } else {
+                        format!("  Connect {}", mount_id)
+                    };
 
-                    if let Some(entry) = mount_items.iter().find(|(id, _, _)| id == mount_id) {
+                    if let Some(entry) = mount_items.iter().find(|(id, _, _, _)| id == mount_id) {
                         // Update existing
                         entry.1.set_text(&label);
+                        entry.2.set_text(&toggle_label);
                     } else {
                         // Create new items and insert into menu
                         let status_item = MenuItem::new(&label, false, None);
+                        let toggle_item = MenuItem::new(&toggle_label, true, None);
                         let restart_item = MenuItem::new(&format!("  Restart {}", mount_id), true, None);
 
-                        // Insert before the mounts separator. Each mount adds 2 items,
+                        // Insert before the mounts separator. Each mount adds 3 items,
                         // so the position grows as we add more.
-                        let pos = MOUNT_INSERT_BASE + mount_items.len() * 2;
+                        let pos = MOUNT_INSERT_BASE + mount_items.len() * 3;
                         let _ = menu_handle.insert(&status_item as &dyn IsMenuItem, pos);
-                        let _ = menu_handle.insert(&restart_item as &dyn IsMenuItem, pos + 1);
+                        let _ = menu_handle.insert(&toggle_item as &dyn IsMenuItem, pos + 1);
+                        let _ = menu_handle.insert(&restart_item as &dyn IsMenuItem, pos + 2);
 
-                        mount_items.push((mount_id.clone(), status_item, restart_item));
+                        mount_items.push((mount_id.clone(), status_item, toggle_item, restart_item));
                     }
                 }
             }
@@ -618,11 +653,25 @@ mod linux_tray {
                     None
                 } else if event.id == item_quit.id() {
                     Some(TrayCommand::Quit)
+                } else if let Some(cmd) = mount_items.iter()
+                    .find(|(_, _, toggle, _)| event.id == toggle.id())
+                    .map(|(mount_id, _, _, _)| {
+                        let ms = &mounts[mount_id];
+                        let is_active = ms.state == "mounted" || ms.state == "mounting" || ms.state == "initializing";
+                        let mount_event = if is_active {
+                            crate::state::MountEvent::Stop
+                        } else {
+                            crate::state::MountEvent::Start
+                        };
+                        TrayCommand::MountEvent(mount_id.clone(), mount_event)
+                    })
+                {
+                    Some(cmd)
                 } else {
                     // Check per-mount restart items
                     mount_items.iter()
-                        .find(|(_, _, restart)| event.id == restart.id())
-                        .map(|(mount_id, _, _)| {
+                        .find(|(_, _, _, restart)| event.id == restart.id())
+                        .map(|(mount_id, _, _, _)| {
                             TrayCommand::MountEvent(mount_id.clone(), crate::state::MountEvent::Restart)
                         })
                 };

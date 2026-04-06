@@ -5,6 +5,8 @@ import {
   mountGetStates,
   mountIsConnected,
   mountRestart,
+  mountStart as tauriMountStart,
+  mountStop as tauriMountStop,
   mountSaveConfig,
   mountGetConfig,
   mountLaunchAgent,
@@ -123,6 +125,32 @@ async function restart(mountId: string) {
   }
 }
 
+async function start(mountId: string) {
+  try {
+    await tauriMountStart(mountId);
+  } catch (e) {
+    console.error("Failed to start mount:", e);
+  }
+}
+
+async function stop(mountId: string) {
+  try {
+    await tauriMountStop(mountId);
+  } catch (e) {
+    console.error("Failed to stop mount:", e);
+  }
+}
+
+/** Toggle a mount between connected and disconnected. */
+function toggleMount(mountId: string) {
+  const ms = state.states[mountId];
+  if (ms?.state === "mounted" || ms?.state === "mounting" || ms?.state === "initializing") {
+    stop(mountId);
+  } else {
+    start(mountId);
+  }
+}
+
 async function saveConfig(config: MountsConfig) {
   try {
     await mountSaveConfig(config);
@@ -182,6 +210,9 @@ export const mountStore = {
   loadStates,
   launchAgent,
   restart,
+  start,
+  stop,
+  toggleMount,
   saveConfig,
   loadConfig,
 };

@@ -20,7 +20,8 @@ pub fn get_socket_path() -> std::path::PathBuf {
     socket_path()
 }
 
-/// IPC server that listens for UFB connections on a Unix domain socket.
+/// IPC server that listens for connections on a Unix domain socket.
+/// Supports multiple concurrent clients (e.g. UFB + Swift tray app).
 pub struct IpcServer {
     pub command_rx: mpsc::Receiver<UfbToAgent>,
     response_tx: mpsc::Sender<AgentToUfb>,
@@ -33,25 +34,31 @@ impl IpcServer {
         let (resp_tx, mut resp_rx) = mpsc::channel::<AgentToUfb>(64);
         let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Shared handle for current client connection (write half)
-        let active_writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        // Shared list of connected client write streams
+        let writers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
 
-        // Response writer task
-        let writer_handle = active_writer.clone();
+        // Response writer task — broadcasts to all connected clients
+        let writer_handle = writers.clone();
         tokio::spawn(async move {
             while let Some(msg) = resp_rx.recv().await {
                 let mut lock = writer_handle.lock().await;
-                if let Some(ref mut stream) = *lock {
+                let mut failed = Vec::new();
+                for (i, stream) in lock.iter_mut().enumerate() {
                     if let Err(e) = super::send_message(stream, &msg) {
-                        log::warn!("Failed to send to UFB client: {}", e);
-                        *lock = None;
+                        log::debug!("Failed to send to client {}: {}", i, e);
+                        failed.push(i);
                     }
+                }
+                // Remove disconnected clients (reverse order to preserve indices)
+                for i in failed.into_iter().rev() {
+                    log::info!("Removing disconnected client {}", i);
+                    lock.remove(i);
                 }
             }
         });
 
         // Connection listener task
-        let listener_handle = active_writer;
+        let listener_handle = writers;
         tokio::spawn(async move {
             let sock_path = socket_path();
 
@@ -98,7 +105,7 @@ impl IpcServer {
                     }
                 };
 
-                log::info!("UFB client connected");
+                log::info!("IPC client connected");
 
                 // Clone stream for writing
                 let write_stream = match stream.try_clone() {
@@ -109,10 +116,10 @@ impl IpcServer {
                     }
                 };
 
-                // Store write half for response writer
+                // Add write half to client list
                 {
                     let mut lock = listener_handle.lock().await;
-                    *lock = Some(write_stream);
+                    lock.push(write_stream);
                 }
 
                 // Read commands in blocking thread
@@ -127,7 +134,7 @@ impl IpcServer {
                                 }
                             }
                             Err(_) => {
-                                log::info!("UFB client disconnected");
+                                log::info!("IPC client disconnected");
                                 break;
                             }
                         }

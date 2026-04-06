@@ -6192,7 +6192,7 @@ dependencies = [
 
 [[package]]
 name = "ufb-tauri"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "arboard",
  "axum",

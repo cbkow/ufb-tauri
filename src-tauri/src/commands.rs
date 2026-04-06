@@ -1618,6 +1618,32 @@ pub async fn mount_restart(state: State<'_, AppState>, mount_id: String) -> Resu
 }
 
 #[tauri::command]
+pub async fn mount_start(state: State<'_, AppState>, mount_id: String) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::StartMount(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
+pub async fn mount_stop(state: State<'_, AppState>, mount_id: String) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::StopMount(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: uuid::Uuid::new_v4().to_string(),
+            },
+        ))
+        .await
+}
+
+#[tauri::command]
 pub async fn mount_save_config(
     state: State<'_, AppState>,
     config: crate::mount_client::MountsConfig,

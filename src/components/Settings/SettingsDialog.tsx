@@ -938,40 +938,6 @@ function MountsSection(props: {
         </div>
       </Show>
 
-      {/* Live mount status */}
-      <Show when={Object.keys(mountStore.states).length > 0}>
-        <h3>Live Status</h3>
-        <For each={Object.values(mountStore.states) as MountStateUpdate[]}>
-          {(ms) => {
-            const cfg = () => props.mountConfig().mounts.find((m) => m.id === ms.mountId);
-            return (
-              <div class="mount-item">
-                <div class="mount-item-header">
-                  <input
-                    type="checkbox"
-                    class="mount-enable-toggle"
-                    checked={cfg()?.enabled ?? true}
-                    onChange={(e) => {
-                      const updated = props.mountConfig().mounts.map((m) =>
-                        m.id === ms.mountId ? { ...m, enabled: e.currentTarget.checked } : m
-                      );
-                      mountStore.saveConfig({ ...props.mountConfig(), mounts: updated });
-                    }}
-                    title={cfg()?.enabled ? "Disable this mount" : "Enable this mount"}
-                  />
-                  <span class={`mount-state-dot ${ms.state === "mounted" ? "healthy" : ms.state === "error" ? "error" : "neutral"}`} />
-                  <span class="mount-item-name">{ms.mountId}</span>
-                  <span class="mount-item-state">{ms.stateDetail}</span>
-                </div>
-                <div class="mount-controls">
-                  <button onClick={() => mountStore.restart(ms.mountId)}>Restart</button>
-                </div>
-              </div>
-            );
-          }}
-        </For>
-      </Show>
-
       {/* Mount configurations */}
       <h3>Configuration</h3>
       <Show when={!editingMount()}>
@@ -989,7 +955,7 @@ function MountsSection(props: {
                     );
                     mountStore.saveConfig({ ...props.mountConfig(), mounts: updated });
                   }}
-                  title={cfg.enabled ? "Disable this mount" : "Enable this mount"}
+                  title={cfg.enabled ? "Auto-connects on agent start" : "Does not auto-connect"}
                 />
                 <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
                 <span class="mount-config-detail">{cfg.nasSharePath} → {mountStore.getMountPath(cfg) || "(not set)"}</span>
@@ -1046,7 +1012,7 @@ function MountsSection(props: {
                   checked={m().enabled}
                   onChange={(e) => updateField("enabled", e.currentTarget.checked)}
                 />
-                <span>Enabled</span>
+                <span>Auto-connect on startup</span>
               </label>
             </div>
 

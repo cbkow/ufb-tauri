@@ -308,6 +308,10 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                   if (!s) return "Unknown";
                   return s;
                 };
+                const isActive = () => {
+                  const s = ms()?.state;
+                  return s === "mounted" || s === "mounting" || s === "initializing";
+                };
                 return (
                   <div
                     class="panel-item"
@@ -320,6 +324,13 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                     <span class="item-label truncate">{cfg.displayName}</span>
                     <Show when={cfg.isJobsFolder}><span class="item-tag">Jobs</span></Show>
                     <span class={`mount-state-label ${stateClass()}`}>{stateLabel()}</span>
+                    <span
+                      class="mount-toggle-btn"
+                      onClick={(e) => { e.stopPropagation(); mountStore.toggleMount(cfg.id); }}
+                      title={isActive() ? "Disconnect" : "Connect"}
+                    >
+                      <span class="icon">{isActive() ? "stop_circle" : "play_circle"}</span>
+                    </span>
                   </div>
                 );
               }}
@@ -478,6 +489,10 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
           const ms = () => mountStore.states[menu().mountId];
           const cfg = () => mountStore.configs.find((c) => c.id === menu().mountId);
           const mountPath = () => cfg() ? mountStore.getMountPath(cfg()!) : "";
+          const isActive = () => {
+            const s = ms()?.state;
+            return s === "mounted" || s === "mounting" || s === "initializing";
+          };
           return (
             <div
               class="ctx-menu"
@@ -489,12 +504,18 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 <div class="ctx-menu-item ctx-menu-disabled"><span class="icon">info</span> {ms()!.stateDetail}</div>
               </Show>
               <div class="ctx-menu-separator" />
+              <Show when={isActive()}>
+                <div class="ctx-menu-item" onClick={() => { mountStore.stop(menu().mountId); closeMountCtxMenu(); }}><span class="icon">stop_circle</span> Disconnect</div>
+              </Show>
+              <Show when={!isActive()}>
+                <div class="ctx-menu-item" onClick={() => { mountStore.start(menu().mountId); closeMountCtxMenu(); }}><span class="icon">play_circle</span> Connect</div>
+              </Show>
+              <div class="ctx-menu-item" onClick={mountCtxRestart}><span class="icon">refresh</span> Restart</div>
+              <div class="ctx-menu-separator" />
               <div class="ctx-menu-item" onClick={() => { navigate(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_back</span> Open in Left Browser</div>
               <div class="ctx-menu-item" onClick={() => { navigateRight(mountPath()); closeMountCtxMenu(); }}><span class="icon">arrow_forward</span> Open in Right Browser</div>
               <div class="ctx-menu-item" onClick={async () => { await revealInFileManager(mountPath()); closeMountCtxMenu(); }}><span class="icon">folder_open</span> Reveal in Explorer</div>
               <div class="ctx-menu-item" onClick={async () => { await showShellContextMenu(mountPath()); closeMountCtxMenu(); }}><span class="icon">more_horiz</span> More...</div>
-              <div class="ctx-menu-separator" />
-              <div class="ctx-menu-item" onClick={mountCtxRestart}><span class="icon">refresh</span> Restart</div>
             </div>
           );
         }}

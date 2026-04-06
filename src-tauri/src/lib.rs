@@ -235,6 +235,8 @@ pub fn run() {
             commands::mount_get_states,
             commands::mount_is_connected,
             commands::mount_restart,
+            commands::mount_start,
+            commands::mount_stop,
             commands::mount_save_config,
             commands::mount_get_config,
             commands::mount_launch_agent,
