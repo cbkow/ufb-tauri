@@ -47,6 +47,7 @@ mediamount-tray/MediaMountTray.app/
 .DS_Store
 Thumbs.db
 Desktop.ini
+docs/
 
 # Environment / secrets
 .env

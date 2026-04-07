@@ -487,9 +487,24 @@ mod windows_tray {
         };
 
         if let Some(cmd) = cmd {
+            let is_quit = matches!(cmd, TrayCommand::Quit);
             let tx = state.cmd_tx.clone();
             drop(lock);
-            let _ = tx.blocking_send(cmd);
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("Tray command channel full, dropping command");
+                    if is_quit {
+                        // Force exit — the main loop is unresponsive
+                        log::info!("Forcing exit: main loop not draining commands");
+                        std::process::exit(0);
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::info!("Tray command channel closed, exiting");
+                    std::process::exit(0);
+                }
+            }
         }
     }
 }
@@ -677,7 +692,21 @@ mod linux_tray {
                 };
 
                 if let Some(cmd) = cmd {
-                    let _ = cmd_tx.blocking_send(cmd);
+                    let is_quit = matches!(cmd, TrayCommand::Quit);
+                    match cmd_tx.try_send(cmd) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!("Tray command channel full, dropping command");
+                            if is_quit {
+                                log::info!("Forcing exit: main loop not draining commands");
+                                std::process::exit(0);
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            log::info!("Tray command channel closed, exiting");
+                            std::process::exit(0);
+                        }
+                    }
                 }
             }
 
@@ -848,7 +877,21 @@ mod macos_tray {
                 };
 
                 if let Some(cmd) = cmd {
-                    let _ = cmd_tx.blocking_send(cmd);
+                    let is_quit = matches!(cmd, TrayCommand::Quit);
+                    match cmd_tx.try_send(cmd) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!("Tray command channel full, dropping command");
+                            if is_quit {
+                                log::info!("Forcing exit: main loop not draining commands");
+                                std::process::exit(0);
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            log::info!("Tray command channel closed, exiting");
+                            std::process::exit(0);
+                        }
+                    }
                 }
             }
 
