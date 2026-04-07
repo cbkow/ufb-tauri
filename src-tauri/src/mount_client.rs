@@ -215,12 +215,16 @@ impl MountClient {
         self.state.lock().await.connected
     }
 
-    /// Quick synchronous check if the agent socket exists (not a full connection test).
+    /// Quick synchronous check if the agent is reachable.
     pub fn is_agent_running(&self) -> bool {
         #[cfg(windows)]
         {
-            // On Windows, check if the named pipe exists
-            std::path::Path::new(PIPE_NAME).exists()
+            // Named pipes don't appear in the filesystem, so Path::exists() won't work.
+            // Instead, try WaitNamedPipeW with a very short timeout.
+            use windows::core::HSTRING;
+            use windows::Win32::System::Pipes::WaitNamedPipeW;
+            let pipe_name = HSTRING::from(PIPE_NAME);
+            unsafe { WaitNamedPipeW(&pipe_name, 100) }.as_bool()
         }
         #[cfg(unix)]
         {
@@ -263,45 +267,76 @@ impl MountClient {
                     }
                     let _ = app_handle.emit("mount:connection", true);
 
-                    // Duplicate the handle so we have one for reading and one for writing.
-                    // The read half goes to a blocking thread; the write half stays here.
-                    let (read_pipe, mut write_pipe) = match duplicate_pipe(pipe) {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            log::error!("MountClient: failed to duplicate pipe handle: {}", e);
-                            continue;
-                        }
-                    };
+                    // Single blocking I/O thread handles both read and write,
+                    // because concurrent ReadFile/WriteFile on a synchronous
+                    // Windows named pipe handle deadlocks.
+                    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<AgentToUfb>(64);
+                    let (write_tx, write_rx) = std::sync::mpsc::channel::<UfbToAgent>();
 
-                    // Request current states
-                    let _ = send_msg(&mut write_pipe, &UfbToAgent::GetStates);
+                    // Send initial GetStates
+                    let _ = write_tx.send(UfbToAgent::GetStates);
 
-                    // Read messages in a blocking thread
-                    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(64);
+                    // Blocking I/O thread: peek/read + write on single handle
                     tokio::task::spawn_blocking(move || {
-                        let mut reader = read_pipe;
+                        log::info!("MountClient: I/O thread started");
+                        let mut pipe_rw = pipe;
                         loop {
-                            match recv_msg(&mut reader) {
-                                Ok(msg) => {
-                                    if msg_tx.blocking_send(msg).is_err() {
-                                        break;
+                            // 1. Write any pending outgoing commands
+                            while let Ok(cmd) = write_rx.try_recv() {
+                                if let Err(e) = send_msg(&mut pipe_rw, &cmd) {
+                                    log::error!("MountClient: write failed: {}", e);
+                                    return;
+                                }
+                            }
+
+                            // 2. Peek for incoming data
+                            let mut available = 0u32;
+                            let peek_ok = unsafe {
+                                windows::Win32::System::Pipes::PeekNamedPipe(
+                                    windows::Win32::Foundation::HANDLE(
+                                        std::os::windows::io::AsRawHandle::as_raw_handle(&pipe_rw)
+                                    ),
+                                    None,
+                                    0,
+                                    None,
+                                    Some(&mut available),
+                                    None,
+                                )
+                            };
+                            if peek_ok.is_err() {
+                                log::info!("MountClient: pipe closed (peek failed)");
+                                return;
+                            }
+
+                            if available > 0 {
+                                match recv_msg(&mut pipe_rw) {
+                                    Ok(msg) => {
+                                        if msg_tx.blocking_send(msg).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        log::info!("MountClient: pipe closed (read failed)");
+                                        return;
                                     }
                                 }
-                                Err(_) => {
-                                    break;
-                                }
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
                             }
                         }
                     });
 
+                    // Bridge: forward Tauri commands to the blocking I/O thread
+                    let write_tx_clone = write_tx.clone();
+
                     // Process incoming messages and outgoing commands
                     loop {
                         tokio::select! {
-                            // Incoming messages from agent
+                            // Incoming messages from agent (via I/O thread)
                             msg = msg_rx.recv() => {
                                 match msg {
                                     Some(AgentToUfb::MountStateUpdate(update)) => {
-                                        log::info!("MountClient: received state update for {} ({})", update.mount_id, update.state);
+                                        log::info!("MountClient: state update {} ({})", update.mount_id, update.state);
                                         let mount_id = update.mount_id.clone();
                                         {
                                             let mut state = self.state.lock().await;
@@ -317,15 +352,15 @@ impl MountClient {
                                         let _ = app_handle.emit("mount:error", &err);
                                     }
                                     None => {
-                                        // Read loop ended — agent disconnected
+                                        // I/O thread exited — agent disconnected
                                         break;
                                     }
                                 }
                             }
-                            // Outgoing commands from UFB
+                            // Outgoing commands from UFB → forward to I/O thread
                             Some(cmd) = cmd_rx.recv() => {
-                                if let Err(e) = send_msg(&mut write_pipe, &cmd) {
-                                    log::error!("MountClient: failed to send command: {}", e);
+                                if write_tx_clone.send(cmd).is_err() {
+                                    log::error!("MountClient: I/O thread gone, can't send command");
                                     break;
                                 }
                             }
@@ -443,36 +478,6 @@ impl MountClient {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
-}
-
-/// Duplicate a pipe file into two: one for reading, one for writing.
-/// Both refer to the same underlying pipe handle.
-#[cfg(windows)]
-fn duplicate_pipe(pipe: std::fs::File) -> io::Result<(std::fs::File, std::fs::File)> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
-    use windows::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    let source_handle = HANDLE(pipe.as_raw_handle());
-    let process = unsafe { GetCurrentProcess() };
-
-    let mut dup_handle = HANDLE::default();
-    unsafe {
-        DuplicateHandle(
-            process,
-            source_handle,
-            process,
-            &mut dup_handle,
-            0,
-            false,
-            DUPLICATE_SAME_ACCESS,
-        )
-    }
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DuplicateHandle failed: {}", e)))?;
-
-    // Original file becomes the reader, duplicate becomes the writer
-    let writer = unsafe { std::fs::File::from_raw_handle(dup_handle.0 as RawHandle) };
-    Ok((pipe, writer))
 }
 
 /// Config file path: %LOCALAPPDATA%/ufb/mounts.json

@@ -1,17 +1,17 @@
 use crate::messages::{AgentToUfb, UfbToAgent};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES};
+use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile, FlushFileBuffers, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
 const PIPE_NAME: &str = r"\\.\pipe\MediaMountAgent";
 
-/// A Send-safe wrapper around a raw HANDLE, stored as a usize for Send safety.
+/// A Send-safe wrapper around a raw HANDLE.
 #[derive(Clone, Copy)]
 struct SendHandle(usize);
 
@@ -24,26 +24,15 @@ impl SendHandle {
     }
 }
 
-/// Named pipe handle with Read/Write implementations.
 struct PipeHandle {
     h: SendHandle,
-    owns: bool, // whether Drop should close the handle
+    owns: bool,
 }
 
 impl PipeHandle {
-    #[allow(dead_code)]
-    fn new(handle: HANDLE) -> Self {
-        Self {
-            h: SendHandle::from_handle(handle),
-            owns: true,
-        }
-    }
-
-    /// Create a non-owning alias (won't close on drop).
     fn alias(handle: SendHandle) -> Self {
         Self { h: handle, owns: false }
     }
-
     fn raw(&self) -> HANDLE {
         self.h.to_handle()
     }
@@ -75,8 +64,8 @@ impl Write for PipeHandle {
         }
         Ok(bytes_written as usize)
     }
-
     fn flush(&mut self) -> io::Result<()> {
+        unsafe { let _ = FlushFileBuffers(self.raw()); }
         Ok(())
     }
 }
@@ -84,49 +73,35 @@ impl Write for PipeHandle {
 impl Drop for PipeHandle {
     fn drop(&mut self) {
         if self.owns && !self.raw().is_invalid() {
-            unsafe {
-                let _ = CloseHandle(self.raw());
-            }
+            unsafe { let _ = CloseHandle(self.raw()); }
         }
     }
 }
 
-/// IPC server that listens for UFB connections on a named pipe.
+/// IPC server using a single I/O thread per client to avoid the Windows
+/// synchronous pipe deadlock (concurrent ReadFile/WriteFile on the same handle).
+///
+/// Outgoing messages are sent via a `std::sync::mpsc` channel so the blocking
+/// I/O thread can `try_recv` without async.
 pub struct IpcServer {
     pub command_rx: mpsc::Receiver<UfbToAgent>,
-    response_tx: mpsc::Sender<AgentToUfb>,
-    _cancel_tx: tokio::sync::oneshot::Sender<()>,
+    /// Outgoing messages — the I/O thread drains this via try_recv.
+    outgoing_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<AgentToUfb>>>,
 }
 
 impl IpcServer {
     pub fn start() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UfbToAgent>(64);
-        let (resp_tx, mut resp_rx) = mpsc::channel::<AgentToUfb>(64);
-        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Shared handle for current client connection
-        let active_handle: Arc<Mutex<Option<SendHandle>>> = Arc::new(Mutex::new(None));
+        // Outgoing channel: std::sync so the blocking I/O thread can try_recv.
+        // The sender is wrapped in Arc<Mutex> so we can swap it per client session.
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<AgentToUfb>();
+        let shared_out_tx = Arc::new(std::sync::Mutex::new(out_tx));
 
-        // Response writer task
-        let writer_handle = active_handle.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = resp_rx.recv().await {
-                let mut lock = writer_handle.lock().await;
-                if let Some(h) = *lock {
-                    let mut pipe = PipeHandle::alias(h);
-                    if let Err(e) = super::send_message(&mut pipe, &msg) {
-                        log::warn!("Failed to send to UFB client: {}", e);
-                        *lock = None;
-                    }
-                }
-            }
-        });
-
-        // Connection listener task
-        let listener_handle = active_handle;
+        let shared_out_tx_clone = shared_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                // Create pipe (blocking)
+                // Create pipe instance
                 let send_handle = match tokio::task::spawn_blocking(|| {
                     create_pipe().map(SendHandle::from_handle)
                 }).await {
@@ -144,7 +119,7 @@ impl IpcServer {
 
                 log::info!("Waiting for UFB client on {}", PIPE_NAME);
 
-                // Wait for client (blocking)
+                // Wait for client connection
                 let sh = send_handle;
                 let send_handle = match tokio::task::spawn_blocking(move || {
                     wait_connect(sh.to_handle()).map(SendHandle::from_handle)
@@ -162,59 +137,77 @@ impl IpcServer {
 
                 log::info!("UFB client connected");
 
-                // Store for writer
+                // Create a fresh outgoing channel for this client session.
+                let (new_tx, new_rx) = std::sync::mpsc::channel::<AgentToUfb>();
                 {
-                    let mut lock = listener_handle.lock().await;
-                    *lock = Some(send_handle);
+                    let mut lock = shared_out_tx_clone.lock().unwrap();
+                    *lock = new_tx;
                 }
 
-                // Read commands in blocking thread
+                // Single blocking I/O thread per client
                 let cmd_tx_clone = cmd_tx.clone();
-                let _listener_ref = listener_handle.clone();
-                tokio::task::spawn_blocking(move || {
+                let io_done = tokio::task::spawn_blocking(move || {
                     let mut pipe = PipeHandle::alias(send_handle);
+
                     loop {
-                        match super::recv_message::<_, UfbToAgent>(&mut pipe) {
-                            Ok(msg) => {
-                                if cmd_tx_clone.blocking_send(msg).is_err() {
-                                    break;
+                        // 1. Write any pending outgoing messages
+                        while let Ok(msg) = new_rx.try_recv() {
+                            if let Err(e) = super::send_message(&mut pipe, &msg) {
+                                log::warn!("Failed to send to UFB client: {}", e);
+                                return;
+                            }
+                            let _ = pipe.flush();
+                        }
+
+                        // 2. Peek for incoming data
+                        let mut available = 0u32;
+                        let peek_ok = unsafe {
+                            PeekNamedPipe(pipe.raw(), None, 0, None, Some(&mut available), None)
+                        };
+                        if peek_ok.is_err() {
+                            log::info!("UFB client disconnected (peek)");
+                            return;
+                        }
+
+                        if available > 0 {
+                            match super::recv_message::<_, UfbToAgent>(&mut pipe) {
+                                Ok(msg) => {
+                                    if cmd_tx_clone.blocking_send(msg).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    log::info!("UFB client disconnected (read)");
+                                    return;
                                 }
                             }
-                            Err(_) => {
-                                log::info!("UFB client disconnected");
-                                break;
-                            }
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
-                    // Clean up: close handle
-                    unsafe {
-                        let _ = CloseHandle(send_handle.to_handle());
-                    }
-                    // We can't async lock from blocking context, but writer will detect broken pipe
                 });
+
+                // Wait for this client session to end
+                let _ = io_done.await;
+                unsafe { let _ = CloseHandle(send_handle.to_handle()); }
             }
         });
 
         Self {
             command_rx: cmd_rx,
-            response_tx: resp_tx,
-            _cancel_tx: cancel_tx,
+            outgoing_tx: shared_out_tx,
         }
     }
 
     pub async fn send(&self, msg: AgentToUfb) -> Result<(), String> {
-        self.response_tx
-            .send(msg)
-            .await
-            .map_err(|e| format!("Failed to queue response: {}", e))
+        let lock = self.outgoing_tx.lock().unwrap();
+        lock.send(msg).map_err(|e| format!("Failed to queue response: {}", e))
     }
 }
 
 fn create_pipe() -> io::Result<HANDLE> {
     let pipe_name: Vec<u16> = format!("{}\0", PIPE_NAME).encode_utf16().collect();
-
-    // PIPE_ACCESS_DUPLEX = 0x00000003
-    let pipe_access = FILE_FLAGS_AND_ATTRIBUTES(0x00000003);
+    let pipe_access = FILE_FLAGS_AND_ATTRIBUTES(0x00000003); // PIPE_ACCESS_DUPLEX
 
     let handle = unsafe {
         CreateNamedPipeW(
@@ -237,8 +230,6 @@ fn create_pipe() -> io::Result<HANDLE> {
 }
 
 fn wait_connect(handle: HANDLE) -> io::Result<HANDLE> {
-    unsafe {
-        let _ = ConnectNamedPipe(handle, None);
-    }
+    unsafe { let _ = ConnectNamedPipe(handle, None); }
     Ok(handle)
 }

@@ -5,7 +5,7 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.2.3"
+#define MyAppVersion "0.2.5"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
@@ -75,7 +75,7 @@ Name: "shortcuts\startmenu"; Description: "Create Start Menu shortcuts"; Types: 
 [Tasks]
 Name: "mediamount_autostart"; Description: "Start MediaMount Agent at login"; GroupDescription: "MediaMount:"; Components: mediamount
 Name: "cleansettings"; Description: "Remove user preferences (%LOCALAPPDATA%\ufb\settings.json) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
-Name: "cleandb"; Description: "Remove database (%LOCALAPPDATA%\ufb\ufb.db) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
+Name: "cleandb"; Description: "Remove database (%LOCALAPPDATA%\ufb\ufb_v2.db) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "cleanall"; Description: "Remove ALL user data and preferences (%LOCALAPPDATA%\ufb\) - NOT RECOMMENDED"; GroupDescription: "User data cleanup:"; Flags: unchecked
 Name: "restartexplorer"; Description: "Restart Windows Explorer (refreshes icons, URI protocols, and shell integrations)"; GroupDescription: "Post-installation:"; Flags: unchecked
 Name: "launchafter"; Description: "Launch {#MyAppName} after installation"; GroupDescription: "Post-installation:"; Flags: unchecked
@@ -248,6 +248,11 @@ var
 begin
   if CurStep = ssInstall then
   begin
+    // Stop running processes before overwriting binaries
+    Exec('taskkill.exe', '/f /im {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('taskkill.exe', '/f /im {#AgentExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(500);
+
     // Clean old program files
     AppDir := ExpandConstant('{app}');
     if DirExists(AppDir) then
@@ -270,6 +275,12 @@ begin
       end;
       if WizardIsTaskSelected('cleandb') then
       begin
+        // Current database
+        DbFile := LocalAppData + '\ufb_v2.db';
+        if FileExists(DbFile) then DeleteFile(DbFile);
+        if FileExists(DbFile + '-wal') then DeleteFile(DbFile + '-wal');
+        if FileExists(DbFile + '-shm') then DeleteFile(DbFile + '-shm');
+        // Legacy database
         DbFile := LocalAppData + '\ufb.db';
         if FileExists(DbFile) then DeleteFile(DbFile);
         if FileExists(DbFile + '-wal') then DeleteFile(DbFile + '-wal');

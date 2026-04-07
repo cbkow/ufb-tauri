@@ -1669,30 +1669,41 @@ pub fn mount_launch_agent() -> Result<(), String> {
         "mediamount-agent"
     };
 
-    // Search order: next to UFB exe, bundle Resources, dev build path, then PATH
+    // Search order: dev build path (when running from target/), next to UFB exe,
+    // bundle Resources, then PATH.  Dev path is checked first so a freshly-built
+    // agent always wins over a stale copy that may linger next to the UFB exe.
     let mut agent_path = std::path::PathBuf::from(agent_name);
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Production: next to UFB exe
-            let sidecar = dir.join(agent_name);
-            if sidecar.exists() {
-                agent_path = sidecar;
-            } else {
-                // macOS .app bundle: Contents/MacOS/ or Contents/Resources/
-                #[cfg(target_os = "macos")]
+            let dir_str = dir.to_string_lossy();
+            let is_dev = dir_str.contains("target/debug") || dir_str.contains("target\\debug")
+                || dir_str.contains("target/release") || dir_str.contains("target\\release");
+
+            // Dev: UFB is in src-tauri/target/debug/,
+            // agent is in mediamount-agent/target/debug/
+            if is_dev {
+                let dev_path = dir.join("../../../mediamount-agent/target/debug").join(agent_name);
+                if let Ok(canon) = std::fs::canonicalize(&dev_path) {
+                    agent_path = canon;
+                }
+            }
+
+            // Production: next to UFB exe (skip if dev path already found)
+            if !agent_path.exists() || agent_path == std::path::PathBuf::from(agent_name) {
+                let sidecar = dir.join(agent_name);
+                if sidecar.exists() {
+                    agent_path = sidecar;
+                }
+            }
+
+            // macOS .app bundle: Contents/MacOS/ or Contents/Resources/
+            #[cfg(target_os = "macos")]
+            if !agent_path.exists() || agent_path == std::path::PathBuf::from(agent_name) {
                 if let Some(contents_dir) = dir.parent() {
                     let resources = contents_dir.join("Resources").join(agent_name);
                     if resources.exists() {
                         agent_path = resources;
-                    }
-                }
-                // Dev: UFB is in src-tauri/target/debug/,
-                // agent is in mediamount-agent/target/debug/
-                if !agent_path.exists() || agent_path == std::path::PathBuf::from(agent_name) {
-                    let dev_path = dir.join("../../../mediamount-agent/target/debug").join(agent_name);
-                    if let Ok(canon) = std::fs::canonicalize(&dev_path) {
-                        agent_path = canon;
                     }
                 }
             }

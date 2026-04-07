@@ -266,16 +266,18 @@ async fn run_event_loop() {
             tokio::select! {
                 // Commands from UFB via IPC
                 Some(cmd) = ipc_server.command_rx.recv() => {
+                    log::debug!("IPC command received: {:?}", cmd);
                     mount_service.handle_command(cmd).await;
                 }
 
                 // Outgoing state updates to forward to UFB and tray
                 Some(msg) = state_rx.recv() => {
+                    log::debug!("Forwarding to UFB+tray: {:?}", msg);
                     // Forward to tray
                     let _ = tray_state_tx.try_send(msg.clone());
                     // Forward to UFB
                     if let Err(e) = ipc_server.send(msg).await {
-                        log::debug!("No UFB client connected: {}", e);
+                        log::warn!("Failed to forward to UFB: {}", e);
                     }
                 }
 

@@ -129,13 +129,23 @@ impl Orchestrator {
 
         #[cfg(windows)]
         {
-            // Single WNetAddConnection2W call: authenticate + map drive letter
-            let result = crate::platform::windows::fallback::connect_drive(
-                &self.config.mount_drive_letter,
-                &self.config.nas_share_path,
-                &username,
-                &password,
-            );
+            // WNetAddConnection2W is a blocking Win32 call that can stall for 30-60s
+            // if the target host is unreachable.  Run it off the async runtime so one
+            // slow mount doesn't block state updates for every other mount.
+            let drive_letter = self.config.mount_drive_letter.clone();
+            let nas_share_path = self.config.nas_share_path.clone();
+            let u = username.clone();
+            let p = password.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::platform::windows::fallback::connect_drive(
+                    &drive_letter,
+                    &nas_share_path,
+                    &u,
+                    &p,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("connect_drive task panicked: {}", e)));
             if let Err(e) = result {
                 log::error!("[{}] Mount failed: {}", self.mount_id, e);
                 let _ = self
@@ -217,10 +227,15 @@ impl Orchestrator {
     async fn disconnect_drive(&mut self) {
         #[cfg(windows)]
         {
-            if let Err(e) = crate::platform::windows::fallback::disconnect_drive(
-                &self.config.mount_drive_letter,
-            ) {
-                log::warn!("[{}] Disconnect failed (non-fatal): {}", self.mount_id, e);
+            let drive_letter = self.config.mount_drive_letter.clone();
+            let mount_id = self.mount_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::platform::windows::fallback::disconnect_drive(&drive_letter)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("disconnect_drive task panicked: {}", e)));
+            if let Err(e) = result {
+                log::warn!("[{}] Disconnect failed (non-fatal): {}", mount_id, e);
             }
         }
 
