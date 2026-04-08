@@ -1,3 +1,4 @@
+use crate::config::MountConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -36,6 +37,10 @@ pub enum MountEvent {
     Start,
     Stop,
     Restart,
+
+    // Config changed while mount is running — orchestrator should
+    // tear down the old config and apply the new one.
+    ConfigChanged { new_config: MountConfig },
 
     // Platform errors
     MountFailed { reason: String },
@@ -165,6 +170,20 @@ pub fn transition(
             ],
         ),
 
+        // ── Global: Config changed — restart to apply new config ──
+        (_, ConfigChanged { .. }) => (
+            Mounting,
+            vec![
+                Effect::DisconnectDrive,
+                Effect::MountDrive,
+                Effect::LogEvent {
+                    level: LogLevel::Info,
+                    message: "config changed, restarting".into(),
+                },
+                Effect::EmitStateUpdate,
+            ],
+        ),
+
         // ── Global: Request state update from any state (no transition) ──
         (_, RequestStateUpdate) => (
             state,
@@ -189,6 +208,48 @@ pub fn transition(
         _ => {
             // No state change, no effects
             (state, vec![])
+        }
+    }
+}
+
+// ── Sync State Machine ──
+// Parallel to mount state — tracks on-demand sync lifecycle independently.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncState {
+    /// Sync not enabled for this mount.
+    Disabled,
+    /// Registering the sync root with the OS.
+    Registering,
+    /// Sync root active, session connected, watcher running.
+    Active,
+    /// Sync root encountered an error.
+    Error(String),
+    /// Tearing down sync root.
+    Deregistering,
+}
+
+impl fmt::Display for SyncState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncState::Disabled => write!(f, "Disabled"),
+            SyncState::Registering => write!(f, "Registering"),
+            SyncState::Active => write!(f, "Active"),
+            SyncState::Error(e) => write!(f, "Error: {}", e),
+            SyncState::Deregistering => write!(f, "Deregistering"),
+        }
+    }
+}
+
+impl SyncState {
+    /// Returns the state name for IPC messages.
+    pub fn state_name(&self) -> &str {
+        match self {
+            SyncState::Disabled => "disabled",
+            SyncState::Registering => "registering",
+            SyncState::Active => "active",
+            SyncState::Error(_) => "error",
+            SyncState::Deregistering => "deregistering",
         }
     }
 }

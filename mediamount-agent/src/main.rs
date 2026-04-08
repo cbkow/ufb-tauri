@@ -7,6 +7,7 @@ mod mount_service;
 mod orchestrator;
 mod platform;
 mod state;
+mod sync;
 mod tray;
 
 use std::process;

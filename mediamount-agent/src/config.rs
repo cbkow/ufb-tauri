@@ -9,7 +9,7 @@ pub struct MountsConfig {
 }
 
 /// Configuration for a single mount.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MountConfig {
     pub id: String,
@@ -46,6 +46,22 @@ pub struct MountConfig {
     /// Whether subfolders of this mount are treated as subscribable jobs (default true)
     #[serde(default = "default_true")]
     pub is_jobs_folder: bool,
+
+    // ── On-demand sync (Windows Cloud Files / macOS FileProvider) ──
+
+    /// Enable on-demand sync for this mount. Mutually exclusive with drive-letter mount:
+    /// if sync_enabled is true, the traditional drive mount is skipped.
+    #[serde(default)]
+    pub sync_enabled: bool,
+
+    /// Override for the local sync root folder path.
+    /// Default: %LOCALAPPDATA%\ufb\sync\{id}\ (Windows) or ~/.local/share/ufb/sync/{id}/ (Unix)
+    #[serde(default)]
+    pub sync_root_path: Option<String>,
+
+    /// Maximum local cache size in bytes for hydrated files. 0 = unlimited.
+    #[serde(default)]
+    pub sync_cache_limit_bytes: u64,
 
     // ── Legacy fields — kept for backwards compat with existing config files ──
 
@@ -107,6 +123,44 @@ pub struct MountConfig {
 }
 
 impl MountConfig {
+    /// Returns true if this mount uses on-demand sync instead of a traditional drive mount.
+    pub fn is_sync_mode(&self) -> bool {
+        self.sync_enabled
+    }
+
+    /// The local folder path for the sync root.
+    /// Uses explicit override if set, otherwise auto-derives from the mount ID.
+    pub fn sync_root_dir(&self) -> PathBuf {
+        if let Some(ref p) = self.sync_root_path {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        Self::default_sync_root_base().join(&self.id)
+    }
+
+    /// Default base directory for sync roots.
+    fn default_sync_root_base() -> PathBuf {
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(local).join("ufb").join("sync");
+                let _ = std::fs::create_dir_all(&dir);
+                return dir;
+            }
+            PathBuf::from(r"C:\ufb\sync")
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(home) = std::env::var_os("HOME") {
+                let dir = PathBuf::from(home).join(".local/share/ufb/sync");
+                let _ = std::fs::create_dir_all(&dir);
+                return dir;
+            }
+            PathBuf::from("/tmp/ufb-sync")
+        }
+    }
+
     /// Base directory for auto-derived mount paths on Linux.
     /// Uses ~/.local/share/ufb/mnt/ which is user-writable without root.
     #[cfg(target_os = "linux")]
@@ -121,10 +175,15 @@ impl MountConfig {
     }
 
     /// The path apps use to access the mount.
-    /// Windows: "M:\\" (drive letter).
+    /// If sync is enabled, returns the sync root path instead of the drive letter.
+    /// Windows (drive): "M:\\"
+    /// Windows (sync): "%LOCALAPPDATA%\\ufb\\sync\\{id}"
     /// macOS: mount_path_macos, or auto-derived /opt/ufb/mounts/<id>
     /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
     pub fn mount_path(&self) -> String {
+        if self.sync_enabled {
+            return self.sync_root_dir().to_string_lossy().to_string();
+        }
         #[cfg(windows)]
         {
             format!("{}:\\", self.mount_drive_letter)
@@ -251,6 +310,9 @@ mod tests {
                 mount_path_linux: None,
                 mount_path_macos: None,
                 is_jobs_folder: true,
+                sync_enabled: false,
+                sync_root_path: None,
+                sync_cache_limit_bytes: 0,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),
                 junction_path: String::new(),
@@ -298,6 +360,9 @@ mod tests {
                 mount_path_linux: None,
                 mount_path_macos: None,
                 is_jobs_folder: true,
+                sync_enabled: false,
+                sync_root_path: None,
+                sync_cache_limit_bytes: 0,
                 rclone_drive_letter: String::new(),
                 smb_drive_letter: String::new(),
                 junction_path: String::new(),

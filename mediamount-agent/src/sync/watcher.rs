@@ -1,0 +1,303 @@
+/// NAS directory watcher via ReadDirectoryChangesW.
+///
+/// Watches the NAS root with subtree support. When a change is detected in a
+/// folder that the user has visited (registered during FETCH_PLACEHOLDERS),
+/// the watcher pushes/removes placeholders in the corresponding client folder.
+
+use cloud_filter::{metadata::Metadata, placeholder_file::PlaceholderFile};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+
+/// Watches a NAS share for changes and syncs placeholders to the client folder.
+pub struct NasWatcher {
+    /// Map of NAS folder → client folder for all visited folders.
+    watched: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    nas_root: PathBuf,
+}
+
+impl NasWatcher {
+    pub fn new(nas_root: PathBuf) -> Self {
+        Self {
+            watched: Arc::new(Mutex::new(HashMap::new())),
+            nas_root,
+        }
+    }
+
+    /// Register a folder pair for watching. Called when FETCH_PLACEHOLDERS fires.
+    pub fn register(&self, nas_dir: PathBuf, client_dir: PathBuf) {
+        let mut map = self.watched.lock().unwrap();
+        map.insert(nas_dir, client_dir);
+    }
+
+    /// Start the background watcher thread.
+    pub fn start(&self) {
+        let nas_root = self.nas_root.clone();
+        let watched = self.watched.clone();
+
+        std::thread::Builder::new()
+            .name("nas-watcher".into())
+            .spawn(move || {
+                if let Err(e) = run_watcher_loop(&nas_root, &watched) {
+                    log::error!("[sync-watcher] Watcher exited with error: {}", e);
+                }
+            })
+            .expect("Failed to spawn NAS watcher thread");
+    }
+
+    /// Get a reference to the watched folders map.
+    pub fn watched_folders(&self) -> Arc<Mutex<HashMap<PathBuf, PathBuf>>> {
+        self.watched.clone()
+    }
+}
+
+fn run_watcher_loop(
+    nas_root: &Path,
+    watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+) -> Result<(), String> {
+    let wide_path: Vec<u16> = nas_root
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            HANDLE::default(),
+        )
+    }
+    .map_err(|e| format!("Failed to open NAS directory for watching: {}", e))?;
+
+    log::info!("[sync-watcher] Watching {:?}", nas_root);
+
+    let mut buffer = vec![0u8; 16384];
+    let mut bytes_returned: u32 = 0;
+    let filter =
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE;
+
+    loop {
+        let result = unsafe {
+            ReadDirectoryChangesW(
+                handle,
+                buffer.as_mut_ptr() as *mut _,
+                buffer.len() as u32,
+                true, // watch subtree
+                filter,
+                Some(&mut bytes_returned),
+                None,
+                None,
+            )
+        };
+
+        match result {
+            Ok(()) if bytes_returned > 0 => {
+                process_events(&buffer, bytes_returned, nas_root, watched);
+            }
+            Ok(()) => {
+                // Buffer overflow — too many changes at once.
+                // Fall back to full readdir + diff on all watched folders.
+                log::warn!("[sync-watcher] Buffer overflow, running full diff on watched folders");
+                full_diff_all_watched(nas_root, watched);
+            }
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return Err(format!("ReadDirectoryChangesW error: {}", e));
+            }
+        }
+    }
+}
+
+fn process_events(
+    buffer: &[u8],
+    bytes_returned: u32,
+    nas_root: &Path,
+    watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+) {
+    let mut offset: usize = 0;
+
+    loop {
+        if offset + std::mem::size_of::<FILE_NOTIFY_INFORMATION>() > bytes_returned as usize {
+            break;
+        }
+
+        let info =
+            unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION) };
+
+        let name_len = info.FileNameLength as usize / 2;
+        let name_slice =
+            unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_len) };
+        let relative_str = String::from_utf16_lossy(name_slice);
+
+        // Skip Synology internal paths
+        if relative_str
+            .split('\\')
+            .any(|c| c.starts_with('@') || c.starts_with('#'))
+        {
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            offset += info.NextEntryOffset as usize;
+            continue;
+        }
+
+        let nas_path = nas_root.join(&relative_str);
+        let parent_nas = nas_path.parent().unwrap_or(nas_root);
+        let file_name = nas_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let action = info.Action.0;
+        let action_name = match action {
+            1 => "ADDED",
+            2 => "REMOVED",
+            3 => "MODIFIED",
+            4 => "RENAMED_OLD",
+            5 => "RENAMED_NEW",
+            _ => "UNKNOWN",
+        };
+
+        let client_dir = {
+            let map = watched.lock().unwrap();
+            let result = map.get(parent_nas).cloned();
+            if result.is_none() {
+                log::debug!(
+                    "[sync-watcher] {} {} (no watched folder for {:?})",
+                    action_name, relative_str, parent_nas
+                );
+            }
+            result
+        };
+
+        if let Some(client_dir) = client_dir {
+            match action {
+                1 | 5 => {
+                    // FILE_ACTION_ADDED or FILE_ACTION_RENAMED_NEW — create placeholder
+                    log::debug!("[sync-watcher] {} {}", action_name, relative_str);
+                    push_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
+                }
+                2 | 4 => {
+                    // FILE_ACTION_REMOVED or FILE_ACTION_RENAMED_OLD — remove placeholder
+                    log::debug!("[sync-watcher] {} {}", action_name, relative_str);
+                    remove_placeholder(&client_dir, &file_name, &relative_str);
+                }
+                3 => {
+                    // FILE_ACTION_MODIFIED — could update metadata, skip for now
+                    log::debug!("[sync-watcher] MODIFIED {}", relative_str);
+                }
+                _ => {}
+            }
+        }
+
+        if info.NextEntryOffset == 0 {
+            break;
+        }
+        offset += info.NextEntryOffset as usize;
+    }
+}
+
+fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str) {
+    let client_path = client_dir.join(file_name);
+    if client_path.exists() {
+        return;
+    }
+
+    if let Ok(meta) = fs::metadata(nas_path) {
+        let blob = nas_path.to_string_lossy().as_bytes().to_vec();
+        let cf_meta = if meta.is_dir() {
+            Metadata::directory()
+        } else {
+            Metadata::file().size(meta.len())
+        };
+        let placeholder = PlaceholderFile::new(file_name)
+            .metadata(cf_meta)
+            .mark_in_sync()
+            .blob(blob);
+        match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
+            Ok(_) => log::debug!("[sync-watcher] + {}", display),
+            Err(e) => log::warn!("[sync-watcher] Failed to create placeholder {}: {}", display, e),
+        }
+    }
+}
+
+fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str) {
+    let client_path = client_dir.join(file_name);
+    if !client_path.exists() {
+        return;
+    }
+
+    let result = if client_path.is_dir() {
+        fs::remove_dir_all(&client_path)
+    } else {
+        fs::remove_file(&client_path)
+    };
+    match result {
+        Ok(()) => log::debug!("[sync-watcher] - {}", display),
+        Err(e) => log::warn!("[sync-watcher] Failed to remove placeholder {}: {}", display, e),
+    }
+}
+
+/// Full readdir + diff on all watched folders. Used when the event buffer overflows.
+fn full_diff_all_watched(
+    _nas_root: &Path,
+    watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+) {
+    let folders: Vec<(PathBuf, PathBuf)> = {
+        let map = watched.lock().unwrap();
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+
+    for (nas_dir, client_dir) in folders {
+        diff_folder(&nas_dir, &client_dir);
+    }
+}
+
+/// Diff a single NAS folder against its client counterpart and reconcile.
+fn diff_folder(nas_dir: &Path, client_dir: &Path) {
+    if !client_dir.is_dir() || !nas_dir.is_dir() {
+        return;
+    }
+
+    let nas_entries: std::collections::HashSet<String> = fs::read_dir(nas_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with('#') && !n.starts_with('@'))
+        .collect();
+
+    let client_entries: std::collections::HashSet<String> = fs::read_dir(client_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    // New on NAS
+    for name in nas_entries.difference(&client_entries) {
+        let nas_path = nas_dir.join(name);
+        push_placeholder(&nas_path, client_dir, name, name);
+    }
+
+    // Gone from NAS
+    for name in client_entries.difference(&nas_entries) {
+        remove_placeholder(client_dir, name, name);
+    }
+}

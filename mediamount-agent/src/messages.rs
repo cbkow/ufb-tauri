@@ -17,6 +17,12 @@ pub struct MountStateUpdateMsg {
     pub mount_id: String,
     pub state: String,
     pub state_detail: String,
+    /// On-demand sync state: "disabled", "registering", "active", "error", "deregistering"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_state: Option<String>,
+    /// Human-readable sync status detail
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_state_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +70,8 @@ mod tests {
             mount_id: "primary-nas".into(),
             state: "mounted".into(),
             state_detail: "Mounted".into(),
+            sync_state: None,
+            sync_state_detail: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -132,6 +140,8 @@ mod tests {
                 mount_id: "x".into(),
                 state: "s".into(),
                 state_detail: "d".into(),
+                sync_state: Some("active".into()),
+                sync_state_detail: Some("Watching 3 folders".into()),
             }),
         ];
         for v in variants {

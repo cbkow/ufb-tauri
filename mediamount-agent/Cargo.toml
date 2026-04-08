@@ -23,6 +23,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # No tray deps — macOS tray UI handled by companion Swift MenuBarExtra app
 
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.6"
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 

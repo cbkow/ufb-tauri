@@ -69,7 +69,21 @@ impl MountService {
                 continue;
             }
 
-            if self.mounts.contains_key(&mount_config.id) {
+            if let Some(instance) = self.mounts.get(&mount_config.id) {
+                // Mount exists — check if config changed
+                if instance.config != mount_config {
+                    log::info!("Config changed for mount: {}", mount_config.id);
+                    let _ = instance
+                        .event_tx
+                        .send(MountEvent::ConfigChanged {
+                            new_config: mount_config.clone(),
+                        })
+                        .await;
+                    // Update stored config
+                    if let Some(instance) = self.mounts.get_mut(&mount_config.id) {
+                        instance.config = mount_config;
+                    }
+                }
                 continue;
             }
 
