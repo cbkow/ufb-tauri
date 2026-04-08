@@ -29,6 +29,7 @@ src-tauri/external/
 
 # Planning docs
 planning/
+spikes/
 
 # Claude Code local settings
 .claude/settings.local.json
@@ -47,7 +48,6 @@ mediamount-tray/MediaMountTray.app/
 .DS_Store
 Thumbs.db
 Desktop.ini
-docs/
 
 # Environment / secrets
 .env
