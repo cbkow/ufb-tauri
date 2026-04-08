@@ -201,6 +201,73 @@ Same SQLite cache index as Windows. On eviction, call
 
 ---
 
+## Write-Through Architecture
+
+When a user saves a file into the sync root, it lands as a regular local file.
+The local data IS the hydration cache — no re-download needed. The agent uploads
+it to the NAS in the background, then converts it to a placeholder.
+
+### Flow
+1. User saves file → lands locally in sync root as regular file
+2. Client watcher detects it (ReadDirectoryChangesW on sync root)
+3. 3-second debounce (quiescence detection — no more MODIFIED events)
+4. Upload worker writes to NAS temp file (`.filename.~sync.{hostname}`)
+5. Conflict check (mtime + size) → rename temp to final
+6. Convert local file to hydrated placeholder via `convert_to_placeholder()`
+7. Echo suppressor prevents NAS watcher from creating a duplicate placeholder
+
+### State Machine (per file path)
+```
+IDLE → DEBOUNCING (3s) → UPLOADING → CONVERTING → IDLE
+             ↑                 |
+             └── cancel ───────┘  (new MODIFIED during upload)
+```
+At every stage, a new MODIFIED event resets to DEBOUNCING.
+Cancel signal sent to active upload, temp file deleted, restart.
+
+### Threading
+```
+Tokio runtime (async):
+  Orchestrator event loop
+  Upload coordinator (debounce timers, state machine, decisions)
+
+Dedicated threads:
+  Client watcher (ReadDirectoryChangesW on local sync root)
+  Upload worker (blocking SMB writes, 4MB chunks)
+  NAS watcher (already exists)
+  Tray (already exists)
+```
+
+### Channels
+```
+Client watcher → Upload coordinator: ClientFsEvent (mpsc, 256)
+Upload coordinator → Upload worker: UploadJob (mpsc, 8)
+Upload worker → Upload coordinator: UploadResult (mpsc, 64)
+Per-job cancel: oneshot channel
+Echo suppression: Arc<Mutex<HashMap>> shared, not channeled
+```
+
+### Upload Resume
+Temp file on NAS is the resume point. On reconnect after failure:
+stat temp file size → seek local source to that offset → continue writing.
+
+### Echo Suppression
+After uploading to NAS, the NAS watcher would see the new file and try to
+create a placeholder. A `HashSet<PathBuf>` with 5-second TTL prevents this.
+Upload coordinator writes to it, NAS watcher reads from it.
+
+### Placeholder Detection (Client Watcher)
+Client watcher must skip placeholder files (only react to regular files).
+Check `FILE_ATTRIBUTE_REPARSE_POINT` — all Cloud Files placeholders (hydrated
+and dehydrated) are NTFS reparse points. Regular files are not.
+Also skip: `.*.~sync.*` temp files, `~$*` Office locks, `*.tmp`.
+
+### Startup Recovery
+1. Scan NAS for orphaned `.~sync.{hostname}` temp files → delete
+2. Scan sync root for non-placeholder files → re-queue for upload
+
+---
+
 ## Phased Delivery
 
 ### Phase 1 — Single share, full pass-through with live updates

@@ -349,9 +349,51 @@ Changes made to mediamount-agent:
 - Rename handling: RENAMED_OLD → remove placeholder, RENAMED_NEW → create placeholder
 
 **Remaining for Phase 1:**
-- Write-through (local saves → NAS upload → convert to placeholder)
+- Write-through (see below)
 - Frontend UI (sync toggle in mount editor, sync status in sidebar)
 - Credential handling for mounts with explicit credential keys
+
+### Write-through design discussion (2026-04-08)
+
+**Key insight: the local write IS the hydration.**
+When a user saves a file, the data landing locally becomes the cache. We upload
+to NAS in the background, then convert to placeholder. No round-trip. Same total
+data transfer as saving directly to a mapped drive.
+
+**state_changed callback is NOT usable for write detection.**
+The cloud-filter crate's state_changed only watches FILE_NOTIFY_CHANGE_ATTRIBUTES
+(pin/unpin detection). It does NOT fire for new files. We need our own client-side
+ReadDirectoryChangesW watcher on the local sync root.
+
+**File completion detection: quiescence, not locking.**
+Rejected: exclusive file locking (try-open) — dangerous, can cause lock contention
+with the app that's writing. Instead: watch for MODIFIED events to stop. 3-second
+debounce after last MODIFIED = file is done. If wrong, upload cancels and restarts.
+
+**Rapid save handling: cancel and restart.**
+State machine per path: IDLE → DEBOUNCING → UPLOADING → CONVERTING → IDLE.
+New MODIFIED at any stage resets to DEBOUNCING. Active upload cancelled via oneshot
+channel, checked between 4MB chunk writes. Worst case waste: one 4MB chunk.
+
+**Read-only sync root rejected as option.**
+Discussed making sync root read-only (writes go to UNC path). Rejected because:
+the sync root IS the mount — users need a single path for browse + read + write.
+The CF API requires a local NTFS folder for the sync root, and the placeholders
+must be what users interact with.
+
+**Threading: coordinator (async) + worker (blocking).**
+Upload coordinator lives on tokio runtime (manages timers, state, decisions).
+Upload worker is a dedicated OS thread (blocking SMB writes). Client watcher is
+another OS thread (blocking ReadDirectoryChangesW). Clean separation: decisions
+are async, I/O is blocking on dedicated threads.
+
+**Scale validated:**
+- 200 files: ~50KB tracking state, ~40s upload at 10GbE
+- 10K files: ~2.5MB tracking state, sequential queue
+- 100K files: ~25MB tracking state, still manageable
+
+**Implementation: 9 steps, each compiles independently.**
+See docs/nas-sync-plan.md for full write-through architecture.
 
 ### Phase 0.3 — Live sync + chunked hydration
 
