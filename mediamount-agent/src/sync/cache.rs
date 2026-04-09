@@ -79,12 +79,37 @@ impl CacheIndex {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS cache_index (
+
+             -- Known files: all placeholders we've seen, with NAS metadata + hydration state
+             CREATE TABLE IF NOT EXISTS known_files (
                  path TEXT PRIMARY KEY,
-                 size INTEGER NOT NULL,
-                 accessed INTEGER NOT NULL
+                 nas_size INTEGER NOT NULL,
+                 nas_mtime INTEGER NOT NULL,
+                 is_hydrated INTEGER NOT NULL DEFAULT 0,
+                 hydrated_size INTEGER DEFAULT 0,
+                 last_accessed INTEGER DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS idx_accessed ON cache_index(accessed);",
+             CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
+             CREATE INDEX IF NOT EXISTS idx_accessed ON known_files(last_accessed);
+
+             -- Visited folders: folders the user has browsed (registered during FETCH_PLACEHOLDERS)
+             CREATE TABLE IF NOT EXISTS visited_folders (
+                 nas_path TEXT PRIMARY KEY,
+                 client_path TEXT NOT NULL,
+                 folder_mtime INTEGER NOT NULL DEFAULT 0
+             );
+
+             -- Metadata: key-value store for global state
+             CREATE TABLE IF NOT EXISTS metadata (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+
+             -- Migrate from old cache_index if it exists
+             INSERT OR IGNORE INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
+                 SELECT path, size, 0, 1, size, accessed FROM cache_index
+                 WHERE EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='cache_index');
+             DROP TABLE IF EXISTS cache_index;",
         )
     }
 
@@ -94,20 +119,21 @@ impl CacheIndex {
             .unwrap_or(false)
     }
 
+    // ── Hydration tracking ──
+
     /// Record a successful hydration. Triggers eviction check.
     pub fn record_hydration(&self, path: &Path, size: u64) {
         if size == 0 {
             return;
         }
         let path_str = path.to_string_lossy();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = Self::unix_now();
 
         let db = self.db.lock().unwrap();
         let _ = db.execute(
-            "INSERT OR REPLACE INTO cache_index (path, size, accessed) VALUES (?1, ?2, ?3)",
+            "INSERT INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
+             VALUES (?1, ?2, 0, 1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET is_hydrated=1, hydrated_size=?2, last_accessed=?3",
             params![path_str.as_ref(), size as i64, now],
         );
         drop(db);
@@ -120,7 +146,7 @@ impl CacheIndex {
         let path_str = path.to_string_lossy();
         let db = self.db.lock().unwrap();
         let _ = db.execute(
-            "DELETE FROM cache_index WHERE path = ?1",
+            "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path = ?1",
             params![path_str.as_ref()],
         );
     }
@@ -128,14 +154,10 @@ impl CacheIndex {
     /// Update last-access timestamp (LRU refresh on re-access).
     pub fn touch(&self, path: &Path) {
         let path_str = path.to_string_lossy();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
+        let now = Self::unix_now();
         let db = self.db.lock().unwrap();
         let _ = db.execute(
-            "UPDATE cache_index SET accessed = ?1 WHERE path = ?2",
+            "UPDATE known_files SET last_accessed = ?1 WHERE path = ?2",
             params![now, path_str.as_ref()],
         );
     }
@@ -146,7 +168,7 @@ impl CacheIndex {
         let new_str = new_path.to_string_lossy();
         let db = self.db.lock().unwrap();
         let _ = db.execute(
-            "UPDATE cache_index SET path = ?1 WHERE path = ?2",
+            "UPDATE known_files SET path = ?1 WHERE path = ?2",
             params![new_str.as_ref(), old_str.as_ref()],
         );
     }
@@ -155,11 +177,121 @@ impl CacheIndex {
     pub fn total_cached_bytes(&self) -> u64 {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM cache_index",
+            "SELECT COALESCE(SUM(hydrated_size), 0) FROM known_files WHERE is_hydrated = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0) as u64
+    }
+
+    // ── Known files (placeholder tracking for reconciliation) ──
+
+    /// Record a known file (placeholder created during FETCH_PLACEHOLDERS or watcher).
+    pub fn record_known_file(&self, path: &Path, nas_size: u64, nas_mtime: i64) {
+        let path_str = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO known_files (path, nas_size, nas_mtime) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET nas_size=?2, nas_mtime=?3",
+            params![path_str.as_ref(), nas_size as i64, nas_mtime],
+        );
+    }
+
+    /// Remove a known file (placeholder removed).
+    pub fn remove_known_file(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "DELETE FROM known_files WHERE path = ?1",
+            params![path_str.as_ref()],
+        );
+    }
+
+    /// Get all known files for a folder (for reconciliation diff).
+    pub fn known_files_in_folder(&self, folder_path: &Path) -> Vec<(String, i64, i64)> {
+        let prefix = format!("{}\\", folder_path.to_string_lossy());
+        let db = self.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT path, nas_size, nas_mtime FROM known_files WHERE path LIKE ?1 AND path NOT LIKE ?2")
+            .unwrap();
+        // Match direct children only (path starts with prefix, no additional backslash)
+        stmt.query_map(params![format!("{}%", prefix), format!("{}%\\\\%", prefix)], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    // ── Visited folders ──
+
+    /// Record a visited folder (called during FETCH_PLACEHOLDERS / watcher.register).
+    pub fn record_visited_folder(&self, nas_path: &Path, client_path: &Path, folder_mtime: i64) {
+        let nas_str = nas_path.to_string_lossy();
+        let client_str = client_path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO visited_folders (nas_path, client_path, folder_mtime) VALUES (?1, ?2, ?3)",
+            params![nas_str.as_ref(), client_str.as_ref(), folder_mtime],
+        );
+    }
+
+    /// Get all visited folders for startup reconciliation.
+    pub fn visited_folders(&self) -> Vec<(PathBuf, PathBuf, i64)> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT nas_path, client_path, folder_mtime FROM visited_folders")
+            .unwrap();
+        stmt.query_map([], |row| {
+            let nas: String = row.get(0)?;
+            let client: String = row.get(1)?;
+            let mtime: i64 = row.get(2)?;
+            Ok((PathBuf::from(nas), PathBuf::from(client), mtime))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    /// Update folder mtime after reconciliation.
+    pub fn update_folder_mtime(&self, nas_path: &Path, folder_mtime: i64) {
+        let nas_str = nas_path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE visited_folders SET folder_mtime = ?1 WHERE nas_path = ?2",
+            params![folder_mtime, nas_str.as_ref()],
+        );
+    }
+
+    // ── Metadata ──
+
+    /// Get last_connected_at timestamp.
+    pub fn last_connected_at(&self) -> Option<i64> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT value FROM metadata WHERE key = 'last_connected_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    }
+
+    /// Update last_connected_at to now.
+    pub fn update_last_connected(&self) {
+        let now = Self::unix_now();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_connected_at', ?1)",
+            params![now.to_string()],
+        );
+    }
+
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
 
     /// Evict LRU files until total <= 80% of cache_limit.
@@ -178,11 +310,11 @@ impl CacheIndex {
         let mut evicted_count = 0u32;
         let mut evicted_bytes = 0u64;
 
-        // Get LRU candidates
+        // Get LRU candidates (hydrated files, oldest first)
         let victims = {
             let db = self.db.lock().unwrap();
             let mut stmt = db
-                .prepare("SELECT path, size FROM cache_index ORDER BY accessed ASC")
+                .prepare("SELECT path, hydrated_size FROM known_files WHERE is_hydrated = 1 ORDER BY last_accessed ASC")
                 .unwrap();
             let rows: Vec<(String, i64)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -209,7 +341,7 @@ impl CacheIndex {
             if self.dehydrate_file(&path) {
                 let db = self.db.lock().unwrap();
                 let _ = db.execute(
-                    "DELETE FROM cache_index WHERE path = ?1",
+                    "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path = ?1",
                     params![path_str],
                 );
                 remaining -= *size as u64;
@@ -230,12 +362,11 @@ impl CacheIndex {
     }
 
     /// Clear ALL cached data for this mount. Returns (files_cleared, bytes_cleared).
-    /// Caller should emit progress events per file.
     pub fn clear_all(&self) -> (u32, u64) {
         let entries = {
             let db = self.db.lock().unwrap();
             let mut stmt = db
-                .prepare("SELECT path, size FROM cache_index")
+                .prepare("SELECT path, hydrated_size FROM known_files WHERE is_hydrated = 1")
                 .unwrap();
             let rows: Vec<(String, i64)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -257,9 +388,9 @@ impl CacheIndex {
             }
         }
 
-        // Clear the entire DB
+        // Mark all as dehydrated (don't delete — we still know about these files)
         let db = self.db.lock().unwrap();
-        let _ = db.execute("DELETE FROM cache_index", []);
+        let _ = db.execute("UPDATE known_files SET is_hydrated=0, hydrated_size=0", []);
 
         log::info!(
             "[cache] Cleared {} of {} files ({:.1} MB)",
@@ -298,9 +429,11 @@ impl CacheIndex {
 
         if dehydrate_all {
             self.dehydrate_tree(&self.client_root);
-            // DB should be empty after dehydrating everything
+            // Clear all tracking — fresh start
             let db = self.db.lock().unwrap();
-            let _ = db.execute("DELETE FROM cache_index", []);
+            let _ = db.execute("DELETE FROM known_files", []);
+            let _ = db.execute("DELETE FROM visited_folders", []);
+            let _ = db.execute("DELETE FROM metadata", []);
             return;
         }
 
@@ -328,10 +461,7 @@ impl CacheIndex {
             Ok(e) => e,
             Err(_) => return,
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = Self::unix_now();
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -349,7 +479,9 @@ impl CacheIndex {
                     let path_str = path.to_string_lossy();
                     let db = self.db.lock().unwrap();
                     let _ = db.execute(
-                        "INSERT OR REPLACE INTO cache_index (path, size, accessed) VALUES (?1, ?2, ?3)",
+                        "INSERT INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
+                         VALUES (?1, ?2, 0, 1, ?2, ?3)
+                         ON CONFLICT(path) DO UPDATE SET is_hydrated=1, hydrated_size=?2, last_accessed=?3",
                         params![path_str.as_ref(), meta.len() as i64, now],
                     );
                 }

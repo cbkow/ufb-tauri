@@ -786,3 +786,124 @@ for a "Repairing cache..." modal. No user intervention needed.
 **macOS equivalent:** FileProvider manages eviction via `NSFileProviderManager.evictItem()`.
 Same SQLite cache index can track hydrated items. The eviction policy (LRU, budget) is
 cross-platform logic in Rust.
+
+---
+
+## Unified Symlink Mount Architecture (2026-04-09)
+
+Major refactor planned: unify all Windows mounts behind symlinks to `C:\Volumes\ufb\{name}\`.
+
+### Problem
+- Sync root re-registers on every restart, destroying placeholders
+- No startup reconciliation — offline changes lost
+- Drive letter mounts vs sync mounts are two different systems
+- Users can write into sync root while offline, creating ambiguous orphans
+- Drive hiding is a messy registry hack
+
+### Architecture
+```
+User-visible:  C:\Volumes\ufb\{shareName}\ (symlink)
+  Drive mount: symlink → \\server\share (UNC)
+  Sync mount:  symlink → {cacheRoot}\sync\{shareName}\ (CF API root, hidden)
+
+Cache root:    %LOCALAPPDATA%\ufb\ (default) or user-selected (e.g., D:\ufb-cache\)
+Cache DB:      {cacheRoot}\cache\{mountId}.db
+```
+
+### Key decisions
+- **Fully replace drive letters** — all mounts at C:\Volumes\ufb\. No drive letters.
+- **PowerShell RunAs for elevation** — same pattern as existing hide_drives.
+  Two-tier: silent if Dev Mode, "Connect Mounts" button if not.
+- **Global cache location** in main Settings. One root for all sync mounts.
+- **Leave symlinks on crash** — reconcile on next start. User can browse cached files while agent is down.
+- **Sync root reconnect without re-register** — try Session::connect() first, register only if new.
+  Placeholders survive agent restarts.
+
+### Startup reconciliation (DB-driven)
+- DB stores visited folders with folder mtime.
+- On startup: SMB stat each visited folder's mtime → skip unchanged → readdir changed folders.
+- Three-way diff: DB (known state) vs NAS (current) vs Local (current).
+- NAS is truth. DB is our snapshot. Local wins only for verified newer saves.
+- Files not in DB discovered organically through browsing (FETCH_PLACEHOLDERS).
+
+### Orphan quarantine
+Files that don't fit reconciliation logic → quarantined to `\\server\share\.orphaned\`:
+```
+.orphaned\
+  project_files\
+    scene_v2.nk                         (first occurrence, original name)
+    scene_v2.orphaned.2026-04-10.nk     (duplicate, timestamped)
+```
+Threshold: >10 orphans in one reconciliation → quarantine ALL (batch confusion).
+UI shows notification: "N files quarantined". Browsable mirror of original path structure.
+
+### Elevation strategy
+```
+Agent starts → try CreateSymbolicLinkW silently
+  → Works (Dev Mode): all mounts connected
+  → Fails: set needs_elevation flag → sidebar shows "Connect Mounts" button
+  → User clicks → single UAC prompt → all symlinks created
+```
+
+### DB schema additions
+```sql
+-- Visited folders (for reconciliation scope)
+CREATE TABLE visited_folders (
+    nas_path TEXT PRIMARY KEY,
+    client_path TEXT NOT NULL,
+    folder_mtime INTEGER NOT NULL
+);
+
+-- Merge cache_index into broader file tracking
+CREATE TABLE known_files (
+    path TEXT PRIMARY KEY,
+    nas_size INTEGER NOT NULL,
+    nas_mtime INTEGER NOT NULL,
+    is_hydrated INTEGER NOT NULL DEFAULT 0,
+    hydrated_size INTEGER DEFAULT 0,
+    last_accessed INTEGER DEFAULT 0
+);
+```
+
+### Implementation order
+1. DB schema changes (visited_folders + known_files)
+2. Sync root reconnect (preserve placeholders)
+3. Startup reconciliation (DB-driven diff)
+4. Orphan quarantine
+5. Symlink module (creation/removal/elevation)
+6. Mount refactor (replace drive letters)
+7. Cache location setting (global, configurable)
+8. Frontend UI (remove drive letter/hide drives, add Connect + cache location)
+9. Cleanup (remove dead code)
+
+**macOS equivalent:** macOS already uses symlinks for all mounts (/opt/ufb/mounts/{id}).
+FileProvider domains are in ~/Library/CloudStorage/. The reconciliation logic and DB
+schema are cross-platform Rust. Symlink elevation is not needed (macOS allows symlinks
+without admin). The orphan quarantine pattern works identically via FSEvents.
+
+### Implementation progress (2026-04-09)
+
+**Step 1 DONE: DB schema migration.**
+- `cache_index` table migrated to `known_files` with NAS metadata (nas_size, nas_mtime,
+  is_hydrated, hydrated_size, last_accessed). Auto-migration preserves existing cache data.
+- New `visited_folders` table tracks folders user has browsed (for reconciliation scope).
+- New `metadata` table (key-value) stores `last_connected_at` timestamp.
+- Dehydration now marks `is_hydrated=0` instead of deleting rows (preserves file knowledge).
+- New methods: `record_known_file`, `known_files_in_folder`, `record_visited_folder`,
+  `visited_folders`, `update_folder_mtime`, `last_connected_at`, `update_last_connected`.
+
+**Step 2 DONE: Sync root reconnect without re-register.**
+- `SyncRoot::start()` now tries `Session::connect()` first. If the registration already
+  exists, connects to it directly — placeholders survive agent restarts.
+- Falls back to `register_fresh()` only if connect fails (first run or path changed).
+- `stop()` no longer calls `unregister()` — only disconnects the CF session. Registration
+  persists across restarts. Separate `SyncRoot::unregister()` method for explicit disable.
+- `last_connected_at` updated on both start and stop.
+- Tested: agent restart preserves all placeholders, log shows "Reconnected to existing sync root".
+
+**Key finding:** `Session::connect()` (wrapping `CfConnectSyncRoot`) consumes the filter.
+If connect fails, a new filter instance must be created for the registration path. Solved
+with a `make_filter` closure that creates fresh instances.
+
+**Next:** Step 3 (startup reconciliation) — replace the old startup recovery (which blindly
+uploads existing placeholders) with DB-driven NAS diff on visited folders.

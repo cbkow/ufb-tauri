@@ -6,7 +6,7 @@ use cloud_filter::root::{
 };
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::cache::CacheIndex;
@@ -35,7 +35,9 @@ pub struct SyncRoot {
 }
 
 impl SyncRoot {
-    /// Register and connect a sync root.
+    /// Start or reconnect a sync root.
+    /// Tries to reconnect to an existing registration first (preserves placeholders).
+    /// Falls back to fresh registration if the root isn't registered yet.
     pub fn start(
         mount_id: &str,
         display_name: &str,
@@ -51,46 +53,7 @@ impl SyncRoot {
         fs::read_dir(&nas_root)
             .map_err(|e| format!("NAS unreachable at {:?}: {}", nas_root, e))?;
 
-        // Build sync root ID (unique per provider + user + mount)
-        let sync_root_id = SyncRootIdBuilder::new(PROVIDER_NAME)
-            .user_security_id(
-                SecurityId::current_user()
-                    .map_err(|e| format!("Failed to get current user SID: {}", e))?,
-            )
-            .account_name(mount_id)
-            .build();
-
-        // Clean up any stale registration
-        let _ = sync_root_id.unregister();
-
-        // Register
-        let icon_path = Self::find_icon();
-        sync_root_id
-            .register(
-                SyncRootInfo::default()
-                    .with_display_name(display_name)
-                    .with_hydration_type(HydrationType::Full)
-                    .with_hydration_policy(
-                        HydrationPolicy::StreamingAllowed
-                            | HydrationPolicy::AutoDehydrationAllowed
-                            | HydrationPolicy::AllowFullRestartHydration,
-                    )
-                    .with_population_type(PopulationType::Full)
-                    .with_allow_pinning(true)
-                    .with_icon(&icon_path)
-                    .with_version(env!("CARGO_PKG_VERSION"))
-                    .with_path(&client_root)
-                    .map_err(|e| format!("Invalid sync root path: {}", e))?,
-            )
-            .map_err(|e| format!("Failed to register sync root: {}", e))?;
-
-        log::info!(
-            "[sync] Registered sync root '{}' at {:?}",
-            mount_id,
-            client_root
-        );
-
-        // Shared state
+        // Shared state (needed before connect)
         let echo = Arc::new(EchoSuppressor::new());
         let connectivity = Arc::new(NasConnectivity::new());
         let open_handles = Arc::new(Mutex::new(HashMap::new()));
@@ -104,38 +67,63 @@ impl SyncRoot {
         );
         let cache = Arc::new(cache_index);
 
-        // If DB was corrupt or missing, rebuild (dehydrate all if corrupt)
+        // If DB was corrupt, rebuild with dehydrate-all
         if needs_repair {
-            cache.rebuild(true); // dehydrate all — can't trust stale data
-        } else {
-            // Check if DB is empty (first run or was cleared)
-            if cache.total_cached_bytes() == 0 {
-                cache.rebuild(false); // just scan and index, don't dehydrate
-            }
+            cache.rebuild(true);
         }
 
-        // Create watcher (shared between filter and SyncRoot for clean shutdown)
+        // Create watcher
         let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
 
-        // Connect the filter
-        let filter = NasSyncFilter::new(
-            nas_root.clone(),
-            client_root.clone(),
-            watcher.clone(),
-            echo.clone(),
-            connectivity.clone(),
-            cache.clone(),
-            open_handles,
-        );
+        // Helper to create a fresh filter instance
+        let make_filter = |oh: Arc<Mutex<HashMap<PathBuf, u32>>>| {
+            NasSyncFilter::new(
+                nas_root.clone(),
+                client_root.clone(),
+                watcher.clone(),
+                echo.clone(),
+                connectivity.clone(),
+                cache.clone(),
+                oh,
+            )
+        };
 
-        // Start the NAS watcher before connecting (so it's ready for callbacks)
-        watcher.start();
+        // Try to reconnect to existing registration first (preserves placeholders).
+        // If connect fails, register fresh. Session::connect() consumes the filter,
+        // so we create a new instance for the registration path.
+        let (connection, is_reconnect) = {
+            let filter = make_filter(open_handles.clone());
+            match Session::new().connect(&client_root, filter) {
+                Ok(conn) => {
+                    log::info!(
+                        "[sync] Reconnected to existing sync root '{}' at {:?}",
+                        mount_id, client_root
+                    );
+                    (conn, true)
+                }
+                Err(e) => {
+                    log::info!(
+                        "[sync] No existing registration for '{}' ({}), registering fresh",
+                        mount_id, e
+                    );
+                    let filter = make_filter(open_handles.clone());
+                    let conn = Self::register_fresh(mount_id, display_name, &client_root, filter)?;
+                    log::info!(
+                        "[sync] Registered new sync root '{}' at {:?}",
+                        mount_id, client_root
+                    );
+                    (conn, false)
+                }
+            }
+        };
 
-        let connection = Session::new()
-            .connect(&client_root, filter)
-            .map_err(|e| format!("Failed to connect sync filter: {}", e))?;
+        // Update last_connected timestamp
+        cache.update_last_connected();
 
-        log::info!("[sync] Filter connected for '{}'", mount_id);
+        // If DB is empty and this isn't a corruption rebuild, scan for hydrated files
+        if !needs_repair && cache.total_cached_bytes() == 0 && is_reconnect {
+            cache.rebuild(false); // scan and index, don't dehydrate
+        }
 
         // Start the write-through pipeline
         let write_through = WriteThrough::start(
@@ -157,9 +145,56 @@ impl SyncRoot {
         })
     }
 
-    /// Tear down the sync root: disconnect session and unregister.
+    /// Full registration of a new sync root.
+    fn register_fresh(
+        mount_id: &str,
+        display_name: &str,
+        client_root: &Path,
+        filter: NasSyncFilter,
+    ) -> Result<cloud_filter::root::Connection<NasSyncFilter>, String> {
+        let sync_root_id = SyncRootIdBuilder::new(PROVIDER_NAME)
+            .user_security_id(
+                SecurityId::current_user()
+                    .map_err(|e| format!("Failed to get current user SID: {}", e))?,
+            )
+            .account_name(mount_id)
+            .build();
+
+        // Clean up stale registration if any
+        let _ = sync_root_id.unregister();
+
+        let icon_path = Self::find_icon();
+        sync_root_id
+            .register(
+                SyncRootInfo::default()
+                    .with_display_name(display_name)
+                    .with_hydration_type(HydrationType::Full)
+                    .with_hydration_policy(
+                        HydrationPolicy::StreamingAllowed
+                            | HydrationPolicy::AutoDehydrationAllowed
+                            | HydrationPolicy::AllowFullRestartHydration,
+                    )
+                    .with_population_type(PopulationType::Full)
+                    .with_allow_pinning(true)
+                    .with_icon(&icon_path)
+                    .with_version(env!("CARGO_PKG_VERSION"))
+                    .with_path(client_root)
+                    .map_err(|e| format!("Invalid sync root path: {}", e))?,
+            )
+            .map_err(|e| format!("Failed to register sync root: {}", e))?;
+
+        Session::new()
+            .connect(client_root, filter)
+            .map_err(|e| format!("Failed to connect sync filter: {}", e))
+    }
+
+    /// Disconnect the sync root session. Does NOT unregister — placeholders survive.
+    /// Call `unregister()` separately to fully remove the sync root.
     pub fn stop(&mut self) {
         log::info!("[sync] Stopping sync root '{}'", self.mount_id);
+
+        // Update last_connected timestamp before stopping
+        self.cache.update_last_connected();
 
         // Stop write-through first (cancels pending uploads)
         if let Some(mut wt) = self.write_through.take() {
@@ -171,24 +206,27 @@ impl SyncRoot {
             watcher.stop();
         }
 
-        // Drop the connection (disconnects CF session)
+        // Drop the connection (disconnects CF session — but registration persists!)
         self._connection.take();
 
-        // Unregister
+        log::info!("[sync] Sync root '{}' stopped (registration preserved)", self.mount_id);
+    }
+
+    /// Fully remove the sync root registration. Only call when user disables sync.
+    pub fn unregister(mount_id: &str) {
         let sync_root_id = SyncRootIdBuilder::new(PROVIDER_NAME)
             .user_security_id(SecurityId::current_user().unwrap())
-            .account_name(&self.mount_id)
+            .account_name(mount_id)
             .build();
 
         if let Err(e) = sync_root_id.unregister() {
             log::warn!(
                 "[sync] Failed to unregister sync root '{}': {}",
-                self.mount_id,
-                e
+                mount_id, e
             );
+        } else {
+            log::info!("[sync] Sync root '{}' unregistered", mount_id);
         }
-
-        log::info!("[sync] Sync root '{}' stopped", self.mount_id);
     }
 
     /// Get shared connectivity state for the orchestrator.
