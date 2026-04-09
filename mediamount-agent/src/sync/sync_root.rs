@@ -4,10 +4,12 @@ use cloud_filter::root::{
     HydrationPolicy, HydrationType, PopulationType, SecurityId, Session, SyncRootIdBuilder,
     SyncRootInfo,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use super::cache::CacheIndex;
 use super::connectivity::NasConnectivity;
 use super::filter::NasSyncFilter;
 use super::watcher::NasWatcher;
@@ -28,6 +30,8 @@ pub struct SyncRoot {
     nas_watcher: Option<Arc<NasWatcher>>,
     /// Shared connectivity state — read by all components, driven by orchestrator heartbeat.
     connectivity: Arc<NasConnectivity>,
+    /// Cache index for LRU eviction.
+    cache: Arc<CacheIndex>,
 }
 
 impl SyncRoot {
@@ -37,6 +41,7 @@ impl SyncRoot {
         display_name: &str,
         nas_root: PathBuf,
         client_root: PathBuf,
+        cache_limit_bytes: u64,
     ) -> Result<Self, String> {
         // Ensure client directory exists
         fs::create_dir_all(&client_root)
@@ -88,17 +93,39 @@ impl SyncRoot {
         // Shared state
         let echo = Arc::new(EchoSuppressor::new());
         let connectivity = Arc::new(NasConnectivity::new());
+        let open_handles = Arc::new(Mutex::new(HashMap::new()));
+
+        // Cache index (SQLite, per-mount)
+        let (cache_index, needs_repair) = CacheIndex::open(
+            &client_root,
+            mount_id,
+            cache_limit_bytes,
+            open_handles.clone(),
+        );
+        let cache = Arc::new(cache_index);
+
+        // If DB was corrupt or missing, rebuild (dehydrate all if corrupt)
+        if needs_repair {
+            cache.rebuild(true); // dehydrate all — can't trust stale data
+        } else {
+            // Check if DB is empty (first run or was cleared)
+            if cache.total_cached_bytes() == 0 {
+                cache.rebuild(false); // just scan and index, don't dehydrate
+            }
+        }
 
         // Create watcher (shared between filter and SyncRoot for clean shutdown)
         let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
 
-        // Connect the filter (gets connectivity for hydration retry)
+        // Connect the filter
         let filter = NasSyncFilter::new(
             nas_root.clone(),
             client_root.clone(),
             watcher.clone(),
             echo.clone(),
             connectivity.clone(),
+            cache.clone(),
+            open_handles,
         );
 
         // Start the NAS watcher before connecting (so it's ready for callbacks)
@@ -126,6 +153,7 @@ impl SyncRoot {
             write_through: Some(write_through),
             nas_watcher: Some(watcher),
             connectivity,
+            cache,
         })
     }
 
@@ -180,6 +208,11 @@ impl SyncRoot {
         if let Some(ref w) = self.nas_watcher {
             w.restart();
         }
+    }
+
+    /// Clear all cached (hydrated) data for this mount.
+    pub fn clear_cache(&self) -> (u32, u64) {
+        self.cache.clear_all()
     }
 
     /// Get the current sync activity summary for UI display.

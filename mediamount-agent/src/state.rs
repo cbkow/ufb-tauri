@@ -47,6 +47,9 @@ pub enum MountEvent {
 
     // State query
     RequestStateUpdate,
+
+    // Cache management
+    ClearSyncCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]

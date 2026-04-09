@@ -753,3 +753,36 @@ Fix: dispatch to main UI thread via `app.run_on_main_thread()` (same pattern as 
 blocking thread pool doesn't have OLE initialized.
 
 **macOS equivalent:** Already uses `app.run_on_main_thread()` — no issue on macOS.
+
+### Cache eviction design (2026-04-09)
+
+**Goal:** Per-mount configurable cache budget with LRU eviction.
+
+**Architecture:** SQLite DB per mount (`{sync_root}/.cache_index.db`) tracks hydrated files
+(path, size, last-access timestamp). After each hydration: check budget → evict LRU to 80%
+of limit. Dehydration via `cloud_filter::ext::file::FileExt::dehydrate(..)` which calls
+`CfDehydratePlaceholder`. Skip files with open handles. Rebuild DB from filesystem attributes
+on startup if missing.
+
+**Manual clear:** "Clear Cache" button in Settings — DB-driven, no filesystem walk. SELECT all
+paths from cache_index, DELETE all rows, dehydrate each file. Fast and targeted.
+
+**Key decisions:**
+- Evict after each hydration (no timer). Simple and immediate.
+- Evict to 80% of limit (not exactly 100%) to avoid thrashing with large VFX files.
+- DB per-mount (not shared) — natural partitioning, clear = DELETE FROM cache_index.
+- `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` check for rebuild — cheap, no file opens.
+- OS auto-dehydration (`AutoDehydrationAllowed`) remains as a safety net independent of our budget.
+
+**Manual clear:** Two levels — per-mount "Clear Cache" button and global "Clear All Cache".
+Both DB-driven (SELECT paths, DELETE all, dehydrate each — no filesystem walk needed).
+Modal progress UI blocks interaction during clear, shows file count progress.
+
+**Damaged DB self-heal:** On corruption (SQLITE_CORRUPT, SQLITE_NOTADB, integrity_check fail):
+delete DB → create fresh → dehydrate ALL hydrated files (nuclear but safe, can't trust stale
+tracking) → rebuild empty index. Automatic on startup. Emits progress events to frontend
+for a "Repairing cache..." modal. No user intervention needed.
+
+**macOS equivalent:** FileProvider manages eviction via `NSFileProviderManager.evictItem()`.
+Same SQLite cache index can track hydrated items. The eviction policy (LRU, budget) is
+cross-platform logic in Rust.

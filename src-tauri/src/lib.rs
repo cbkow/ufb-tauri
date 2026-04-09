@@ -250,6 +250,7 @@ pub fn run() {
             commands::mount_delete_credentials,
             commands::mount_hide_drives,
             commands::mount_unhide_drives,
+            commands::mount_clear_sync_cache,
             // App lifecycle
             commands::relaunch_app,
             // Platform

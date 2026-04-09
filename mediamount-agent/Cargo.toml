@@ -26,6 +26,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

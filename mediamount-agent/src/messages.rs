@@ -46,6 +46,7 @@ pub enum UfbToAgent {
     StartMount(MountIdMsg),
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
+    ClearSyncCache(MountIdMsg),
     ReloadConfig,
     GetStates,
     Ping,

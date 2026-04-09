@@ -52,6 +52,7 @@ pub enum UfbToAgent {
     StartMount(MountIdMsg),
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
+    ClearSyncCache(MountIdMsg),
     ReloadConfig,
     GetStates,
     Ping,
@@ -96,6 +97,8 @@ pub struct MountConfig {
     pub sync_enabled: bool,
     #[serde(default)]
     pub sync_root_path: Option<String>,
+    #[serde(default)]
+    pub sync_cache_limit_bytes: u64,
 
     // Legacy fields — kept for backwards compat with existing config files
     #[serde(default)]

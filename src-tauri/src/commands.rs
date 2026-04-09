@@ -1038,6 +1038,24 @@ pub async fn get_thumbnail(
     }
 }
 
+// ── Sync Cache ──
+
+#[tauri::command]
+pub async fn mount_clear_sync_cache(
+    state: State<'_, AppState>,
+    mount_id: String,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::ClearSyncCache(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: String::new(),
+            },
+        ))
+        .await
+}
+
 // ── System Icons ──
 
 /// Get the OS-native file type icon as a base64-encoded PNG data URL.

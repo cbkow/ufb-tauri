@@ -16,6 +16,8 @@ mod watcher;
 #[cfg(windows)]
 pub mod write_through;
 #[cfg(windows)]
+pub mod cache;
+#[cfg(windows)]
 pub mod connectivity;
 
 #[cfg(windows)]

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::watcher::NasWatcher;
+use super::cache::CacheIndex;
 use super::connectivity::{is_network_error, NasConnectivity};
 use super::write_through::EchoSuppressor;
 
@@ -27,6 +28,7 @@ pub struct NasSyncFilter {
     pub watcher: Arc<NasWatcher>,
     pub echo: Arc<EchoSuppressor>,
     pub connectivity: Arc<NasConnectivity>,
+    pub cache: Arc<CacheIndex>,
     pub open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
 }
 
@@ -37,6 +39,8 @@ impl NasSyncFilter {
         watcher: Arc<NasWatcher>,
         echo: Arc<EchoSuppressor>,
         connectivity: Arc<NasConnectivity>,
+        cache: Arc<CacheIndex>,
+        open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
     ) -> Self {
         Self {
             nas_root,
@@ -44,7 +48,8 @@ impl NasSyncFilter {
             watcher,
             echo,
             connectivity,
-            open_handles: Arc::new(Mutex::new(HashMap::new())),
+            cache,
+            open_handles,
         }
     }
 
@@ -246,6 +251,9 @@ impl SyncFilter for NasSyncFilter {
             speed_mbps
         );
 
+        // Track in cache index for LRU eviction
+        self.cache.record_hydration(&request.path(), total_written);
+
         Ok(())
     }
 
@@ -294,6 +302,9 @@ impl SyncFilter for NasSyncFilter {
             let _ = fs::rename(&nas_src, &nas_dst);
         }
 
+        // Update cache index path
+        self.cache.rename_entry(&request.path(), &info.target_path());
+
         let _ = ticket.pass();
         Ok(())
     }
@@ -308,6 +319,8 @@ impl SyncFilter for NasSyncFilter {
         let relative = self.relative_path(&request.path());
         log::debug!("[sync] DEHYDRATE {:?}", relative);
         let _ = ticket.pass();
+        // Remove from cache index
+        self.cache.record_dehydration(&request.path());
         Ok(())
     }
 
@@ -315,7 +328,10 @@ impl SyncFilter for NasSyncFilter {
     fn opened(&self, request: Request, _info: info::Opened) {
         let path = request.path();
         let mut handles = self.open_handles.lock().unwrap();
-        *handles.entry(path).or_insert(0) += 1;
+        *handles.entry(path.clone()).or_insert(0) += 1;
+        drop(handles);
+        // LRU refresh
+        self.cache.touch(&path);
     }
 
     /// Track file closes. When refcount hits 0, apply any deferred NAS updates.

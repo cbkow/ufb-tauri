@@ -1,6 +1,6 @@
 import { createSignal, createResource, createMemo, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare, mountClearSyncCache } from "../../lib/tauri";
 import type { CredentialInfo } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
@@ -1052,6 +1052,68 @@ function MountsSection(props: {
                 <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)" }}>
                   Sync root: {mountStore.getMountPath(m()!) || "(auto)"}
                 </p>
+
+                <div class="settings-field">
+                  <div class="settings-field-header">
+                    <span>Cache Limit</span>
+                    <span class="settings-help" title="Maximum local disk space for cached (hydrated) files. Oldest files are evicted when over budget. Set to 0 for unlimited.">?</span>
+                  </div>
+                  <div style={{ display: "flex", gap: "var(--spacing-sm)", "align-items": "center" }}>
+                    <select
+                      class="settings-select"
+                      value={(() => {
+                        const v = m().syncCacheLimitBytes ?? 0;
+                        const presets = [0, 10e9, 25e9, 50e9, 100e9, 200e9, 500e9];
+                        return presets.includes(v) ? String(v) : "custom";
+                      })()}
+                      onChange={(e) => {
+                        const val = e.currentTarget.value;
+                        if (val !== "custom") {
+                          updateField("syncCacheLimitBytes", Number(val));
+                        }
+                      }}
+                    >
+                      <option value="0">Unlimited</option>
+                      <option value="10000000000">10 GB</option>
+                      <option value="25000000000">25 GB</option>
+                      <option value="50000000000">50 GB</option>
+                      <option value="100000000000">100 GB</option>
+                      <option value="200000000000">200 GB</option>
+                      <option value="500000000000">500 GB</option>
+                      <option value="custom">Custom...</option>
+                    </select>
+                    <Show when={(() => {
+                      const v = m().syncCacheLimitBytes ?? 0;
+                      return ![0, 10e9, 25e9, 50e9, 100e9, 200e9, 500e9].includes(v) || false;
+                    })()}>
+                      <SettingsInput
+                        value={String(Math.round((m().syncCacheLimitBytes ?? 0) / 1e9))}
+                        placeholder="GB"
+                        onCommit={(v) => {
+                          const gb = parseFloat(v);
+                          if (!isNaN(gb) && gb >= 0) {
+                            updateField("syncCacheLimitBytes", Math.round(gb * 1e9));
+                          }
+                        }}
+                      />
+                      <span class="settings-hint-inline">GB</span>
+                    </Show>
+                  </div>
+                </div>
+
+                <button
+                  class="settings-btn"
+                  style={{ "margin-top": "var(--spacing-sm)" }}
+                  onClick={async () => {
+                    if (confirm("Clear all cached data for this mount? Files will re-download on next access.")) {
+                      try {
+                        await mountClearSyncCache(m().id);
+                      } catch (e) {
+                        console.error("Failed to clear cache:", e);
+                      }
+                    }
+                  }}
+                >Clear Cache</button>
               </Show>
             </Show>
 

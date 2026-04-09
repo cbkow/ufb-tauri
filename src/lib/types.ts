@@ -273,6 +273,7 @@ export interface MountConfig {
   isJobsFolder: boolean;
   syncEnabled?: boolean;
   syncRootPath?: string;
+  syncCacheLimitBytes?: number;
 }
 
 export interface MountsConfig {

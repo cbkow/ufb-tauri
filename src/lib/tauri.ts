@@ -251,6 +251,11 @@ export const transcodeClearCompleted = () =>
 export const getSystemIcon = (extension: string, size: number = 32) =>
   invoke<string | null>("get_system_icon", { extension, size });
 
+// ── Sync Cache ──
+
+export const mountClearSyncCache = (mountId: string) =>
+  invoke<void>("mount_clear_sync_cache", { mountId });
+
 // ── Mount (MediaMount Agent) ──
 
 export const mountGetStates = () =>

@@ -84,6 +84,17 @@ impl Orchestrator {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     match event {
+                        Some(MountEvent::ClearSyncCache) => {
+                            #[cfg(windows)]
+                            if let Some(ref sr) = self.sync_root {
+                                let (count, bytes) = sr.clear_cache();
+                                log::info!(
+                                    "[{}] Cache cleared: {} files, {:.1} MB",
+                                    self.mount_id, count,
+                                    bytes as f64 / (1024.0 * 1024.0)
+                                );
+                            }
+                        }
                         Some(event) => {
                             self.handle_event(event).await;
 
@@ -403,8 +414,9 @@ impl Orchestrator {
         let nas_root = std::path::PathBuf::from(&self.config.nas_share_path);
         let client_root = self.config.sync_root_dir();
 
+        let cache_limit = self.config.sync_cache_limit_bytes;
         let result = tokio::task::spawn_blocking(move || {
-            crate::sync::SyncRoot::start(&mid, &display_name, nas_root, client_root)
+            crate::sync::SyncRoot::start(&mid, &display_name, nas_root, client_root, cache_limit)
         })
         .await
         .unwrap_or_else(|e| Err(format!("SyncRoot::start task panicked: {}", e)));
