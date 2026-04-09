@@ -682,6 +682,7 @@ name = "mediamount-agent"
 version = "0.2.5"
 dependencies = [
  "cloud-filter",
+ "crossbeam-channel",
  "gtk",
  "image",
  "libc",

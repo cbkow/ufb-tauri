@@ -82,7 +82,7 @@ impl SyncRoot {
         let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
 
         // Connect the filter
-        let filter = NasSyncFilter::new(nas_root.clone(), client_root.clone(), watcher.clone());
+        let filter = NasSyncFilter::new(nas_root.clone(), client_root.clone(), watcher.clone(), echo.clone());
 
         // Start the NAS watcher before connecting (so it's ready for callbacks)
         watcher.start();

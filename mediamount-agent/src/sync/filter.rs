@@ -24,16 +24,19 @@ pub struct NasSyncFilter {
     pub nas_root: PathBuf,
     pub client_root: PathBuf,
     pub watcher: Arc<NasWatcher>,
+    /// Echo suppression — shared with NAS watcher to prevent duplicate operations.
+    pub echo: Arc<EchoSuppressor>,
     /// Tracks open file handles for deferred NAS updates.
     pub open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
 }
 
 impl NasSyncFilter {
-    pub fn new(nas_root: PathBuf, client_root: PathBuf, watcher: Arc<NasWatcher>) -> Self {
+    pub fn new(nas_root: PathBuf, client_root: PathBuf, watcher: Arc<NasWatcher>, echo: Arc<EchoSuppressor>) -> Self {
         Self {
             nas_root,
             client_root,
             watcher,
+            echo,
             open_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -228,12 +231,18 @@ impl SyncFilter for NasSyncFilter {
     ) -> CResult<()> {
         let relative = self.relative_path(&request.path());
         let nas_path = self.nas_path(&relative);
-        log::info!("[sync] DELETE {:?}", relative);
+
+        // Suppress so NAS watcher doesn't try to remove the placeholder too
+        self.echo.suppress(nas_path.clone());
 
         if nas_path.is_dir() {
+            log::info!("[sync] DELETE dir {:?}", relative);
             let _ = fs::remove_dir_all(&nas_path);
         } else if nas_path.exists() {
+            log::info!("[sync] DELETE {:?}", relative);
             let _ = fs::remove_file(&nas_path);
+        } else {
+            log::debug!("[sync] DELETE {:?} (already gone)", relative);
         }
 
         let _ = ticket.pass();

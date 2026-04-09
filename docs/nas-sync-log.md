@@ -668,3 +668,88 @@ Parts Windows-only (need macOS equivalents):
   - sync_root.rs → NSFileProviderDomain registration
   - Placeholder conversion → FileProvider materialization/completion handlers
 ```
+
+### 10. NAS watcher: 0-byte placeholders during batch copy (2026-04-09)
+When files are copied to the NAS in a batch, Synology sends ADDED events sequentially.
+The first file in the batch may still be 0 bytes when the second file's ADDED fires.
+Synology does NOT reliably send MODIFIED after the copy completes for all files.
+
+**Solution: belt-and-suspenders.**
+- Added `FILE_NOTIFY_CHANGE_LAST_WRITE` to the watcher filter (catches some MODIFIED events)
+- MODIFIED handler does delete+recreate (not CfUpdatePlaceholder, which silently fails on 0-byte placeholders via Win32 handles)
+- Deferred fallback: spawns a thread that polls the NAS file at increasing intervals (2s, 3s, 5s, 10s, 15s, 30s), delete+recreate when non-zero
+- Whichever mechanism fires first (MODIFIED event or deferred poll) fixes the placeholder
+
+**Key finding: `CfUpdatePlaceholder` silently fails on 0-byte placeholders.**
+The API returns Ok but the size doesn't change in Explorer. Delete+recreate (`fs::remove_file` + `PlaceholderFile::create`) is the reliable approach.
+
+**macOS equivalent:** FileProvider handles this differently — `signalEnumerator` triggers
+re-enumeration, and the system fetches fresh metadata. No 0-byte race condition because
+FileProvider's `enumerateItems` is called by the system, not triggered by individual events.
+
+### 11. Echo suppression for deletes (2026-04-09)
+When a user deletes from the sync root, the CF API delete callback removes the NAS file.
+The NAS watcher then sees REMOVED and tries to remove the local placeholder — but the
+CF API is still processing the deletion. This race causes Explorer to show "file not found"
+dialogs repeatedly.
+
+Fix: the CF API delete callback suppresses the NAS path via EchoSuppressor before deleting.
+The NAS watcher checks suppression on REMOVED events (same as it does for ADDED).
+
+**macOS equivalent:** FileProvider's `deleteItem` callback handles both sides. The system
+manages the local materialization state. No watcher race condition expected.
+
+### 12. NAS watcher trailing backslash on UNC root (2026-04-09)
+`Path::parent()` on `\\server\share\file` returns `\\server\share\` (with trailing backslash).
+But the watched folder map stores `\\server\share` (no trailing backslash) from FETCH_PLACEHOLDERS.
+Root-level file events never matched — all watcher events for root files were silently dropped.
+
+Fix: normalize parent path by stripping trailing separator before map lookup.
+
+**macOS equivalent:** Not applicable — FSEvents uses forward-slash paths without trailing
+separator ambiguity.
+
+### 13. Upload worker pool (2026-04-09)
+Upgraded from single upload worker thread to 3 concurrent workers via `crossbeam-channel`.
+Workers share a single multi-consumer receiver. The coordinator dispatches jobs to whichever
+worker is free. All workers share the same EchoSuppressor and result_tx.
+
+**macOS equivalent:** Same architecture applies — the worker pool is pure Rust/crossbeam,
+platform-agnostic. Only the coordinator→worker channel type changed.
+
+### 14. Credential session sharing (2026-04-09)
+Multiple mounts to the same NAS server caused SMB credential conflicts (ERROR 1219) even
+with the same credentials, because Windows treats each WNetAddConnection2W call with
+explicit credentials as a new session attempt.
+
+Fix: shared `Arc<Mutex<HashSet<String>>>` of connected server hostnames across all
+orchestrators. First mount to a server authenticates; subsequent mounts skip credential
+lookup and pass null credentials to reuse the existing session.
+
+Also handle the 85→1219 sequence: drive letter already assigned → disconnect → retry with
+credentials → credential conflict → retry with null credentials to reuse session.
+
+**macOS equivalent:** macOS kernel handles SMB session sharing automatically. No explicit
+tracking needed.
+
+### 15. System file type icons (2026-04-09)
+Added OS-native file type icons to the Tauri app's file browser (both list and grid views).
+- Backend: `system_icons.rs` — `SHGetFileInfoW` with `SHGFI_USEFILEATTRIBUTES` → HICON → BGRA → RGBA → PNG
+- Frontend: `systemIconCache.ts` (deduped Promise cache by extension) + `FileTypeIcon` component
+- Priority: thumbnail (grid only) → system icon → Material Symbols fallback
+- Folder icons supported via `FILE_ATTRIBUTE_DIRECTORY` flag
+- Backend caches by extension in `RwLock<HashMap>`
+
+**macOS equivalent:** `NSWorkspace.icon(forFileType:)` → NSImage → PNG. Same frontend
+cache and component. Backend needs `objc2` bindings for NSWorkspace/NSImage.
+
+### 16. Drag-drop freeze fix (2026-04-09)
+Windows `DoDragDrop()` is a blocking call that pumps its own message loop. Calling it from
+an `async fn` blocked the entire Tauri async runtime, freezing all system drag operations.
+
+Fix: dispatch to main UI thread via `app.run_on_main_thread()` (same pattern as macOS).
+`DoDragDrop` runs safely on the main thread because it pumps its own message loop.
+`spawn_blocking` didn't work because `OleInitialize` uses per-process `Once` — the
+blocking thread pool doesn't have OLE initialized.
+
+**macOS equivalent:** Already uses `app.run_on_main_thread()` — no issue on macOS.

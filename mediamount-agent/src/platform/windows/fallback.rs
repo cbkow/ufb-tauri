@@ -52,6 +52,16 @@ pub fn connect_drive(
             log::info!("Mapped {}:\\ → {} (after disconnect)", drive_letter, share_path);
             return Ok(());
         }
+        // After disconnect+retry, might hit credential conflict — try without creds
+        if retry == WIN32_ERROR(1219) {
+            let retry2 = unsafe {
+                WNetAddConnection2W(&nr, PCWSTR::null(), PCWSTR::null(), NET_CONNECT_FLAGS(0))
+            };
+            if retry2 == WIN32_ERROR(0) {
+                log::info!("Mapped {}:\\ → {} (reusing session, after disconnect)", drive_letter, share_path);
+                return Ok(());
+            }
+        }
         return Err(format!(
             "WNetAddConnection2W retry failed for {}:\\ → {}: error {:?}",
             drive_letter, share_path, retry

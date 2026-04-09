@@ -73,7 +73,7 @@ pub struct WriteThrough {
     /// HANDLE is just an opaque Win32 identifier, safe to use from any thread.
     client_dir_handle: Arc<AtomicUsize>,
     watcher_thread: Option<std::thread::JoinHandle<()>>,
-    worker_thread: Option<std::thread::JoinHandle<()>>,
+    worker_threads: Vec<std::thread::JoinHandle<()>>,
     coordinator_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -90,9 +90,9 @@ impl WriteThrough {
 
         // Client watcher → coordinator
         let (event_tx, event_rx) = mpsc::channel::<ClientFsEvent>(256);
-        // Coordinator → upload worker
-        let (job_tx, job_rx) = std::sync::mpsc::channel::<UploadJob>();
-        // Upload worker → coordinator
+        // Coordinator → upload worker pool (crossbeam for multi-consumer)
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<UploadJob>();
+        // Upload workers → coordinator
         let (result_tx, result_rx) = mpsc::channel::<UploadResult>(64);
 
         let watcher_thread = client_watcher::start(
@@ -102,7 +102,7 @@ impl WriteThrough {
             client_dir_handle.clone(),
         );
 
-        let worker_thread = worker::start(job_rx, result_tx, echo.clone());
+        let worker_threads = worker::start_pool(job_rx, result_tx, echo.clone());
 
         let handle = tokio::runtime::Handle::current();
         let cr = client_root.clone();
@@ -121,7 +121,7 @@ impl WriteThrough {
             shutdown,
             client_dir_handle,
             watcher_thread: Some(watcher_thread),
-            worker_thread: Some(worker_thread),
+            worker_threads,
             coordinator_task: Some(coordinator_task),
         }
     }
@@ -146,23 +146,25 @@ impl WriteThrough {
         }
 
         // Wait for threads (with timeout — don't block shutdown)
-        for (name, thread) in [
-            ("client-watcher", self.watcher_thread.take()),
-            ("upload-worker", self.worker_thread.take()),
-        ] {
-            if let Some(t) = thread {
-                let start = std::time::Instant::now();
-                loop {
-                    if t.is_finished() {
-                        let _ = t.join();
-                        break;
-                    }
-                    if start.elapsed() > std::time::Duration::from_secs(3) {
-                        log::warn!("[write-through] {} thread join timed out", name);
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut threads: Vec<(&str, std::thread::JoinHandle<()>)> = Vec::new();
+        if let Some(t) = self.watcher_thread.take() {
+            threads.push(("client-watcher", t));
+        }
+        for t in self.worker_threads.drain(..) {
+            threads.push(("upload-worker", t));
+        }
+        for (name, t) in threads {
+            let start = std::time::Instant::now();
+            loop {
+                if t.is_finished() {
+                    let _ = t.join();
+                    break;
                 }
+                if start.elapsed() > std::time::Duration::from_secs(3) {
+                    log::warn!("[write-through] {} thread join timed out", name);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
 
@@ -190,7 +192,7 @@ async fn run_coordinator(
     client_root: PathBuf,
     nas_root: PathBuf,
     mut event_rx: mpsc::Receiver<ClientFsEvent>,
-    job_tx: std::sync::mpsc::Sender<UploadJob>,
+    job_tx: crossbeam_channel::Sender<UploadJob>,
     mut result_rx: mpsc::Receiver<UploadResult>,
     echo: Arc<EchoSuppressor>,
 ) {
@@ -262,7 +264,7 @@ fn check_deadlines(
     states: &mut HashMap<PathBuf, FileState>,
     client_root: &Path,
     nas_root: &Path,
-    job_tx: &std::sync::mpsc::Sender<UploadJob>,
+    job_tx: &crossbeam_channel::Sender<UploadJob>,
 ) {
     let now = tokio::time::Instant::now();
     let mut ready: Vec<PathBuf> = Vec::new();
@@ -426,7 +428,7 @@ fn to_nas_path(local: &Path, client_root: &Path, nas_root: &Path) -> PathBuf {
 async fn startup_recovery(
     client_root: &PathBuf,
     nas_root: &PathBuf,
-    job_tx: &std::sync::mpsc::Sender<UploadJob>,
+    job_tx: &crossbeam_channel::Sender<UploadJob>,
     _echo: &Arc<EchoSuppressor>,
 ) {
     let cr = client_root.clone();
@@ -446,7 +448,7 @@ async fn startup_recovery(
 fn do_startup_recovery(
     client_root: &Path,
     nas_root: &Path,
-    job_tx: &std::sync::mpsc::Sender<UploadJob>,
+    job_tx: &crossbeam_channel::Sender<UploadJob>,
 ) {
     let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
 
@@ -481,7 +483,7 @@ fn queue_non_placeholders(
     client_root: &Path,
     scan_dir: &Path,
     nas_root: &Path,
-    job_tx: &std::sync::mpsc::Sender<UploadJob>,
+    job_tx: &crossbeam_channel::Sender<UploadJob>,
 ) {
     let entries = match std::fs::read_dir(scan_dir) {
         Ok(e) => e,
@@ -500,8 +502,23 @@ fn queue_non_placeholders(
         if path.is_dir() {
             queue_non_placeholders(client_root, &path, nas_root, job_tx);
         } else if client_watcher::is_file(&path) {
+            let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let relative = path.strip_prefix(client_root).unwrap_or(Path::new(""));
             let nas_path = nas_root.join(relative);
+
+            // Don't upload 0-byte local files over non-empty NAS files —
+            // these are dehydrated placeholders that lost their reparse point.
+            if local_size == 0 {
+                let nas_size = std::fs::metadata(&nas_path).map(|m| m.len()).unwrap_or(0);
+                if nas_size > 0 {
+                    log::info!(
+                        "[write-through] Skipping 0-byte local file (NAS has {} bytes): {:?}",
+                        nas_size, relative
+                    );
+                    continue;
+                }
+            }
+
             let (_cancel_tx, cancel_rx) = oneshot::channel();
             let job = UploadJob {
                 local_path: path,

@@ -41,24 +41,35 @@ pub enum UploadResult {
     },
 }
 
-/// Start the upload worker on a dedicated thread.
-pub fn start(
-    rx: std::sync::mpsc::Receiver<UploadJob>,
+/// Number of concurrent upload worker threads.
+/// 3-4 saturates typical NAS disk I/O without overwhelming spinning disks.
+pub const WORKER_COUNT: usize = 3;
+
+/// Start N upload workers on dedicated threads sharing a crossbeam channel.
+pub fn start_pool(
+    rx: crossbeam_channel::Receiver<UploadJob>,
     result_tx: mpsc::Sender<UploadResult>,
     echo: Arc<EchoSuppressor>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("upload-worker".into())
-        .spawn(move || {
-            for job in rx {
-                let result = process_upload(job, &echo);
-                if result_tx.blocking_send(result).is_err() {
-                    break;
-                }
-            }
-            log::info!("[write-through] Upload worker exiting");
+) -> Vec<std::thread::JoinHandle<()>> {
+    (0..WORKER_COUNT)
+        .map(|i| {
+            let rx = rx.clone();
+            let result_tx = result_tx.clone();
+            let echo = echo.clone();
+            std::thread::Builder::new()
+                .name(format!("upload-worker-{}", i))
+                .spawn(move || {
+                    for job in rx {
+                        let result = process_upload(job, &echo);
+                        if result_tx.blocking_send(result).is_err() {
+                            break;
+                        }
+                    }
+                    log::info!("[write-through] Upload worker {} exiting", i);
+                })
+                .expect("Failed to spawn upload worker thread")
         })
-        .expect("Failed to spawn upload worker thread")
+        .collect()
 }
 
 fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {

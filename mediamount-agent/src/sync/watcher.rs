@@ -14,7 +14,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE,
     FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
@@ -138,7 +139,8 @@ fn run_watcher_loop(
     let mut buffer = vec![0u8; 16384];
     let mut bytes_returned: u32 = 0;
     let filter =
-        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE;
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE
+            | FILE_NOTIFY_CHANGE_LAST_WRITE;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -211,10 +213,10 @@ fn process_events(
             unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_len) };
         let relative_str = String::from_utf16_lossy(name_slice);
 
-        // Skip Synology internal paths
+        // Skip Synology internal paths and write-through temp files
         if relative_str
             .split('\\')
-            .any(|c| c.starts_with('@') || c.starts_with('#'))
+            .any(|c| c.starts_with('@') || c.starts_with('#') || c.contains(".~sync."))
         {
             if info.NextEntryOffset == 0 {
                 break;
@@ -224,7 +226,17 @@ fn process_events(
         }
 
         let nas_path = nas_root.join(&relative_str);
-        let parent_nas = nas_path.parent().unwrap_or(nas_root);
+        // Normalize parent: strip trailing backslash for consistent map lookup.
+        // Path::parent() on UNC paths like \\server\share\file returns \\server\share\
+        // but the watched map stores \\server\share (no trailing separator).
+        let raw_parent = nas_path.parent().unwrap_or(nas_root);
+        let parent_str = raw_parent.to_string_lossy();
+        let parent_nas = if parent_str.ends_with('\\') || parent_str.ends_with('/') {
+            PathBuf::from(parent_str.trim_end_matches(|c| c == '\\' || c == '/'))
+        } else {
+            raw_parent.to_path_buf()
+        };
+        let parent_nas = parent_nas.as_path();
         let file_name = nas_path
             .file_name()
             .unwrap_or_default()
@@ -266,12 +278,18 @@ fn process_events(
                 }
                 2 | 4 => {
                     // FILE_ACTION_REMOVED or FILE_ACTION_RENAMED_OLD — remove placeholder
-                    log::debug!("[sync-watcher] {} {}", action_name, relative_str);
-                    remove_placeholder(&client_dir, &file_name, &relative_str);
+                    if echo.is_suppressed(&nas_path) {
+                        log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
+                    } else {
+                        log::debug!("[sync-watcher] {} {}", action_name, relative_str);
+                        remove_placeholder(&client_dir, &file_name, &relative_str);
+                    }
                 }
                 3 => {
-                    // FILE_ACTION_MODIFIED — could update metadata, skip for now
-                    log::debug!("[sync-watcher] MODIFIED {}", relative_str);
+                    // FILE_ACTION_MODIFIED — update placeholder metadata (file size)
+                    if !echo.is_suppressed(&nas_path) {
+                        update_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
+                    }
                 }
                 _ => {}
             }
@@ -302,11 +320,24 @@ fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display
             .mark_in_sync()
             .blob(blob);
         match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
-            Ok(_) => log::debug!("[sync-watcher] + {}", display),
+            Ok(_) => {
+                log::debug!("[sync-watcher] + {} ({})", display, meta.len());
+                // 0-byte placeholder — NAS might not send MODIFIED reliably.
+                // Poll for the real size as a fallback.
+                if !meta.is_dir() && meta.len() == 0 {
+                    let nas = nas_path.to_path_buf();
+                    let client = client_dir.join(file_name);
+                    let name = display.to_string();
+                    std::thread::spawn(move || {
+                        deferred_size_update(&nas, &client, &name);
+                    });
+                }
+            }
             Err(e) => log::warn!("[sync-watcher] Failed to create placeholder {}: {}", display, e),
         }
     }
 }
+
 
 fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str) {
     let client_path = client_dir.join(file_name);
@@ -321,8 +352,80 @@ fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str) {
     };
     match result {
         Ok(()) => log::debug!("[sync-watcher] - {}", display),
-        Err(e) => log::warn!("[sync-watcher] Failed to remove placeholder {}: {}", display, e),
+        // Access denied / not found is expected — the CF API delete callback
+        // may have already removed it, or it's still being processed.
+        Err(e) => log::debug!("[sync-watcher] Remove skipped {}: {}", display, e),
     }
+}
+
+fn update_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str) {
+    let client_path = client_dir.join(file_name);
+    if !client_path.exists() || client_path.is_dir() {
+        return;
+    }
+
+    let nas_size = match fs::metadata(nas_path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+
+    if nas_size == 0 {
+        return;
+    }
+
+    // Delete and recreate — CfUpdatePlaceholder doesn't reliably update
+    // size on 0-byte placeholders via Win32 handles.
+    let _ = fs::remove_file(&client_path);
+    let blob = nas_path.to_string_lossy().as_bytes().to_vec();
+    let cf_meta = Metadata::file().size(nas_size);
+    let placeholder = PlaceholderFile::new(file_name)
+        .metadata(cf_meta)
+        .mark_in_sync()
+        .blob(blob);
+    match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
+        Ok(_) => log::info!("[sync-watcher] ~ {} ({})", display, nas_size),
+        Err(e) => log::debug!("[sync-watcher] Update failed {}: {}", display, e),
+    }
+}
+
+/// Fallback for 0-byte placeholders: poll NAS until the file has data, then update.
+/// Used when Synology doesn't reliably send MODIFIED after a batch copy.
+fn deferred_size_update(nas_path: &Path, client_path: &Path, display: &str) {
+    let parent = match client_path.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    let file_name = match client_path.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return,
+    };
+
+    // Poll at increasing intervals up to ~65s total
+    for delay_ms in [2000, 3000, 5000, 10000, 15000, 30000] {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if !client_path.exists() {
+            return; // Placeholder was removed
+        }
+        if let Ok(meta) = fs::metadata(nas_path) {
+            if meta.len() > 0 {
+                // Delete the 0-byte placeholder and recreate with correct size.
+                // CfUpdatePlaceholder doesn't reliably update size on 0-byte placeholders.
+                let _ = fs::remove_file(client_path);
+                let blob = nas_path.to_string_lossy().as_bytes().to_vec();
+                let cf_meta = Metadata::file().size(meta.len());
+                let placeholder = PlaceholderFile::new(&file_name)
+                    .metadata(cf_meta)
+                    .mark_in_sync()
+                    .blob(blob);
+                match placeholder.create::<PathBuf>(parent) {
+                    Ok(_) => log::info!("[sync-watcher] Recreated placeholder: {} ({})", display, meta.len()),
+                    Err(e) => log::warn!("[sync-watcher] Failed to recreate placeholder {}: {}", display, e),
+                }
+                return;
+            }
+        }
+    }
+    log::debug!("[sync-watcher] Deferred update gave up: {}", display);
 }
 
 /// Full readdir + diff on all watched folders. Used when the event buffer overflows.
