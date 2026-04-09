@@ -690,6 +690,7 @@ function defaultMountConfig(): MountConfig {
     smbMountPath: "",
     mountPathLinux: "",
     isJobsFolder: true,
+    syncEnabled: false,
   };
 }
 
@@ -749,8 +750,8 @@ function MountsSection(props: {
     if (!m.nasSharePath.trim()) return true;
     // Duplicate ID check (only when adding new)
     if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id)) return true;
-    // Duplicate drive letter (Windows, excluding self when editing)
-    if (props.platform() === "win" && m.mountDriveLetter) {
+    // Duplicate drive letter (Windows, excluding self when editing, skip sync mounts)
+    if (props.platform() === "win" && m.mountDriveLetter && !m.syncEnabled) {
       const dup = props.mountConfig().mounts.some(
         (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
       );
@@ -766,7 +767,7 @@ function MountsSection(props: {
     if (!m.nasSharePath.trim()) return "NAS share path is required";
     if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id))
       return "A mount with this ID already exists";
-    if (props.platform() === "win" && m.mountDriveLetter) {
+    if (props.platform() === "win" && m.mountDriveLetter && !m.syncEnabled) {
       const dup = props.mountConfig().mounts.some(
         (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
       );
@@ -958,7 +959,9 @@ function MountsSection(props: {
                   title={cfg.enabled ? "Auto-connects on agent start" : "Does not auto-connect"}
                 />
                 <span class="mount-config-name">{cfg.displayName || cfg.id}</span>
-                <span class="mount-config-detail">{cfg.nasSharePath} → {mountStore.getMountPath(cfg) || "(not set)"}</span>
+                <span class="mount-config-detail">
+                  {cfg.nasSharePath} → {cfg.syncEnabled ? "Sync" : mountStore.getMountPath(cfg) || "(not set)"}
+                </span>
               </div>
               <div class="mount-config-actions">
                 <button class="settings-btn" onClick={() => startEdit(cfg)}>Edit</button>
@@ -1028,6 +1031,30 @@ function MountsSection(props: {
               <span class="settings-hint-inline">Subfolders appear as subscribable jobs</span>
             </div>
 
+            {/* On-demand sync toggle — Windows only */}
+            <Show when={props.platform() === "win"}>
+              <div class="settings-row">
+                <label class="settings-toggle">
+                  <input
+                    type="checkbox"
+                    checked={m().syncEnabled ?? false}
+                    onChange={(e) => {
+                      const sync = e.currentTarget.checked;
+                      updateField("syncEnabled", sync);
+                      if (sync) updateField("mountDriveLetter", "");
+                    }}
+                  />
+                  <span>On-Demand Sync</span>
+                </label>
+                <span class="settings-hint-inline">Files appear locally as cloud placeholders, downloaded on access</span>
+              </div>
+              <Show when={m().syncEnabled}>
+                <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)" }}>
+                  Sync root: {mountStore.getMountPath(m()!) || "(auto)"}
+                </p>
+              </Show>
+            </Show>
+
             <h3>Network</h3>
 
             <div class="settings-field">
@@ -1085,8 +1112,8 @@ function MountsSection(props: {
               </Show>
             </div>
 
-            {/* Drive letter — Windows only */}
-            <Show when={props.platform() === "win"}>
+            {/* Drive letter — Windows only, hidden when sync enabled */}
+            <Show when={props.platform() === "win" && !m().syncEnabled}>
               <h3>Drive Letter</h3>
 
               <label class="settings-field">

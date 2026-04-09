@@ -433,3 +433,238 @@ policy affects whether the user sees a blocking dialog or a non-blocking toast.
 For VFX (large video files, limited local SSD): aggressive auto-dehydration + streaming
 + toast notifications for background re-hydration is likely the right combination.
 Needs hands-on testing with real workflow patterns.
+
+### Write-through implementation (2026-04-08)
+
+**Implemented: full write-through pipeline.**
+
+New module: `sync/write_through/` with three files:
+- `mod.rs` — EchoSuppressor, WriteThrough struct, async coordinator, placeholder conversion
+- `client_watcher.rs` — ReadDirectoryChangesW on local sync root, filters placeholders/temps
+- `worker.rs` — blocking upload thread, 4MB chunked SMB write, conflict detection
+
+**Architecture (as planned):**
+```
+Client watcher (blocking thread) → ClientFsEvent (mpsc, 256)
+  → Upload coordinator (async tokio task) → UploadJob (std::sync::mpsc)
+    → Upload worker (blocking thread) → UploadResult (mpsc, 64)
+      → Placeholder conversion (spawn_blocking)
+```
+
+**Key implementation details:**
+- Client watcher uses `GetFileAttributesW` + `FILE_ATTRIBUTE_REPARSE_POINT` to distinguish
+  regular files from CF placeholders — only regular files trigger uploads
+- Filters: `.~sync.` temp files, `~$` Office locks, `.tmp` files, `#`/`@` Synology noise
+- Per-path state machine: IDLE → DEBOUNCING(3s) → UPLOADING → placeholder conversion → IDLE
+- New MODIFIED event at any stage cancels active upload and resets to DEBOUNCING
+- Upload worker: writes to `.filename.~sync.HOSTNAME` temp file, conflict check via
+  pre/post mtime+size comparison, rename to final on success
+- Conflict files saved as `filename.conflict.HOSTNAME.TIMESTAMP`
+- Echo suppression: 5-second TTL HashSet shared between write-through and NAS watcher
+- NAS watcher checks echo suppressor before creating placeholders (prevents duplicates)
+- Placeholder conversion via `cloud_filter::placeholder::Placeholder::convert_to_placeholder()`
+  with `ConvertOptions::default().mark_in_sync().blob(nas_path_bytes)`
+- Startup recovery: cleans orphaned `.~sync.HOSTNAME` temp files on NAS, queues
+  non-placeholder files in sync root for upload
+- Clean shutdown: `CancelIoEx` on client watcher handle (stored as `AtomicUsize` for
+  Send safety — HANDLE wraps raw pointer which is `!Send`)
+
+**HANDLE !Send solution:**
+Windows `HANDLE` is `!Send` because it wraps `*mut c_void`. Stored the handle as
+`AtomicUsize` instead of `Arc<Mutex<HANDLE>>`. HANDLEs are just opaque kernel IDs —
+safe to use from any thread. This keeps `WriteThrough` Send+Sync without unsafe impls.
+
+**Wired into existing code:**
+- `sync_root.rs`: Creates `EchoSuppressor` and `WriteThrough`, stops write-through
+  before CF session disconnect on teardown
+- `filter.rs`: `NasSyncFilter::new()` accepts `Arc<EchoSuppressor>`, passes to NasWatcher
+- `watcher.rs`: All placeholder-creating paths check `echo.is_suppressed()` first
+
+**Status: tested end-to-end against \\192.168.40.100\test1. All core flows working.**
+
+### Write-through testing (2026-04-08)
+
+**Tested against \\192.168.40.100\test1. Bugs found and fixed during testing:**
+
+1. **Startup recovery path mapping (fixed):** `queue_non_placeholders` used the recursion
+   directory for `strip_prefix` instead of the original client root. Nested files got
+   mapped to wrong NAS paths (e.g., `project_files/scene_01.txt` → `\\test1\scene_01.txt`).
+   Fix: pass `client_root` separately from `scan_dir` through recursion.
+
+2. **Cancel-on-closed oneshot (fixed):** Startup recovery creates `UploadJob` with
+   `oneshot::channel()` but drops the sender immediately. Worker treated `Closed` as
+   cancellation (`Ok(()) | Err(Closed) => cancel`). Fix: only treat explicit `Ok(())`
+   as cancel. `Closed` means the coordinator isn't tracking the job — not a cancel.
+
+3. **Placeholder::open() invalid handle (fixed):** `Placeholder::open()` uses
+   `CfOpenFileWithOplock` which doesn't work for regular (non-placeholder) files.
+   Fix: use `std::fs::File::open()` → `Placeholder::from(file)` which wraps a standard
+   Win32 handle. `CfConvertToPlaceholder` works with either handle type.
+
+4. **Placeholder modification detection (fixed):** Client watcher filtered by
+   `FILE_ATTRIBUTE_REPARSE_POINT` — skipped placeholders entirely. When a user edits a
+   hydrated placeholder, the file stays as a reparse point, so modifications were missed.
+   Fix: detect modifications on ALL files (not just regular files). Added conversion
+   suppression: coordinator tracks recently-converted paths and ignores the first event
+   after conversion (one-shot, not time-based) to prevent feedback loops.
+
+5. **Double-convert error (fixed):** `CfConvertToPlaceholder` on an existing placeholder
+   returns `0x8007017C` ("cloud operation is invalid"). Fix: check reparse point attribute
+   first. If already a placeholder, call `Placeholder::mark_in_sync()` instead of
+   `convert_to_placeholder()`.
+
+6. **Conversion suppression window (fixed):** Initially used 5-second time window — too
+   long, suppressed legitimate user saves within 5s of a conversion. Fix: one-shot
+   suppression (remove entry after first event caught) + reduced window to 2s.
+
+**Test results (all passing):**
+- New file creation → uploaded → converted to placeholder ✓
+- New file in subdirectory → correct NAS path mapping ✓
+- Placeholder modification → detected → uploaded → re-synced ✓
+- Rapid saves (3 saves in 2s) → debounced → only final content uploaded ✓
+- Startup recovery → non-placeholder files uploaded and converted ✓
+- Echo suppression → NAS watcher doesn't duplicate after upload ✓
+- Performance: ~20-30ms per small file upload over 10GbE
+
+### Phase 2 design note: upload worker pool (2026-04-08)
+
+Current write-through uses a single upload worker thread. At 25MB+ per file (typical
+for this workflow), 1000 queued files would take ~3-4 minutes to drain.
+
+**Plan: 3-4 concurrent worker threads**, matching Synology Drive Client's approach.
+- 3-4 workers saturates NAS disk I/O without overwhelming spinning disks
+- Switch coordinator→worker channel to multi-consumer (crossbeam-channel or
+  `Arc<Mutex<std::sync::mpsc::Receiver>>`)
+- Workers share the same EchoSuppressor, send results to same result_tx
+- Coordinator doesn't care which worker handles which job
+
+**Prioritization: small files first.**
+Synology Drive does this — clears queue count quickly, gives visible progress.
+Large files block a worker for longer; interleaving with small files on other
+workers keeps throughput smooth. Implementation: two queues (small/large threshold,
+e.g., 10MB) or a priority channel, rather than plain FIFO.
+
+Not needed for Phase 1 — single worker handles the interactive "save → see on NAS
+in 3s" use case. Becomes important for bulk operations (paste 1000 files, render
+farm output).
+
+### Phase 1 complete (2026-04-09)
+
+**All Phase 1 items delivered and tested on Windows:**
+
+- Write-through: client watcher → debounce → upload worker → placeholder conversion
+- Frontend UI: sync toggle in Settings, sync status in sidebar, navigation to sync root
+- Credential handling: mediamount_ prefix, empty key skip, 1219 conflict reuse
+- Sync root path: `C:\Volumes\ufb\{shareName}` (extracted from NAS path)
+- Shell integration: custom cloud-sync.ico for Explorer folder icon
+- Agent shutdown: orchestrator loop exit fix + NAS watcher CancelIoEx + thread join timeouts
+
+**10 bugs found and fixed during testing** (see project memory for full list).
+Key lessons for macOS implementation below.
+
+---
+
+## Lessons from Windows Phase 1 — hints for macOS
+
+These are patterns and pitfalls discovered during Windows implementation that the
+macOS FileProvider implementation should anticipate.
+
+### 1. Write detection for modified placeholders
+On Windows, CF API placeholders are NTFS reparse points. When a user edits a hydrated
+placeholder, the file stays as a reparse point — the original client watcher filtered
+these out and missed modifications. Fix: detect changes on ALL files (not just new ones),
+then suppress events from our own conversion operations (one-shot suppression per path).
+
+**macOS equivalent:** FileProvider's `modifyItem` callback handles this natively —
+the system tells you when a materialized file is modified. No client-side watcher needed
+for modification detection. But write-through upload + itemVersion update still needed.
+
+### 2. Placeholder conversion API
+`CfConvertToPlaceholder` requires a standard Win32 file handle (via `std::fs::File`),
+NOT a CF API handle (`CfOpenFileWithOplock`). For files that are already placeholders,
+use `Placeholder::mark_in_sync()` instead — `convert_to_placeholder` returns
+`ERROR_CLOUD_OPERATION_INVALID` (0x8007017C) on existing placeholders.
+
+**macOS equivalent:** FileProvider handles materialization state internally. After
+uploading, signal completion via the `NSFileProviderManager` completion handler.
+No manual file conversion needed.
+
+### 3. Shutdown and thread cleanup
+Blocking Win32 calls (`ReadDirectoryChangesW`, `WNetAddConnection2W`) need explicit
+cancellation via `CancelIoEx`. Without it, threads hang indefinitely and the agent
+won't quit. Thread joins need timeouts (3s) because NAS may be unreachable.
+
+**macOS equivalent:** `FSEvents` streams need `FSEventStreamStop` + `FSEventStreamInvalidate`
+on shutdown. NSFileProviderManager operations should be cancelled via invalidation.
+Dispatch queues need explicit cleanup.
+
+### 4. Orchestrator event loop exit
+The orchestrator held its own `event_tx` (sender), keeping the mpsc channel alive even
+after the mount service dropped its sender. `event_rx.recv()` never returned `None`.
+Fix: break the loop explicitly when state reaches `Stopped`.
+
+**macOS equivalent:** Same Rust orchestrator code is shared. This fix applies to all platforms.
+
+### 5. Credential handling
+Windows Credential Store keys use a `mediamount_` prefix (set by the Tauri app).
+The agent must match this prefix when reading. Empty credential keys should skip
+lookup entirely (not call CredReadW with empty string). Multiple mounts to the same
+NAS server cause SMB credential conflicts (ERROR 1219) — retry without credentials
+to reuse the existing session.
+
+**macOS equivalent:** Keychain Access uses service name + account name. The macOS
+credential store implementation should use the same `mediamount_` prefix convention.
+SMB session sharing on macOS is handled by the kernel — one mount per share path.
+
+### 6. Echo suppression for write-through
+After uploading to NAS, the NAS watcher sees the new/modified file and tries to
+create/update a placeholder. Suppressed via a shared HashMap<PathBuf, Instant> with
+5-second TTL. Upload worker writes to it, NAS watcher reads.
+
+**macOS equivalent:** After upload via FileProvider, signal the enumerator via
+`NSFileProviderManager.signalEnumerator(for:)`. The system re-enumerates and sees
+the file is already materialized. May not need explicit echo suppression if the
+FileProvider system handles this, but test carefully.
+
+### 7. Sync root path
+Windows: `C:\Volumes\ufb\{shareName}` — visible in Explorer, easy to find.
+Share name extracted from NAS path (e.g., `\\192.168.40.100\test1` → `test1`).
+Created automatically via `fs::create_dir_all`.
+
+**macOS equivalent:** FileProvider domains appear under `~/Library/CloudStorage/`
+automatically. The display name is set via `NSFileProviderDomain`. Users see it in
+Finder sidebar. No manual path creation needed.
+
+### 8. Icon handling
+CF API sync root icon must be set during registration via `SyncRootInfo::with_icon()`.
+Format: `path_to_file.ico` or `path_to_dll,index`. The exe's embedded icon works
+(`exe_path,0`). Custom .ico files work directly. Icon must exist at registration time.
+
+**macOS equivalent:** FileProvider domain icon set via `NSFileProviderDomain` configuration
+or the extension's Info.plist. Standard macOS icon handling (NSImage, asset catalogs).
+
+### 9. File structure for macOS reference
+```
+mediamount-agent/src/sync/
+  mod.rs              — module def, Windows-only gates (#[cfg(windows)])
+  filter.rs           — CF API SyncFilter impl (Windows)
+  watcher.rs          — NAS watcher via ReadDirectoryChangesW (Windows)
+  sync_root.rs        — Sync root lifecycle (Windows)
+  write_through/
+    mod.rs            — Coordinator, echo suppressor, conversion (Windows)
+    client_watcher.rs — Local fs watcher via ReadDirectoryChangesW (Windows)
+    worker.rs         — Upload worker (CROSS-PLATFORM — pure std::fs)
+
+Parts reusable on macOS:
+  - worker.rs: upload logic (temp file, conflict detection, chunked write) is pure Rust/std::fs
+  - EchoSuppressor: platform-agnostic HashMap<PathBuf, Instant>
+  - Coordinator async logic: debounce timers, state machine, per-path tracking
+  - Config fields: sync_enabled, sync_root_path, share_name() extraction
+
+Parts Windows-only (need macOS equivalents):
+  - filter.rs → NSFileProviderReplicatedExtension methods
+  - watcher.rs → FSEvents stream on NAS mount
+  - client_watcher.rs → FileProvider modifyItem callback (system handles detection)
+  - sync_root.rs → NSFileProviderDomain registration
+  - Placeholder conversion → FileProvider materialization/completion handlers
+```

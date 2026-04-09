@@ -16,6 +16,8 @@ export interface MountStateUpdate {
   mountId: string;
   state: string;
   stateDetail: string;
+  syncState?: string;
+  syncStateDetail?: string;
 }
 
 export interface MountConfig {
@@ -29,6 +31,8 @@ export interface MountConfig {
   mountPathLinux?: string;
   mountPathMacos?: string;
   isJobsFolder: boolean;
+  syncEnabled?: boolean;
+  syncRootPath?: string;
 }
 
 export interface MountsConfig {
@@ -178,6 +182,16 @@ async function loadConfig(): Promise<MountsConfig> {
 
 /** Get the user-facing mount path for a config (platform-aware). */
 function getMountPath(cfg: MountConfig): string {
+  // Sync mounts use the sync root path
+  if (cfg.syncEnabled) {
+    if (cfg.syncRootPath) return cfg.syncRootPath;
+    // Default: C:\Volumes\ufb\{shareName}
+    const shareName = cfg.nasSharePath.replace(/^\\\\/, "").split("\\")[1] || cfg.id;
+    if (platformStore.platform === "win") {
+      return `C:\\Volumes\\ufb\\${shareName}`;
+    }
+    return `${platformStore.home || "~"}/.local/share/ufb/sync/${shareName}`;
+  }
   if (platformStore.platform === "win") {
     return cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "";
   }

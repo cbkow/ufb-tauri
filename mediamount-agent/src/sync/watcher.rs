@@ -8,6 +8,7 @@ use cloud_filter::{metadata::Metadata, placeholder_file::PlaceholderFile};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -17,18 +18,32 @@ use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
+use super::write_through::EchoSuppressor;
+
 /// Watches a NAS share for changes and syncs placeholders to the client folder.
 pub struct NasWatcher {
     /// Map of NAS folder → client folder for all visited folders.
     watched: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     nas_root: PathBuf,
+    /// Echo suppression — skip placeholders for files we just uploaded.
+    echo: Arc<EchoSuppressor>,
+    /// Shutdown signal.
+    shutdown: Arc<AtomicBool>,
+    /// Directory handle stored as usize for CancelIoEx on shutdown.
+    dir_handle: Arc<AtomicUsize>,
+    /// Thread handle for join on stop.
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl NasWatcher {
-    pub fn new(nas_root: PathBuf) -> Self {
+    pub fn new(nas_root: PathBuf, echo: Arc<EchoSuppressor>) -> Self {
         Self {
             watched: Arc::new(Mutex::new(HashMap::new())),
             nas_root,
+            echo,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            dir_handle: Arc::new(AtomicUsize::new(0)),
+            thread: Mutex::new(None),
         }
     }
 
@@ -42,26 +57,59 @@ impl NasWatcher {
     pub fn start(&self) {
         let nas_root = self.nas_root.clone();
         let watched = self.watched.clone();
+        let echo = self.echo.clone();
+        let shutdown = self.shutdown.clone();
+        let dir_handle = self.dir_handle.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("nas-watcher".into())
             .spawn(move || {
-                if let Err(e) = run_watcher_loop(&nas_root, &watched) {
-                    log::error!("[sync-watcher] Watcher exited with error: {}", e);
+                if let Err(e) = run_watcher_loop(&nas_root, &watched, &echo, &shutdown, &dir_handle) {
+                    if !shutdown.load(Ordering::Relaxed) {
+                        log::error!("[sync-watcher] Watcher exited with error: {}", e);
+                    }
                 }
             })
             .expect("Failed to spawn NAS watcher thread");
+
+        *self.thread.lock().unwrap() = Some(handle);
     }
 
-    /// Get a reference to the watched folders map.
-    pub fn watched_folders(&self) -> Arc<Mutex<HashMap<PathBuf, PathBuf>>> {
-        self.watched.clone()
+    /// Stop the watcher thread.
+    pub fn stop(&self) {
+        log::info!("[sync-watcher] Stopping NAS watcher");
+        self.shutdown.store(true, Ordering::SeqCst);
+        let h = self.dir_handle.load(Ordering::SeqCst);
+        if h != 0 {
+            let handle = HANDLE(h as *mut std::ffi::c_void);
+            unsafe {
+                let _ = windows::Win32::System::IO::CancelIoEx(handle, None);
+            }
+        }
+        if let Some(t) = self.thread.lock().unwrap().take() {
+            // Timeout: NAS might be unreachable, don't block shutdown
+            let start = std::time::Instant::now();
+            loop {
+                if t.is_finished() {
+                    let _ = t.join();
+                    break;
+                }
+                if start.elapsed() > std::time::Duration::from_secs(3) {
+                    log::warn!("[sync-watcher] NAS watcher thread join timed out");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 }
 
 fn run_watcher_loop(
     nas_root: &Path,
     watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    echo: &Arc<EchoSuppressor>,
+    shutdown: &AtomicBool,
+    dir_handle_store: &AtomicUsize,
 ) -> Result<(), String> {
     let wide_path: Vec<u16> = nas_root
         .to_string_lossy()
@@ -82,6 +130,9 @@ fn run_watcher_loop(
     }
     .map_err(|e| format!("Failed to open NAS directory for watching: {}", e))?;
 
+    // Store handle so stop() can cancel via CancelIoEx
+    dir_handle_store.store(handle.0 as usize, Ordering::SeqCst);
+
     log::info!("[sync-watcher] Watching {:?}", nas_root);
 
     let mut buffer = vec![0u8; 16384];
@@ -90,6 +141,10 @@ fn run_watcher_loop(
         FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE;
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         let result = unsafe {
             ReadDirectoryChangesW(
                 handle,
@@ -103,24 +158,35 @@ fn run_watcher_loop(
             )
         };
 
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
         match result {
             Ok(()) if bytes_returned > 0 => {
-                process_events(&buffer, bytes_returned, nas_root, watched);
+                process_events(&buffer, bytes_returned, nas_root, watched, echo);
             }
             Ok(()) => {
-                // Buffer overflow — too many changes at once.
-                // Fall back to full readdir + diff on all watched folders.
                 log::warn!("[sync-watcher] Buffer overflow, running full diff on watched folders");
-                full_diff_all_watched(nas_root, watched);
+                full_diff_all_watched(nas_root, watched, echo);
             }
             Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
+                if !shutdown.load(Ordering::Relaxed) {
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    return Err(format!("ReadDirectoryChangesW error: {}", e));
                 }
-                return Err(format!("ReadDirectoryChangesW error: {}", e));
+                break;
             }
         }
     }
+
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    log::info!("[sync-watcher] Watcher stopped");
+    Ok(())
 }
 
 fn process_events(
@@ -128,6 +194,7 @@ fn process_events(
     bytes_returned: u32,
     nas_root: &Path,
     watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    echo: &EchoSuppressor,
 ) {
     let mut offset: usize = 0;
 
@@ -190,8 +257,12 @@ fn process_events(
             match action {
                 1 | 5 => {
                     // FILE_ACTION_ADDED or FILE_ACTION_RENAMED_NEW — create placeholder
-                    log::debug!("[sync-watcher] {} {}", action_name, relative_str);
-                    push_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
+                    if echo.is_suppressed(&nas_path) {
+                        log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
+                    } else {
+                        log::debug!("[sync-watcher] {} {}", action_name, relative_str);
+                        push_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
+                    }
                 }
                 2 | 4 => {
                     // FILE_ACTION_REMOVED or FILE_ACTION_RENAMED_OLD — remove placeholder
@@ -258,6 +329,7 @@ fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str) {
 fn full_diff_all_watched(
     _nas_root: &Path,
     watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    echo: &EchoSuppressor,
 ) {
     let folders: Vec<(PathBuf, PathBuf)> = {
         let map = watched.lock().unwrap();
@@ -265,12 +337,12 @@ fn full_diff_all_watched(
     };
 
     for (nas_dir, client_dir) in folders {
-        diff_folder(&nas_dir, &client_dir);
+        diff_folder(&nas_dir, &client_dir, echo);
     }
 }
 
 /// Diff a single NAS folder against its client counterpart and reconcile.
-fn diff_folder(nas_dir: &Path, client_dir: &Path) {
+fn diff_folder(nas_dir: &Path, client_dir: &Path, echo: &EchoSuppressor) {
     if !client_dir.is_dir() || !nas_dir.is_dir() {
         return;
     }
@@ -293,7 +365,9 @@ fn diff_folder(nas_dir: &Path, client_dir: &Path) {
     // New on NAS
     for name in nas_entries.difference(&client_entries) {
         let nas_path = nas_dir.join(name);
-        push_placeholder(&nas_path, client_dir, name, name);
+        if !echo.is_suppressed(&nas_path) {
+            push_placeholder(&nas_path, client_dir, name, name);
+        }
     }
 
     // Gone from NAS

@@ -291,7 +291,15 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
             <For each={mountStore.configs}>
               {(cfg) => {
                 const ms = () => mountStore.states[cfg.id];
+                const isSync = () => cfg.syncEnabled;
                 const stateClass = () => {
+                  if (isSync()) {
+                    const ss = ms()?.syncState;
+                    if (ss === "active") return "mount-healthy";
+                    if (ss === "registering") return "mount-starting";
+                    if (ss === "error") return "mount-error";
+                    if (ss === "deregistering" || ss === "disabled") return "mount-warn";
+                  }
                   const s = ms()?.state;
                   if (s === "mounted") return "mount-healthy";
                   if (s === "mounting" || s === "initializing") return "mount-starting";
@@ -300,6 +308,14 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                   return "mount-error";
                 };
                 const stateLabel = () => {
+                  if (isSync()) {
+                    const ss = ms()?.syncState;
+                    if (ss === "active") return "Sync";
+                    if (ss === "registering") return "Starting";
+                    if (ss === "error") return "Error";
+                    if (ss === "deregistering") return "Stopping";
+                    if (ss === "disabled") return "Disabled";
+                  }
                   const s = ms()?.state;
                   if (s === "mounted") return "Mounted";
                   if (s === "mounting" || s === "initializing") return "Starting";
@@ -318,11 +334,12 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                     onClick={() => navigate(mountStore.getMountPath(cfg))}
                     onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(mountStore.getMountPath(cfg)); } }}
                     onContextMenu={(e) => onMountContextMenu(e, cfg.id)}
-                    title={ms()?.stateDetail ?? mountStore.getMountPath(cfg)}
+                    title={ms()?.syncStateDetail ?? ms()?.stateDetail ?? mountStore.getMountPath(cfg)}
                   >
                     <span class={`mount-status-dot ${stateClass()}`} />
                     <span class="item-label truncate">{cfg.displayName}</span>
-                    <Show when={cfg.isJobsFolder}><span class="item-tag">Jobs</span></Show>
+                    <Show when={isSync()}><span class="item-tag">Sync</span></Show>
+                    <Show when={cfg.isJobsFolder && !isSync()}><span class="item-tag">Jobs</span></Show>
                     <span class={`mount-state-label ${stateClass()}`}>{stateLabel()}</span>
                     <span
                       class="mount-toggle-btn"

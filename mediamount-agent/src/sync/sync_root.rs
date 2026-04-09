@@ -5,8 +5,11 @@ use cloud_filter::root::{
 };
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::filter::NasSyncFilter;
+use super::watcher::NasWatcher;
+use super::write_through::{EchoSuppressor, WriteThrough};
 
 const PROVIDER_NAME: &str = "MediaMount";
 
@@ -17,6 +20,10 @@ pub struct SyncRoot {
     client_root: PathBuf,
     /// Held to keep the CF session alive. Dropped on teardown.
     _connection: Option<cloud_filter::root::Connection<NasSyncFilter>>,
+    /// Write-through pipeline (local saves → NAS upload → placeholder conversion).
+    write_through: Option<WriteThrough>,
+    /// NAS watcher — kept separately so we can stop it (the filter is moved into the CF session).
+    nas_watcher: Option<Arc<NasWatcher>>,
 }
 
 impl SyncRoot {
@@ -68,11 +75,17 @@ impl SyncRoot {
             client_root
         );
 
+        // Shared echo suppressor (write-through writes, NAS watcher reads)
+        let echo = Arc::new(EchoSuppressor::new());
+
+        // Create watcher (shared between filter and SyncRoot for clean shutdown)
+        let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
+
         // Connect the filter
-        let filter = NasSyncFilter::new(nas_root.clone(), client_root.clone());
+        let filter = NasSyncFilter::new(nas_root.clone(), client_root.clone(), watcher.clone());
 
         // Start the NAS watcher before connecting (so it's ready for callbacks)
-        filter.watcher.start();
+        watcher.start();
 
         let connection = Session::new()
             .connect(&client_root, filter)
@@ -80,11 +93,20 @@ impl SyncRoot {
 
         log::info!("[sync] Filter connected for '{}'", mount_id);
 
+        // Start the write-through pipeline
+        let write_through = WriteThrough::start(
+            client_root.clone(),
+            nas_root.clone(),
+            echo,
+        );
+
         Ok(Self {
             mount_id: mount_id.to_string(),
             nas_root,
             client_root,
             _connection: Some(connection),
+            write_through: Some(write_through),
+            nas_watcher: Some(watcher),
         })
     }
 
@@ -92,7 +114,17 @@ impl SyncRoot {
     pub fn stop(&mut self) {
         log::info!("[sync] Stopping sync root '{}'", self.mount_id);
 
-        // Drop the connection first (disconnects CF session)
+        // Stop write-through first (cancels pending uploads)
+        if let Some(mut wt) = self.write_through.take() {
+            wt.stop();
+        }
+
+        // Stop the NAS watcher (cancels ReadDirectoryChangesW)
+        if let Some(watcher) = self.nas_watcher.take() {
+            watcher.stop();
+        }
+
+        // Drop the connection (disconnects CF session)
         self._connection.take();
 
         // Unregister
@@ -112,25 +144,30 @@ impl SyncRoot {
         log::info!("[sync] Sync root '{}' stopped", self.mount_id);
     }
 
-    /// Find an icon for the sync root. Falls back to a system icon.
+    /// Icon for the sync root in Explorer.
+    /// Uses cloud-sync.ico next to the exe, falls back to embedded exe icon.
     fn find_icon() -> String {
-        // Try to find the app's icon next to the executable
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                let ico = dir.join("icons").join("icon.ico");
-                if ico.exists() {
-                    return ico.to_string_lossy().to_string();
+                let cloud_ico = dir.join("cloud-sync.ico");
+                if cloud_ico.exists() {
+                    let path = cloud_ico.to_string_lossy().to_string();
+                    log::info!("[sync] Using sync icon: {}", path);
+                    return path;
                 }
             }
+            // Fallback: embedded icon in the exe
+            let path = format!("{},0", exe.to_string_lossy());
+            log::info!("[sync] Using exe icon: {}", path);
+            return path;
         }
-        // Fallback to system icon
-        r"%SystemRoot%\system32\shell32.dll,0".to_string()
+        r"%SystemRoot%\system32\shell32.dll,12".to_string()
     }
 }
 
 impl Drop for SyncRoot {
     fn drop(&mut self) {
-        if self._connection.is_some() {
+        if self._connection.is_some() || self.write_through.is_some() || self.nas_watcher.is_some() {
             self.stop();
         }
     }

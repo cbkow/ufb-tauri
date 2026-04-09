@@ -69,6 +69,12 @@ impl Orchestrator {
                         Some(event) => {
                             self.handle_event(event).await;
 
+                            // Exit the event loop once fully stopped
+                            if matches!(self.state, MountState::Stopped) {
+                                log::info!("[{}] Orchestrator stopping", self.mount_id);
+                                break;
+                            }
+
                             // After restart or start, if we're in Mounting state and no error, transition to Mounted
                             if matches!(self.state, MountState::Mounting) {
                                 self.handle_event(MountEvent::RequestStateUpdate).await;
@@ -380,17 +386,32 @@ impl Orchestrator {
         log::info!("[{}] Sync stopped", self.mount_id);
     }
 
+    /// Credential keys in the config are bare names (e.g., "gfx-nas").
+    /// The Tauri app stores them with a "mediamount_" prefix in the OS credential store.
+    const CRED_PREFIX: &'static str = "mediamount_";
+
     async fn retrieve_credentials(&self) -> (String, String) {
+        let key = &self.config.credential_key;
+        if key.is_empty() {
+            return (String::new(), String::new());
+        }
+        // Match the Tauri app's prefix convention
+        let prefixed = if key.starts_with(Self::CRED_PREFIX) {
+            key.clone()
+        } else {
+            format!("{}{}", Self::CRED_PREFIX, key)
+        };
+
         #[cfg(windows)]
         {
             use crate::platform::CredentialStore;
             let cred_store = crate::platform::windows::WindowsCredentialStore::new();
-            match cred_store.retrieve(&self.config.credential_key) {
+            match cred_store.retrieve(&prefixed) {
                 Ok(creds) => creds,
                 Err(e) => {
                     log::warn!(
                         "[{}] No credentials found for {}: {}, trying without",
-                        self.mount_id, self.config.credential_key, e
+                        self.mount_id, key, e
                     );
                     (String::new(), String::new())
                 }
@@ -400,12 +421,12 @@ impl Orchestrator {
         {
             use crate::platform::CredentialStore;
             let cred_store = crate::platform::linux::LinuxCredentialStore::new();
-            match cred_store.retrieve(&self.config.credential_key) {
+            match cred_store.retrieve(&prefixed) {
                 Ok(creds) => creds,
                 Err(e) => {
                     log::warn!(
                         "[{}] No credentials found for {}: {}, trying without",
-                        self.mount_id, self.config.credential_key, e
+                        self.mount_id, key, e
                     );
                     (String::new(), String::new())
                 }
@@ -415,12 +436,12 @@ impl Orchestrator {
         {
             use crate::platform::CredentialStore;
             let cred_store = crate::platform::macos::MacosCredentialStore::new();
-            match cred_store.retrieve(&self.config.credential_key) {
+            match cred_store.retrieve(&prefixed) {
                 Ok(creds) => creds,
                 Err(e) => {
                     log::warn!(
                         "[{}] No credentials found for {}: {}, trying without",
-                        self.mount_id, self.config.credential_key, e
+                        self.mount_id, key, e
                     );
                     (String::new(), String::new())
                 }

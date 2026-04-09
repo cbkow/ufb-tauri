@@ -27,6 +27,10 @@ pub struct MountStateUpdateMsg {
     pub mount_id: String,
     pub state: String,
     pub state_detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_state_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +90,12 @@ pub struct MountConfig {
     pub mount_path_linux: Option<String>,
     #[serde(default = "default_true")]
     pub is_jobs_folder: bool,
+
+    // On-demand sync (Windows Cloud Files API)
+    #[serde(default)]
+    pub sync_enabled: bool,
+    #[serde(default)]
+    pub sync_root_path: Option<String>,
 
     // Legacy fields — kept for backwards compat with existing config files
     #[serde(default)]

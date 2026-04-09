@@ -257,6 +257,8 @@ export interface MountStateUpdate {
   mountId: string;
   state: string;
   stateDetail: string;
+  syncState?: string;
+  syncStateDetail?: string;
 }
 
 export interface MountConfig {
@@ -269,6 +271,8 @@ export interface MountConfig {
   smbMountPath?: string;
   mountPathLinux?: string;
   isJobsFolder: boolean;
+  syncEnabled?: boolean;
+  syncRootPath?: string;
 }
 
 export interface MountsConfig {

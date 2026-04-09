@@ -129,33 +129,38 @@ impl MountConfig {
     }
 
     /// The local folder path for the sync root.
-    /// Uses explicit override if set, otherwise auto-derives from the mount ID.
+    /// Uses explicit override if set, otherwise C:\Volumes\ufb\{shareName} on Windows.
     pub fn sync_root_dir(&self) -> PathBuf {
         if let Some(ref p) = self.sync_root_path {
             if !p.is_empty() {
                 return PathBuf::from(p);
             }
         }
-        Self::default_sync_root_base().join(&self.id)
+        Self::default_sync_root_base().join(self.share_name())
+    }
+
+    /// Extract the share name from the NAS path.
+    /// e.g., \\192.168.40.100\test1 → test1
+    ///       \\nas\Jobs_Live → Jobs_Live
+    fn share_name(&self) -> String {
+        self.nas_share_path
+            .trim_start_matches('\\')
+            .split('\\')
+            .nth(1) // skip server, take share
+            .unwrap_or(&self.id)
+            .to_string()
     }
 
     /// Default base directory for sync roots.
     fn default_sync_root_base() -> PathBuf {
         #[cfg(windows)]
         {
-            if let Ok(local) = std::env::var("LOCALAPPDATA") {
-                let dir = PathBuf::from(local).join("ufb").join("sync");
-                let _ = std::fs::create_dir_all(&dir);
-                return dir;
-            }
-            PathBuf::from(r"C:\ufb\sync")
+            PathBuf::from(r"C:\Volumes\ufb")
         }
         #[cfg(not(windows))]
         {
             if let Some(home) = std::env::var_os("HOME") {
-                let dir = PathBuf::from(home).join(".local/share/ufb/sync");
-                let _ = std::fs::create_dir_all(&dir);
-                return dir;
+                return PathBuf::from(home).join(".local/share/ufb/sync");
             }
             PathBuf::from("/tmp/ufb-sync")
         }
@@ -177,7 +182,7 @@ impl MountConfig {
     /// The path apps use to access the mount.
     /// If sync is enabled, returns the sync root path instead of the drive letter.
     /// Windows (drive): "M:\\"
-    /// Windows (sync): "%LOCALAPPDATA%\\ufb\\sync\\{id}"
+    /// Windows (sync): "C:\\Volumes\\ufb\\{shareName}"
     /// macOS: mount_path_macos, or auto-derived /opt/ufb/mounts/<id>
     /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
     pub fn mount_path(&self) -> String {

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::watcher::NasWatcher;
+use super::write_through::EchoSuppressor;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB hydration chunks
 
@@ -22,14 +23,13 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB hydration chunks
 pub struct NasSyncFilter {
     pub nas_root: PathBuf,
     pub client_root: PathBuf,
-    pub watcher: NasWatcher,
+    pub watcher: Arc<NasWatcher>,
     /// Tracks open file handles for deferred NAS updates.
     pub open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
 }
 
 impl NasSyncFilter {
-    pub fn new(nas_root: PathBuf, client_root: PathBuf) -> Self {
-        let watcher = NasWatcher::new(nas_root.clone());
+    pub fn new(nas_root: PathBuf, client_root: PathBuf, watcher: Arc<NasWatcher>) -> Self {
         Self {
             nas_root,
             client_root,

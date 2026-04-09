@@ -13,6 +13,8 @@ mod sync_root;
 mod filter;
 #[cfg(windows)]
 mod watcher;
+#[cfg(windows)]
+pub mod write_through;
 
 #[cfg(windows)]
 pub use sync_root::SyncRoot;
