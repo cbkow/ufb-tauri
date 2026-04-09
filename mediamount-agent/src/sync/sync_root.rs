@@ -1,7 +1,8 @@
 /// Sync root lifecycle — registration, session management, teardown.
 
 use cloud_filter::root::{
-    HydrationType, PopulationType, SecurityId, Session, SyncRootIdBuilder, SyncRootInfo,
+    HydrationPolicy, HydrationType, PopulationType, SecurityId, Session, SyncRootIdBuilder,
+    SyncRootInfo,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -61,7 +62,13 @@ impl SyncRoot {
                 SyncRootInfo::default()
                     .with_display_name(display_name)
                     .with_hydration_type(HydrationType::Full)
+                    .with_hydration_policy(
+                        HydrationPolicy::StreamingAllowed
+                            | HydrationPolicy::AutoDehydrationAllowed
+                            | HydrationPolicy::AllowFullRestartHydration,
+                    )
                     .with_population_type(PopulationType::Full)
+                    .with_allow_pinning(true)
                     .with_icon(&icon_path)
                     .with_version(env!("CARGO_PKG_VERSION"))
                     .with_path(&client_root)
