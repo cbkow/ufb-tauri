@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::watcher::NasWatcher;
+use super::connectivity::{is_network_error, NasConnectivity};
 use super::write_through::EchoSuppressor;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB hydration chunks
@@ -24,19 +25,25 @@ pub struct NasSyncFilter {
     pub nas_root: PathBuf,
     pub client_root: PathBuf,
     pub watcher: Arc<NasWatcher>,
-    /// Echo suppression — shared with NAS watcher to prevent duplicate operations.
     pub echo: Arc<EchoSuppressor>,
-    /// Tracks open file handles for deferred NAS updates.
+    pub connectivity: Arc<NasConnectivity>,
     pub open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
 }
 
 impl NasSyncFilter {
-    pub fn new(nas_root: PathBuf, client_root: PathBuf, watcher: Arc<NasWatcher>, echo: Arc<EchoSuppressor>) -> Self {
+    pub fn new(
+        nas_root: PathBuf,
+        client_root: PathBuf,
+        watcher: Arc<NasWatcher>,
+        echo: Arc<EchoSuppressor>,
+        connectivity: Arc<NasConnectivity>,
+    ) -> Self {
         Self {
             nas_root,
             client_root,
             watcher,
             echo,
+            connectivity,
             open_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -159,11 +166,28 @@ impl SyncFilter for NasSyncFilter {
             total_needed as f64 / (1024.0 * 1024.0)
         );
 
-        let mut file = match fs::File::open(&nas_path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("[sync] Failed to open {:?}: {}", nas_path, e);
-                return Ok(());
+        // Retry NAS file open with backoff — handles transient disconnects.
+        // Leave 10s margin before the CF API's 60-second callback timeout.
+        let mut file = loop {
+            match fs::File::open(&nas_path) {
+                Ok(f) => break f,
+                Err(e) if is_network_error(&e) && start.elapsed().as_secs() < 50 => {
+                    self.connectivity.report_network_error();
+                    log::warn!(
+                        "[sync] Hydration waiting for NAS ({:.0}s): {:?}",
+                        start.elapsed().as_secs_f64(),
+                        nas_path
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                }
+                Err(e) => {
+                    if is_network_error(&e) {
+                        self.connectivity.report_network_error();
+                    }
+                    log::error!("[sync] Failed to open {:?}: {}", nas_path, e);
+                    return Ok(());
+                }
             }
         };
 
@@ -186,6 +210,9 @@ impl SyncFilter for NasSyncFilter {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
+                    if is_network_error(&e) {
+                        self.connectivity.report_network_error();
+                    }
                     log::error!("[sync] Read error at offset {}: {}", position, e);
                     return Ok(());
                 }

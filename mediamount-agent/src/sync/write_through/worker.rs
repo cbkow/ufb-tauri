@@ -38,11 +38,12 @@ pub enum UploadResult {
     Failed {
         local_path: PathBuf,
         error: String,
+        /// True if the failure is a network error that may resolve after reconnect.
+        retriable: bool,
     },
 }
 
 /// Number of concurrent upload worker threads.
-/// 3-4 saturates typical NAS disk I/O without overwhelming spinning disks.
 pub const WORKER_COUNT: usize = 3;
 
 /// Start N upload workers on dedicated threads sharing a crossbeam channel.
@@ -50,17 +51,23 @@ pub fn start_pool(
     rx: crossbeam_channel::Receiver<UploadJob>,
     result_tx: mpsc::Sender<UploadResult>,
     echo: Arc<EchoSuppressor>,
+    connectivity: Arc<super::super::connectivity::NasConnectivity>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..WORKER_COUNT)
         .map(|i| {
             let rx = rx.clone();
             let result_tx = result_tx.clone();
             let echo = echo.clone();
+            let conn = connectivity.clone();
             std::thread::Builder::new()
                 .name(format!("upload-worker-{}", i))
                 .spawn(move || {
                     for job in rx {
-                        let result = process_upload(job, &echo);
+                        // Wait for NAS to be online before starting the job
+                        while !conn.is_online() {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                        let result = process_upload(job, &echo, &conn);
                         if result_tx.blocking_send(result).is_err() {
                             break;
                         }
@@ -72,7 +79,11 @@ pub fn start_pool(
         .collect()
 }
 
-fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
+fn process_upload(
+    mut job: UploadJob,
+    echo: &EchoSuppressor,
+    connectivity: &super::super::connectivity::NasConnectivity,
+) -> UploadResult {
     let local = &job.local_path;
     let nas_target = &job.nas_path;
 
@@ -97,6 +108,7 @@ fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
                 return UploadResult::Failed {
                     local_path: local.clone(),
                     error: format!("Failed to create NAS directory: {}", e),
+                retriable: super::super::connectivity::is_network_error(&e),
                 };
             }
         }
@@ -109,6 +121,7 @@ fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
             return UploadResult::Failed {
                 local_path: local.clone(),
                 error: format!("Failed to open local file: {}", e),
+                retriable: false,
             }
         }
     };
@@ -125,6 +138,7 @@ fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
             return UploadResult::Failed {
                 local_path: local.clone(),
                 error: format!("Failed to create NAS temp file: {}", e),
+                retriable: super::super::connectivity::is_network_error(&e),
             }
         }
     };
@@ -154,16 +168,24 @@ fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
                 return UploadResult::Failed {
                     local_path: local.clone(),
                     error: format!("Read error at {} bytes: {}", total, e),
+                    retriable: false,
                 };
             }
         };
 
         if let Err(e) = dst.write_all(&buf[..n]) {
+            if super::super::connectivity::is_network_error(&e) {
+                connectivity.report_network_error();
+            }
             drop(dst);
-            let _ = fs::remove_file(&nas_temp);
+            // Don't delete temp file on network error — it's the resume point
+            if !super::super::connectivity::is_network_error(&e) {
+                let _ = fs::remove_file(&nas_temp);
+            }
             return UploadResult::Failed {
                 local_path: local.clone(),
                 error: format!("Write error at {} bytes: {}", total, e),
+                    retriable: super::super::connectivity::is_network_error(&e),
             };
         }
 
@@ -222,6 +244,7 @@ fn process_upload(mut job: UploadJob, echo: &EchoSuppressor) -> UploadResult {
         return UploadResult::Failed {
             local_path: local.clone(),
             error: format!("Rename to final failed: {}", e),
+            retriable: super::super::connectivity::is_network_error(&e),
         };
     }
 

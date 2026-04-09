@@ -223,6 +223,10 @@ pub enum SyncState {
     Registering,
     /// Sync root active, session connected, watcher running.
     Active,
+    /// NAS unreachable — watcher stopped, operations fail-fast.
+    Offline,
+    /// Attempting to restore NAS connection.
+    Reconnecting,
     /// Sync root encountered an error.
     Error(String),
     /// Tearing down sync root.
@@ -235,6 +239,8 @@ impl fmt::Display for SyncState {
             SyncState::Disabled => write!(f, "Disabled"),
             SyncState::Registering => write!(f, "Registering"),
             SyncState::Active => write!(f, "Active"),
+            SyncState::Offline => write!(f, "NAS unreachable"),
+            SyncState::Reconnecting => write!(f, "Reconnecting..."),
             SyncState::Error(e) => write!(f, "Error: {}", e),
             SyncState::Deregistering => write!(f, "Deregistering"),
         }
@@ -248,6 +254,8 @@ impl SyncState {
             SyncState::Disabled => "disabled",
             SyncState::Registering => "registering",
             SyncState::Active => "active",
+            SyncState::Offline => "offline",
+            SyncState::Reconnecting => "reconnecting",
             SyncState::Error(_) => "error",
             SyncState::Deregistering => "deregistering",
         }

@@ -15,6 +15,10 @@ mod filter;
 mod watcher;
 #[cfg(windows)]
 pub mod write_through;
+#[cfg(windows)]
+pub mod connectivity;
 
 #[cfg(windows)]
 pub use sync_root::SyncRoot;
+#[cfg(windows)]
+pub use connectivity::{NasConnectivity, NasStatus, is_network_error};

@@ -296,8 +296,9 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                   if (isSync()) {
                     const ss = ms()?.syncState;
                     if (ss === "active") return "mount-healthy";
-                    if (ss === "registering") return "mount-starting";
+                    if (ss === "registering" || ss === "reconnecting") return "mount-starting";
                     if (ss === "error") return "mount-error";
+                    if (ss === "offline") return "mount-warn";
                     if (ss === "deregistering" || ss === "disabled") return "mount-warn";
                   }
                   const s = ms()?.state;
@@ -316,6 +317,8 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                       return "Sync";
                     }
                     if (ss === "registering") return "Starting";
+                    if (ss === "offline") return "Offline";
+                    if (ss === "reconnecting") return "Reconnecting...";
                     if (ss === "error") return "Error";
                     if (ss === "deregistering") return "Stopping";
                     if (ss === "disabled") return "Disabled";

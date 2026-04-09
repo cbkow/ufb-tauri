@@ -8,6 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::connectivity::NasConnectivity;
 use super::filter::NasSyncFilter;
 use super::watcher::NasWatcher;
 use super::write_through::{EchoSuppressor, WriteThrough};
@@ -25,6 +26,8 @@ pub struct SyncRoot {
     write_through: Option<WriteThrough>,
     /// NAS watcher — kept separately so we can stop it (the filter is moved into the CF session).
     nas_watcher: Option<Arc<NasWatcher>>,
+    /// Shared connectivity state — read by all components, driven by orchestrator heartbeat.
+    connectivity: Arc<NasConnectivity>,
 }
 
 impl SyncRoot {
@@ -82,14 +85,21 @@ impl SyncRoot {
             client_root
         );
 
-        // Shared echo suppressor (write-through writes, NAS watcher reads)
+        // Shared state
         let echo = Arc::new(EchoSuppressor::new());
+        let connectivity = Arc::new(NasConnectivity::new());
 
         // Create watcher (shared between filter and SyncRoot for clean shutdown)
         let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
 
-        // Connect the filter
-        let filter = NasSyncFilter::new(nas_root.clone(), client_root.clone(), watcher.clone(), echo.clone());
+        // Connect the filter (gets connectivity for hydration retry)
+        let filter = NasSyncFilter::new(
+            nas_root.clone(),
+            client_root.clone(),
+            watcher.clone(),
+            echo.clone(),
+            connectivity.clone(),
+        );
 
         // Start the NAS watcher before connecting (so it's ready for callbacks)
         watcher.start();
@@ -105,6 +115,7 @@ impl SyncRoot {
             client_root.clone(),
             nas_root.clone(),
             echo,
+            connectivity.clone(),
         );
 
         Ok(Self {
@@ -114,6 +125,7 @@ impl SyncRoot {
             _connection: Some(connection),
             write_through: Some(write_through),
             nas_watcher: Some(watcher),
+            connectivity,
         })
     }
 
@@ -149,6 +161,25 @@ impl SyncRoot {
         }
 
         log::info!("[sync] Sync root '{}' stopped", self.mount_id);
+    }
+
+    /// Get shared connectivity state for the orchestrator.
+    pub fn connectivity(&self) -> Arc<NasConnectivity> {
+        self.connectivity.clone()
+    }
+
+    /// Stop the NAS watcher (e.g., when NAS goes offline).
+    pub fn stop_watcher(&self) {
+        if let Some(ref w) = self.nas_watcher {
+            w.stop();
+        }
+    }
+
+    /// Restart the NAS watcher after reconnect.
+    pub fn restart_watcher(&self) {
+        if let Some(ref w) = self.nas_watcher {
+            w.restart();
+        }
     }
 
     /// Get the current sync activity summary for UI display.

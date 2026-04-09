@@ -22,6 +22,9 @@ pub struct Orchestrator {
     /// Current sync sub-state, tracked independently from MountState.
     #[cfg(windows)]
     sync_state: SyncState,
+    /// Shared NAS connectivity state for reconnect (Windows sync only).
+    #[cfg(windows)]
+    connectivity: Option<std::sync::Arc<crate::sync::NasConnectivity>>,
 }
 
 impl Orchestrator {
@@ -45,6 +48,8 @@ impl Orchestrator {
             sync_root: None,
             #[cfg(windows)]
             sync_state: SyncState::Disabled,
+            #[cfg(windows)]
+            connectivity: None,
         }
     }
 
@@ -69,8 +74,11 @@ impl Orchestrator {
             self.handle_event(MountEvent::RequestStateUpdate).await;
         }
 
-        // Periodic sync activity update (2s) — only active for sync mounts
+        // Periodic sync activity update (2s) and NAS heartbeat (30s)
         let mut sync_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        // Non-blocking heartbeat: result arrives via channel so select! stays responsive
+        let (hb_tx, mut hb_rx) = mpsc::channel::<bool>(1);
 
         loop {
             tokio::select! {
@@ -102,6 +110,35 @@ impl Orchestrator {
                     #[cfg(windows)]
                     if self.sync_root.is_some() {
                         self.emit_state_update().await;
+                    }
+                }
+                // NAS heartbeat — fire-and-forget with 10s timeout, result comes via hb_rx
+                _ = heartbeat_tick.tick() => {
+                    #[cfg(windows)]
+                    if self.sync_root.is_some() {
+                        let nas_root = self.config.nas_share_path.clone();
+                        let tx = hb_tx.clone();
+                        tokio::spawn(async move {
+                            // Timeout the SMB metadata call — stale connections can block 60s+
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                tokio::task::spawn_blocking(move || {
+                                    std::fs::metadata(&nas_root).is_ok()
+                                }),
+                            ).await;
+                            let reachable = match result {
+                                Ok(Ok(r)) => r,
+                                _ => false, // Timeout or panic = unreachable
+                            };
+                            let _ = tx.send(reachable).await;
+                        });
+                    }
+                }
+                // Heartbeat result — handle disconnect/reconnect
+                Some(reachable) = hb_rx.recv() => {
+                    #[cfg(windows)]
+                    if self.sync_root.is_some() {
+                        self.handle_heartbeat_result(reachable).await;
                     }
                 }
             }
@@ -374,6 +411,7 @@ impl Orchestrator {
 
         match result {
             Ok(sync_root) => {
+                self.connectivity = Some(sync_root.connectivity());
                 self.sync_root = Some(sync_root);
                 self.sync_state = SyncState::Active;
                 log::info!("[{}] Sync root active", self.mount_id);
@@ -412,7 +450,71 @@ impl Orchestrator {
         .await;
 
         self.sync_state = SyncState::Disabled;
+        self.connectivity = None;
         log::info!("[{}] Sync stopped", self.mount_id);
+    }
+
+    /// Handle heartbeat result — trigger disconnect/reconnect as needed.
+    #[cfg(windows)]
+    async fn handle_heartbeat_result(&mut self, reachable: bool) {
+        match (reachable, &self.sync_state) {
+            (false, SyncState::Active) => {
+                // NAS just went down
+                log::warn!("[{}] NAS heartbeat failed — going offline", self.mount_id);
+                self.sync_state = SyncState::Offline;
+                if let Some(ref conn) = self.connectivity {
+                    conn.set_status(crate::sync::NasStatus::Offline);
+                }
+                // Stop the NAS watcher (its handle is now invalid)
+                if let Some(ref sr) = self.sync_root {
+                    sr.stop_watcher();
+                }
+                self.emit_state_update().await;
+                // Immediately transition to reconnecting
+                self.sync_state = SyncState::Reconnecting;
+                if let Some(ref conn) = self.connectivity {
+                    conn.set_status(crate::sync::NasStatus::Reconnecting);
+                }
+                self.emit_state_update().await;
+            }
+            (true, SyncState::Offline | SyncState::Reconnecting) => {
+                // NAS is back
+                log::info!("[{}] NAS heartbeat OK — reconnecting", self.mount_id);
+                self.complete_reconnect().await;
+            }
+            _ => {} // No change
+        }
+    }
+
+    /// Re-establish SMB session and restart the NAS watcher after a disconnect.
+    #[cfg(windows)]
+    async fn complete_reconnect(&mut self) {
+        // Re-establish SMB session
+        let share_path = self.config.nas_share_path.clone();
+        let (username, password) = self.retrieve_credentials().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::platform::windows::fallback::establish_smb_session(&share_path, &username, &password)
+        })
+        .await;
+
+        // Mark server as connected
+        let host = Self::server_host(&self.config.nas_share_path);
+        if !host.is_empty() {
+            self.connected_servers.lock().unwrap().insert(host);
+        }
+
+        // Restart NAS watcher (runs full_diff to catch up)
+        if let Some(ref sr) = self.sync_root {
+            sr.restart_watcher();
+        }
+
+        // Set online
+        self.sync_state = SyncState::Active;
+        if let Some(ref conn) = self.connectivity {
+            conn.set_status(crate::sync::NasStatus::Online);
+        }
+        self.emit_state_update().await;
+        log::info!("[{}] NAS reconnected", self.mount_id);
     }
 
     /// Credential keys in the config are bare names (e.g., "gfx-nas").

@@ -113,6 +113,7 @@ impl WriteThrough {
         client_root: PathBuf,
         nas_root: PathBuf,
         echo: Arc<EchoSuppressor>,
+        connectivity: Arc<super::connectivity::NasConnectivity>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let client_dir_handle = Arc::new(AtomicUsize::new(0));
@@ -132,7 +133,7 @@ impl WriteThrough {
             client_dir_handle.clone(),
         );
 
-        let worker_threads = worker::start_pool(job_rx, result_tx, echo.clone());
+        let worker_threads = worker::start_pool(job_rx, result_tx, echo.clone(), connectivity);
 
         let handle = tokio::runtime::Handle::current();
         let cr = client_root.clone();
@@ -367,6 +368,7 @@ async fn on_upload_result(
         UploadResult::Failed {
             ref local_path,
             ref error,
+            ref retriable,
         } => {
             log::error!(
                 "[write-through] Upload failed for {:?}: {}",
@@ -379,8 +381,14 @@ async fn on_upload_result(
                 .to_string_lossy()
                 .to_string();
             activity.lock().unwrap().last_error = Some(format!("{} — {}", file_name, error));
-            // Reset to idle — will retry on next modification
-            states.remove(local_path);
+            if *retriable {
+                // Network error — re-queue with longer debounce for auto-retry after reconnect
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                states.insert(local_path.clone(), FileState::Debouncing { deadline });
+                log::info!("[write-through] Will retry: {:?}", local_path);
+            } else {
+                states.remove(local_path);
+            }
         }
     }
 }

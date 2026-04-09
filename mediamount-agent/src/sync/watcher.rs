@@ -80,6 +80,25 @@ impl NasWatcher {
     pub fn stop(&self) {
         log::info!("[sync-watcher] Stopping NAS watcher");
         self.shutdown.store(true, Ordering::SeqCst);
+        self.cancel_io();
+        self.join_thread(3);
+    }
+
+    /// Restart the watcher after a reconnect. Preserves the watched folder map.
+    /// Runs full_diff on all watched folders to catch changes missed while offline.
+    pub fn restart(&self) {
+        log::info!("[sync-watcher] Restarting NAS watcher");
+        // Ensure old thread is dead
+        self.cancel_io();
+        self.join_thread(1);
+        // Reset for new thread
+        self.shutdown.store(false, Ordering::SeqCst);
+        self.dir_handle.store(0, Ordering::SeqCst);
+        // Spawn new watcher — start() handles the rest
+        self.start();
+    }
+
+    fn cancel_io(&self) {
         let h = self.dir_handle.load(Ordering::SeqCst);
         if h != 0 {
             let handle = HANDLE(h as *mut std::ffi::c_void);
@@ -87,15 +106,17 @@ impl NasWatcher {
                 let _ = windows::Win32::System::IO::CancelIoEx(handle, None);
             }
         }
+    }
+
+    fn join_thread(&self, timeout_secs: u64) {
         if let Some(t) = self.thread.lock().unwrap().take() {
-            // Timeout: NAS might be unreachable, don't block shutdown
             let start = std::time::Instant::now();
             loop {
                 if t.is_finished() {
                     let _ = t.join();
                     break;
                 }
-                if start.elapsed() > std::time::Duration::from_secs(3) {
+                if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
                     log::warn!("[sync-watcher] NAS watcher thread join timed out");
                     break;
                 }
@@ -135,6 +156,9 @@ fn run_watcher_loop(
     dir_handle_store.store(handle.0 as usize, Ordering::SeqCst);
 
     log::info!("[sync-watcher] Watching {:?}", nas_root);
+
+    // Reconcile any changes missed while offline (e.g., after a reconnect)
+    full_diff_all_watched(nas_root, watched, echo);
 
     let mut buffer = vec![0u8; 16384];
     let mut bytes_returned: u32 = 0;
