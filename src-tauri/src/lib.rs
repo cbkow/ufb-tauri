@@ -19,6 +19,7 @@ pub mod udp_notify;
 pub mod mount_client;
 pub mod explorer_pins;
 pub mod shell_context_menu;
+pub mod sync_aware;
 pub mod system_icons;
 pub mod transcode;
 pub mod utils;

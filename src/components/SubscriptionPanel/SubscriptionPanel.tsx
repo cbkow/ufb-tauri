@@ -310,7 +310,11 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 const stateLabel = () => {
                   if (isSync()) {
                     const ss = ms()?.syncState;
-                    if (ss === "active") return "Sync";
+                    if (ss === "active") {
+                      const detail = ms()?.syncStateDetail;
+                      if (detail && detail !== "Active") return detail;
+                      return "Sync";
+                    }
                     if (ss === "registering") return "Starting";
                     if (ss === "error") return "Error";
                     if (ss === "deregistering") return "Stopping";

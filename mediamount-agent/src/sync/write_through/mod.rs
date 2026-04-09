@@ -64,6 +64,33 @@ enum FileState {
     },
 }
 
+// ── Sync activity (shared with orchestrator for status reporting) ────
+
+/// Current sync activity — read by orchestrator for UI status.
+#[derive(Default)]
+pub struct SyncActivity {
+    pub uploading: usize,
+    pub queued: usize,
+    pub last_error: Option<String>,
+}
+
+impl SyncActivity {
+    pub fn summary(&self) -> String {
+        if self.uploading == 0 && self.queued == 0 {
+            if let Some(ref err) = self.last_error {
+                return format!("Error: {}", err);
+            }
+            return "Up to date".to_string();
+        }
+        let total = self.uploading + self.queued;
+        if self.queued > 0 {
+            format!("Syncing {} files ({} queued)", self.uploading, self.queued)
+        } else {
+            format!("Syncing {} file{}", total, if total == 1 { "" } else { "s" })
+        }
+    }
+}
+
 // ── WriteThrough — owns all threads and the coordinator task ────────
 
 /// Manages the write-through pipeline for a single sync root.
@@ -75,6 +102,8 @@ pub struct WriteThrough {
     watcher_thread: Option<std::thread::JoinHandle<()>>,
     worker_threads: Vec<std::thread::JoinHandle<()>>,
     coordinator_task: Option<tokio::task::JoinHandle<()>>,
+    /// Sync activity — shared with orchestrator for status reporting.
+    pub activity: Arc<Mutex<SyncActivity>>,
 }
 
 impl WriteThrough {
@@ -87,6 +116,7 @@ impl WriteThrough {
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let client_dir_handle = Arc::new(AtomicUsize::new(0));
+        let activity = Arc::new(Mutex::new(SyncActivity::default()));
 
         // Client watcher → coordinator
         let (event_tx, event_rx) = mpsc::channel::<ClientFsEvent>(256);
@@ -107,8 +137,9 @@ impl WriteThrough {
         let handle = tokio::runtime::Handle::current();
         let cr = client_root.clone();
         let nr = nas_root.clone();
+        let act = activity.clone();
         let coordinator_task = handle.spawn(run_coordinator(
-            cr, nr, event_rx, job_tx, result_rx, echo,
+            cr, nr, event_rx, job_tx, result_rx, echo, act,
         ));
 
         log::info!(
@@ -123,6 +154,7 @@ impl WriteThrough {
             watcher_thread: Some(watcher_thread),
             worker_threads,
             coordinator_task: Some(coordinator_task),
+            activity,
         }
     }
 
@@ -195,6 +227,7 @@ async fn run_coordinator(
     job_tx: crossbeam_channel::Sender<UploadJob>,
     mut result_rx: mpsc::Receiver<UploadResult>,
     echo: Arc<EchoSuppressor>,
+    activity: Arc<Mutex<SyncActivity>>,
 ) {
     let mut states: HashMap<PathBuf, FileState> = HashMap::new();
     // Paths recently converted to placeholders — ignore events from our own conversion
@@ -227,12 +260,18 @@ async fn run_coordinator(
             }
             result = result_rx.recv() => {
                 match result {
-                    Some(r) => on_upload_result(&mut states, r, &mut recently_converted).await,
+                    Some(r) => on_upload_result(&mut states, r, &mut recently_converted, &activity).await,
                     None => break,
                 }
             }
             _ = tick.tick() => {
                 check_deadlines(&mut states, &client_root, &nas_root, &job_tx);
+                // Update activity stats for UI
+                let uploading = states.values().filter(|s| matches!(s, FileState::Uploading { .. })).count();
+                let queued = states.values().filter(|s| matches!(s, FileState::Debouncing { .. })).count();
+                let mut act = activity.lock().unwrap();
+                act.uploading = uploading;
+                act.queued = queued;
             }
         }
     }
@@ -301,6 +340,7 @@ async fn on_upload_result(
     states: &mut HashMap<PathBuf, FileState>,
     result: UploadResult,
     recently_converted: &mut HashMap<PathBuf, std::time::Instant>,
+    activity: &Arc<Mutex<SyncActivity>>,
 ) {
     match result {
         UploadResult::Success {
@@ -308,6 +348,8 @@ async fn on_upload_result(
             ref nas_path,
         } => {
             states.remove(local_path);
+            // Clear last error on success
+            activity.lock().unwrap().last_error = None;
             // Suppress post-conversion events for this path
             recently_converted.insert(local_path.clone(), std::time::Instant::now());
             // Convert local file to hydrated placeholder (blocking Win32 call)
@@ -320,7 +362,6 @@ async fn on_upload_result(
             .ok();
         }
         UploadResult::Cancelled { ref local_path } => {
-            // State was already reset by the event that triggered cancellation
             log::debug!("[write-through] Upload cancelled: {:?}", local_path);
         }
         UploadResult::Failed {
@@ -332,6 +373,12 @@ async fn on_upload_result(
                 local_path,
                 error
             );
+            // Record error for UI
+            let file_name = local_path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            activity.lock().unwrap().last_error = Some(format!("{} — {}", file_name, error));
             // Reset to idle — will retry on next modification
             states.remove(local_path);
         }

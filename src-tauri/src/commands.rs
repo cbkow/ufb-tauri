@@ -360,6 +360,13 @@ async fn do_copy_with_progress(
             };
             let target = dest_path.join(file_name);
 
+            // Sync-aware: copy within sync root creates a dehydrated placeholder (instant)
+            match crate::sync_aware::sync_copy(src_path, dest_path) {
+                Ok(true) => { succeeded += 1; continue; }
+                Ok(false) => {} // Not in sync root, fall through to normal copy
+                Err(e) => { errors.push(e); continue; }
+            }
+
             let item_result = if src_path.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();
                 options.overwrite = true;
@@ -477,6 +484,13 @@ async fn do_move_with_progress(
                 }
             };
             let target = dest_path.join(file_name);
+
+            // Sync-aware: move within sync root uses fs::rename (instant)
+            match crate::sync_aware::sync_move(src_path, dest_path) {
+                Ok(true) => { succeeded += 1; continue; }
+                Ok(false) => {} // Not in sync root, fall through to normal move
+                Err(e) => { errors.push(e); continue; }
+            }
 
             let item_result = if src_path.is_dir() {
                 let mut options = fs_extra::dir::CopyOptions::new();

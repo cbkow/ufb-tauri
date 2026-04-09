@@ -69,6 +69,9 @@ impl Orchestrator {
             self.handle_event(MountEvent::RequestStateUpdate).await;
         }
 
+        // Periodic sync activity update (2s) — only active for sync mounts
+        let mut sync_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+
         loop {
             tokio::select! {
                 event = self.event_rx.recv() => {
@@ -92,6 +95,13 @@ impl Orchestrator {
                             log::info!("[{}] Event channel closed, orchestrator exiting", self.mount_id);
                             break;
                         }
+                    }
+                }
+                // Periodic sync activity update
+                _ = sync_tick.tick() => {
+                    #[cfg(windows)]
+                    if self.sync_root.is_some() {
+                        self.emit_state_update().await;
                     }
                 }
             }
@@ -503,9 +513,17 @@ impl Orchestrator {
         let (sync_state, sync_state_detail) = {
             #[cfg(windows)]
             if self.config.is_sync_mode() {
+                let detail = if self.sync_state == SyncState::Active {
+                    // Include activity summary when active
+                    self.sync_root.as_ref()
+                        .map(|sr| sr.activity_summary())
+                        .unwrap_or_else(|| self.sync_state.to_string())
+                } else {
+                    self.sync_state.to_string()
+                };
                 (
                     Some(self.sync_state.state_name().to_string()),
-                    Some(self.sync_state.to_string()),
+                    Some(detail),
                 )
             } else {
                 (None, None)

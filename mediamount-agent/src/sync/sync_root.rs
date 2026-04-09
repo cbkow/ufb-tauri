@@ -151,6 +151,15 @@ impl SyncRoot {
         log::info!("[sync] Sync root '{}' stopped", self.mount_id);
     }
 
+    /// Get the current sync activity summary for UI display.
+    pub fn activity_summary(&self) -> String {
+        if let Some(ref wt) = self.write_through {
+            wt.activity.lock().unwrap().summary()
+        } else {
+            "Disabled".to_string()
+        }
+    }
+
     /// Icon for the sync root in Explorer.
     /// Uses cloud-sync.ico next to the exe, falls back to embedded exe icon.
     fn find_icon() -> String {
