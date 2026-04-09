@@ -1013,6 +1013,26 @@ pub async fn get_thumbnail(
     }
 }
 
+// ── System Icons ──
+
+/// Get the OS-native file type icon as a base64-encoded PNG data URL.
+/// Cached by extension — only one OS API call per unique extension.
+#[tauri::command]
+pub fn get_system_icon(
+    state: State<'_, AppState>,
+    extension: String,
+    size: u32,
+) -> Result<Option<String>, String> {
+    match state.system_icon_cache.get_icon(&extension, size)? {
+        Some(png_bytes) => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            Ok(Some(format!("data:image/png;base64,{}", b64)))
+        }
+        None => Ok(None),
+    }
+}
+
 // ── Transcode ──
 
 #[tauri::command]

@@ -246,6 +246,11 @@ export const transcodeRemoveJob = (id: string) =>
 export const transcodeClearCompleted = () =>
   invoke<void>("transcode_clear_completed");
 
+// ── System Icons ──
+
+export const getSystemIcon = (extension: string, size: number = 32) =>
+  invoke<string | null>("get_system_icon", { extension, size });
+
 // ── Mount (MediaMount Agent) ──
 
 export const mountGetStates = () =>

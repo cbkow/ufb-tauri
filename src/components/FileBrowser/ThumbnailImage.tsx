@@ -1,6 +1,7 @@
 import { createSignal, onMount, onCleanup } from "solid-js";
 import { getThumbnail } from "../../lib/tauri";
 import { getFileIcon } from "../../lib/fileIcons";
+import { getSystemIconCached } from "../../lib/systemIconCache";
 
 interface ThumbnailImageProps {
   filePath: string;
@@ -54,7 +55,18 @@ export function ThumbnailImage(props: ThumbnailImageProps) {
   let cancelled = false;
 
   onMount(() => {
-    if (props.isDir || !props.extension) return;
+    const ext = props.isDir ? "folder" : props.extension;
+
+    if (props.isDir || !props.extension) {
+      // Directories: skip thumbnail, try system folder icon directly
+      if (ext) {
+        getSystemIconCached(ext, 32).then((iconUrl) => {
+          if (cancelled) return;
+          if (iconUrl) setSrc(iconUrl);
+        });
+      }
+      return;
+    }
 
     // Instant cache hit
     const cached = thumbCache.get(props.filePath);
@@ -71,6 +83,13 @@ export function ThumbnailImage(props: ThumbnailImageProps) {
         setSrc(dataUrl);
       } else {
         noThumbPaths.add(props.filePath);
+        // No thumbnail — try system icon as fallback
+        if (ext) {
+          getSystemIconCached(ext, 32).then((iconUrl) => {
+            if (cancelled) return;
+            if (iconUrl) setSrc(iconUrl);
+          });
+        }
       }
     });
   });

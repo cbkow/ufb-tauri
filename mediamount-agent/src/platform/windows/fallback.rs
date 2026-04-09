@@ -61,9 +61,9 @@ pub fn connect_drive(
     // ERROR_SESSION_CREDENTIAL_CONFLICT (1219) — session exists with different creds.
     // Retry without credentials to reuse the existing session.
     if result == WIN32_ERROR(1219) {
-        log::debug!(
-            "Credential conflict for {}, retrying with existing session",
-            share_path
+        log::info!(
+            "Session already exists for {}, reusing for {}:\\",
+            share_path, drive_letter
         );
         let retry = unsafe {
             WNetAddConnection2W(&nr, PCWSTR::null(), PCWSTR::null(), NET_CONNECT_FLAGS(0))
@@ -72,7 +72,6 @@ pub fn connect_drive(
             log::info!("Mapped {}:\\ → {} (reusing session)", drive_letter, share_path);
             return Ok(());
         }
-        // Also handle already-assigned on retry
         if retry == WIN32_ERROR(85) {
             let _ = disconnect_drive(drive_letter);
             let retry2 = unsafe {
@@ -84,7 +83,7 @@ pub fn connect_drive(
             }
         }
         return Err(format!(
-            "WNetAddConnection2W failed for {}:\\ → {} after credential conflict: error {:?}",
+            "WNetAddConnection2W failed for {}:\\ → {} after session reuse: error {:?}",
             drive_letter, share_path, retry
         ));
     }

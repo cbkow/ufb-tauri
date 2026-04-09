@@ -1,7 +1,8 @@
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createMemo, createSignal, onMount } from "solid-js";
 import type { BrowserStore } from "../../stores/fileStore";
 import type { FileEntry } from "../../lib/types";
 import { getFileIcon } from "../../lib/fileIcons";
+import { getSystemIconCached } from "../../lib/systemIconCache";
 import { makeColumnResizer } from "../../lib/useColumnResize";
 import { settingsStore } from "../../stores/settingsStore";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
@@ -12,6 +13,31 @@ function formatSize(bytes: number): string {
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   const val = bytes / Math.pow(1024, i);
   return `${val.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+/** List view icon cell: shows system icon if available, Material Symbol fallback. */
+function FileIconCell(props: { extension: string; isDir: boolean }) {
+  const [sysIcon, setSysIcon] = createSignal<string | null>(null);
+  const icon = () => getFileIcon(props.extension, props.isDir);
+
+  onMount(() => {
+    // Folders use "folder" as the extension key for the system icon lookup
+    const ext = props.isDir ? "folder" : props.extension;
+    if (!ext) return;
+    getSystemIconCached(ext, 32).then((url) => {
+      if (url) setSysIcon(url);
+    });
+  });
+
+  return (
+    <div class="file-cell col-icon file-icon" style={{ color: sysIcon() ? undefined : icon().color }}>
+      {sysIcon() ? (
+        <img src={sysIcon()!} alt="" width={16} height={16} style={{ "vertical-align": "middle" }} draggable={false} />
+      ) : (
+        <span class="icon">{icon().icon}</span>
+      )}
+    </div>
+  );
 }
 
 function formatDate(ms: number | null): string {
@@ -174,11 +200,7 @@ export function FileListView(props: FileListViewProps) {
             onClick={(e) => handleClick(entry, e)}
             onContextMenu={(e) => props.onItemContextMenu(e, entry)}
           >
-            {(() => { const icon = getFileIcon(entry.extension, entry.isDir); return (
-                <div class="file-cell col-icon file-icon" style={{ color: icon.color }}>
-                  <span class="icon">{icon.icon}</span>
-                </div>
-              ); })()}
+            <FileIconCell extension={entry.extension} isDir={entry.isDir} />
             <div class="file-cell file-name">{entry.name}</div>
             <Show when={showSize()}>
               <div class="file-cell file-size" style={{ width: `${sizeW()}px` }}>

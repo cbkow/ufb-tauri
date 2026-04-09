@@ -6,6 +6,7 @@ use crate::mesh_sync::MeshSyncManager;
 use crate::metadata::MetadataManager;
 use crate::mount_client::MountClient;
 use crate::subscription::SubscriptionManager;
+use crate::system_icons::SystemIconCache;
 use crate::thumbnails::ThumbnailManager;
 use crate::transcode::TranscodeManager;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub bookmark_manager: BookmarkManager,
     pub backup_manager: BackupManager,
     pub thumbnail_manager: ThumbnailManager,
+    pub system_icon_cache: SystemIconCache,
     pub mesh_sync_manager: Mutex<Option<MeshSyncManager>>,
     pub transcode_manager: Arc<TranscodeManager>,
     pub mount_client: Arc<MountClient>,
@@ -73,6 +75,7 @@ impl AppState {
             bookmark_manager,
             backup_manager,
             thumbnail_manager,
+            system_icon_cache: SystemIconCache::new(),
             mesh_sync_manager,
             transcode_manager,
             mount_client,

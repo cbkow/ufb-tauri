@@ -1,6 +1,8 @@
 use crate::config::MountConfig;
 use crate::messages::{AgentToUfb, MountStateUpdateMsg};
 use crate::state::{self, Effect, LogLevel, MountEvent, MountState, SyncState};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Per-mount orchestrator. Receives events, runs transitions, dispatches effects.
@@ -11,6 +13,9 @@ pub struct Orchestrator {
     event_tx: mpsc::Sender<MountEvent>,
     event_rx: mpsc::Receiver<MountEvent>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
+    /// Servers with active SMB sessions — shared across all orchestrators.
+    /// If a server is already connected, skip credential lookup and reuse the session.
+    connected_servers: Arc<Mutex<HashSet<String>>>,
     /// On-demand sync root (Windows only). Held alive to keep the CF session active.
     #[cfg(windows)]
     sync_root: Option<crate::sync::SyncRoot>,
@@ -23,6 +28,7 @@ impl Orchestrator {
     pub fn new(
         config: MountConfig,
         ipc_tx: mpsc::Sender<AgentToUfb>,
+        connected_servers: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(64);
         let mount_id = config.id.clone();
@@ -34,6 +40,7 @@ impl Orchestrator {
             event_tx,
             event_rx,
             ipc_tx,
+            connected_servers,
             #[cfg(windows)]
             sync_root: None,
             #[cfg(windows)]
@@ -183,6 +190,12 @@ impl Orchestrator {
                     .event_tx
                     .send(MountEvent::MountFailed { reason: e })
                     .await;
+            } else {
+                // Mark server as connected so other mounts skip credential lookup
+                let host = Self::server_host(&self.config.nas_share_path);
+                if !host.is_empty() {
+                    self.connected_servers.lock().unwrap().insert(host);
+                }
             }
         }
 
@@ -331,6 +344,12 @@ impl Orchestrator {
             return;
         }
 
+        // Mark server as connected so other mounts skip credential lookup
+        let host = Self::server_host(&self.config.nas_share_path);
+        if !host.is_empty() {
+            self.connected_servers.lock().unwrap().insert(host);
+        }
+
         // Register and connect sync root (blocking — CF API registration is synchronous)
         let mid = self.mount_id.clone();
         let display_name = self.config.display_name.clone();
@@ -390,7 +409,28 @@ impl Orchestrator {
     /// The Tauri app stores them with a "mediamount_" prefix in the OS credential store.
     const CRED_PREFIX: &'static str = "mediamount_";
 
+    /// Extract the server hostname from a UNC path (e.g., \\192.168.40.100\share → 192.168.40.100).
+    fn server_host(nas_path: &str) -> String {
+        nas_path
+            .trim_start_matches('\\')
+            .split('\\')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
+    }
+
     async fn retrieve_credentials(&self) -> (String, String) {
+        // If another mount already connected to this server, skip credential lookup
+        // and let the OS reuse the existing session.
+        let host = Self::server_host(&self.config.nas_share_path);
+        if !host.is_empty() && self.connected_servers.lock().unwrap().contains(&host) {
+            log::debug!(
+                "[{}] Server {} already connected, reusing session",
+                self.mount_id, host
+            );
+            return (String::new(), String::new());
+        }
+
         let key = &self.config.credential_key;
         if key.is_empty() {
             return (String::new(), String::new());

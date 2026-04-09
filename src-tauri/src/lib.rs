@@ -19,6 +19,7 @@ pub mod udp_notify;
 pub mod mount_client;
 pub mod explorer_pins;
 pub mod shell_context_menu;
+pub mod system_icons;
 pub mod transcode;
 pub mod utils;
 
@@ -219,6 +220,8 @@ pub fn run() {
             commands::restore_backup,
             // Thumbnails
             commands::get_thumbnail,
+            // System icons
+            commands::get_system_icon,
             // Item creation
             commands::get_folder_add_mode,
             commands::detect_folder_layout_mode,

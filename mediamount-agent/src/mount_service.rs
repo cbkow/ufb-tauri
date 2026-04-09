@@ -2,13 +2,16 @@ use crate::config::{self, MountConfig, MountsConfig};
 use crate::messages::{AgentToUfb, AckMsg, ErrorMsg, UfbToAgent};
 use crate::orchestrator::Orchestrator;
 use crate::state::MountEvent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Top-level mount manager. Manages N mount instances.
 pub struct MountService {
     mounts: HashMap<String, MountInstance>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
+    /// Servers with active SMB sessions — shared across all orchestrators.
+    connected_servers: Arc<Mutex<HashSet<String>>>,
 }
 
 struct MountInstance {
@@ -22,6 +25,7 @@ impl MountService {
         Self {
             mounts: HashMap::new(),
             ipc_tx,
+            connected_servers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -96,7 +100,11 @@ impl MountService {
 
         log::info!("Starting mount: {}", mount_id);
 
-        let mut orchestrator = Orchestrator::new(config.clone(), self.ipc_tx.clone());
+        let mut orchestrator = Orchestrator::new(
+            config.clone(),
+            self.ipc_tx.clone(),
+            self.connected_servers.clone(),
+        );
         let event_tx = orchestrator.event_sender();
 
         // Run orchestrator in background task
