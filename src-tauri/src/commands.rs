@@ -943,8 +943,19 @@ pub async fn start_native_drag(
 ) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
-        // Windows OLE drag blocks on the calling thread (pumps own message loop)
-        crate::drag_out::start_native_drag(&window, &paths)
+        // DoDragDrop is blocking but pumps its own message loop — safe to call
+        // from the main UI thread. Must NOT run on the async runtime (blocks it).
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let window_clone = window.clone();
+        let paths_clone = paths.clone();
+
+        app.run_on_main_thread(move || {
+            let result = crate::drag_out::start_native_drag(&window_clone, &paths_clone);
+            let _ = tx.send(result);
+        }).map_err(|e| format!("Failed to dispatch to main thread: {}", e))?;
+
+        rx.recv().map_err(|e| format!("Drag thread error: {}", e))?
     }
     #[cfg(target_os = "macos")]
     {
