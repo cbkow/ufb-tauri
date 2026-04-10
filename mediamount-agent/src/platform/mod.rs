@@ -43,59 +43,6 @@ pub trait CredentialStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), String>;
 }
 
-/// Check if a drive letter (Windows) or mount path (Linux) is already in use.
-pub fn is_drive_in_use(path_or_letter: &str) -> bool {
-    #[cfg(windows)]
-    {
-        let path = format!("{}:\\", path_or_letter);
-        std::path::Path::new(&path).exists()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // Check /proc/mounts for the given path
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            let normalized = path_or_letter.trim_end_matches('/');
-            for line in mounts.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1].trim_end_matches('/') == normalized {
-                    return true;
-                }
-            }
-        }
-        // Also check if the path exists as a non-empty directory
-        if let Ok(mut entries) = std::fs::read_dir(path_or_letter) {
-            return entries.next().is_some();
-        }
-        false
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Check `mount` command output for the path
-        if let Ok(output) = std::process::Command::new("mount").output() {
-            if output.status.success() {
-                let mounts = String::from_utf8_lossy(&output.stdout);
-                let normalized = path_or_letter.trim_end_matches('/');
-                for line in mounts.lines() {
-                    // mount output format: "//server/share on /Volumes/share (smbfs, ...)"
-                    if let Some(on_pos) = line.find(" on ") {
-                        let after_on = &line[on_pos + 4..];
-                        let mount_point = after_on.split(' ').next().unwrap_or("");
-                        if mount_point.trim_end_matches('/') == normalized {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        // Also check if the path exists (symlink or directory)
-        std::path::Path::new(path_or_letter).exists()
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        std::path::Path::new(path_or_letter).exists()
-    }
-}
-
 /// Manage auto-start at login.
 #[cfg(windows)]
 pub fn set_auto_start(enabled: bool) -> Result<(), String> {

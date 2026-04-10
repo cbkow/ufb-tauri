@@ -324,7 +324,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                     if (ss === "disabled") return "Disabled";
                   }
                   const s = ms()?.state;
-                  if (s === "mounted") return "Mounted";
+                  if (s === "mounted") return "Connected";
                   if (s === "mounting" || s === "initializing") return "Starting";
                   if (s === "error") return "Error";
                   if (s === "stopped") return "Stopped";

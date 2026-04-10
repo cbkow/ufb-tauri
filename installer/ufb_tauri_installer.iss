@@ -5,7 +5,7 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.2.5"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
@@ -315,6 +315,13 @@ begin
   begin
     // Stop the MediaMount agent if running
     Exec('taskkill.exe', '/f /im {#AgentExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(500);
+
+    // Remove volume mount symlinks/junctions
+    if DirExists('C:\Volumes\ufb') then
+      DelTree('C:\Volumes\ufb', True, True, True);
+    // Remove empty Volumes dir if we created it
+    RemoveDir('C:\Volumes');
   end;
 
   if CurUninstallStep = usPostUninstall then
@@ -322,6 +329,9 @@ begin
 
     // Remove MediaMount auto-start
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'MediaMountAgent');
+
+    // Remove Explorer nav pane pins (CLSIDs with 0FB prefix)
+    Exec('powershell.exe', '-NoProfile -Command "Get-ChildItem ''HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace'' | Where-Object { $_.PSChildName -like ''*0FB*'' } | ForEach-Object { $clsid = $_.PSChildName; Remove-Item -Path (''HKCU:\Software\Classes\CLSID\'' + $clsid) -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path $_.PSPath -Force -ErrorAction SilentlyContinue }"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
     // Remove firewall rules
     Exec('netsh.exe', 'advfirewall firewall delete rule name="UFB Mesh Sync (TCP)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -349,12 +359,13 @@ begin
     DeleteFile(NilesoftDir + '\imports\taskbar.nss');
     DeleteFile(NilesoftDir + '\imports\modify.nss');
 
-    // Prompt to delete user data
+    // Prompt to delete user data (includes sync cache, DB, settings)
     UserDataDir := ExpandConstant('{localappdata}\ufb');
     if DirExists(UserDataDir) then
     begin
-      Response := MsgBox('Do you want to delete your user data, settings, and database?' + #13#10 +
+      Response := MsgBox('Do you want to delete your user data, settings, database, and sync cache?' + #13#10 +
                          'Location: ' + UserDataDir + #13#10#13#10 +
+                         'This includes cached sync files, mount configurations, and preferences.' + #13#10#13#10 +
                          'Choose "Yes" for a clean uninstall.' + #13#10 +
                          'Choose "No" to keep data for future installations (RECOMMENDED).',
                          mbConfirmation, MB_YESNO);

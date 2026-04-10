@@ -750,13 +750,6 @@ function MountsSection(props: {
     if (!m.nasSharePath.trim()) return true;
     // Duplicate ID check (only when adding new)
     if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id)) return true;
-    // Duplicate drive letter (Windows, excluding self when editing, skip sync mounts)
-    if (props.platform() === "win" && m.mountDriveLetter && !m.syncEnabled) {
-      const dup = props.mountConfig().mounts.some(
-        (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
-      );
-      if (dup) return true;
-    }
     return false;
   });
 
@@ -767,12 +760,6 @@ function MountsSection(props: {
     if (!m.nasSharePath.trim()) return "NAS share path is required";
     if (isNew() && props.mountConfig().mounts.some((e) => e.id === m.id))
       return "A mount with this ID already exists";
-    if (props.platform() === "win" && m.mountDriveLetter && !m.syncEnabled) {
-      const dup = props.mountConfig().mounts.some(
-        (e) => e.mountDriveLetter && e.mountDriveLetter === m.mountDriveLetter && e.id !== m.id
-      );
-      if (dup) return `Drive letter ${m.mountDriveLetter}: is already used by another mount`;
-    }
     return "";
   });
 
@@ -902,39 +889,6 @@ function MountsSection(props: {
                 setConfirmDeleteCred(null);
               }}>Delete</button>
             </div>
-          </div>
-        </div>
-      </Show>
-
-      {/* Explorer drive visibility (Windows only) */}
-      <Show when={props.platform() === "win" && props.mountConfig().mounts.length > 0}>
-        <div class="settings-field">
-          <div class="settings-field-header">
-            <span>Explorer Drive Visibility</span>
-            <span class="settings-help" title="Hide mount-related drive letters from Explorer's 'This PC' view. Drives remain accessible by path. Requires admin (UAC prompt). Restart Explorer after changing.">?</span>
-          </div>
-          <div class="mount-controls" style={{ gap: "var(--spacing-sm)" }}>
-            <button
-              class="settings-btn"
-              onClick={() => {
-                const letters: string[] = [];
-                for (const m of props.mountConfig().mounts) {
-                  if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
-                }
-                if (letters.length > 0) mountHideDrives(letters);
-              }}
-            >Hide Drives</button>
-            <button
-              class="settings-btn"
-              onClick={() => {
-                const letters: string[] = [];
-                for (const m of props.mountConfig().mounts) {
-                  if (m.mountDriveLetter) letters.push(m.mountDriveLetter);
-                }
-                if (letters.length > 0) mountUnhideDrives(letters);
-              }}
-            >Show Drives</button>
-            <span class="settings-hint-inline">Restart Explorer after changing.</span>
           </div>
         </div>
       </Show>
@@ -1095,47 +1049,57 @@ function MountsSection(props: {
                     <span>Cache Limit</span>
                     <span class="settings-help" title="Maximum local disk space for cached (hydrated) files. Oldest files are evicted when over budget. Set to 0 for unlimited.">?</span>
                   </div>
-                  <div style={{ display: "flex", gap: "var(--spacing-sm)", "align-items": "center" }}>
-                    <select
-                      class="settings-select"
-                      value={(() => {
-                        const v = m().syncCacheLimitBytes ?? 0;
-                        const presets = [0, 10e9, 25e9, 50e9, 100e9, 200e9, 500e9];
-                        return presets.includes(v) ? String(v) : "custom";
-                      })()}
-                      onChange={(e) => {
-                        const val = e.currentTarget.value;
-                        if (val !== "custom") {
-                          updateField("syncCacheLimitBytes", Number(val));
-                        }
-                      }}
-                    >
-                      <option value="0">Unlimited</option>
-                      <option value="10000000000">10 GB</option>
-                      <option value="25000000000">25 GB</option>
-                      <option value="50000000000">50 GB</option>
-                      <option value="100000000000">100 GB</option>
-                      <option value="200000000000">200 GB</option>
-                      <option value="500000000000">500 GB</option>
-                      <option value="custom">Custom...</option>
-                    </select>
-                    <Show when={(() => {
+                  {(() => {
+                    const presets = [0, 10e9, 25e9, 50e9, 100e9, 200e9, 500e9];
+                    const isCustom = () => {
                       const v = m().syncCacheLimitBytes ?? 0;
-                      return ![0, 10e9, 25e9, 50e9, 100e9, 200e9, 500e9].includes(v) || false;
-                    })()}>
-                      <SettingsInput
-                        value={String(Math.round((m().syncCacheLimitBytes ?? 0) / 1e9))}
-                        placeholder="GB"
-                        onCommit={(v) => {
-                          const gb = parseFloat(v);
-                          if (!isNaN(gb) && gb >= 0) {
-                            updateField("syncCacheLimitBytes", Math.round(gb * 1e9));
-                          }
-                        }}
-                      />
-                      <span class="settings-hint-inline">GB</span>
-                    </Show>
-                  </div>
+                      return !presets.includes(v);
+                    };
+                    const [showCustom, setShowCustom] = createSignal(isCustom());
+                    return (
+                      <div style={{ display: "flex", gap: "var(--spacing-sm)", "align-items": "center" }}>
+                        <select
+                          class="settings-select"
+                          value={(() => {
+                            const v = m().syncCacheLimitBytes ?? 0;
+                            return presets.includes(v) && !showCustom() ? String(v) : "custom";
+                          })()}
+                          onChange={(e) => {
+                            const val = e.currentTarget.value;
+                            if (val === "custom") {
+                              setShowCustom(true);
+                            } else {
+                              setShowCustom(false);
+                              updateField("syncCacheLimitBytes", Number(val));
+                            }
+                          }}
+                        >
+                          <option value="0">Unlimited</option>
+                          <option value="10000000000">10 GB</option>
+                          <option value="25000000000">25 GB</option>
+                          <option value="50000000000">50 GB</option>
+                          <option value="100000000000">100 GB</option>
+                          <option value="200000000000">200 GB</option>
+                          <option value="500000000000">500 GB</option>
+                          <option value="custom">Custom...</option>
+                        </select>
+                        <Show when={showCustom()}>
+                          <SettingsInput
+                            type="number"
+                            value={String(Math.round((m().syncCacheLimitBytes ?? 0) / 1e9))}
+                            placeholder="GB"
+                            onCommit={(v) => {
+                              const gb = parseFloat(v);
+                              if (!isNaN(gb) && gb >= 0) {
+                                updateField("syncCacheLimitBytes", Math.round(gb * 1e9));
+                              }
+                            }}
+                          />
+                          <span class="settings-hint-inline">GB</span>
+                        </Show>
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 <button

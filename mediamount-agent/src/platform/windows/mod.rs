@@ -4,4 +4,4 @@ pub mod credentials;
 pub mod elevation;
 
 pub use credentials::WindowsCredentialStore;
-pub use mountpoint::{WindowsMountMapping, SymlinkError, VOLUMES_BASE};
+pub use mountpoint::WindowsMountMapping;
