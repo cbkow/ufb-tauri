@@ -515,6 +515,21 @@ impl CacheIndex {
     }
 }
 
+/// Check if a file is a Cloud Files placeholder (has the reparse point attribute).
+/// Returns false for regular user files. Cheap — no file open needed.
+pub(crate) fn is_cf_placeholder(path: &Path) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetFileAttributesW;
+
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+    attrs != u32::MAX && (attrs & 0x400) != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+}
+
 /// Check if a file is a hydrated placeholder (data present locally).
 /// Uses file attributes — cheap, no file open needed.
 fn is_hydrated(path: &Path) -> bool {

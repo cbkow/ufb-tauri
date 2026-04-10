@@ -445,8 +445,18 @@ fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str, cache: 
     }
 
     let is_dir = client_path.is_dir();
+
+    // Safety: only remove CF placeholders. Real files/directories that aren't
+    // on the NAS should be left for write-through to upload, not deleted.
+    if !is_dir && !super::cache::is_cf_placeholder(&client_path) {
+        log::info!("[sync-watcher] Skipping removal of real file: {}", display);
+        return;
+    }
+
     let result = if is_dir {
-        fs::remove_dir_all(&client_path)
+        // Only remove empty placeholder directories — never remove_dir_all
+        // which could destroy user content in subdirectories.
+        fs::remove_dir(&client_path)
     } else {
         fs::remove_file(&client_path)
     };
@@ -457,8 +467,7 @@ fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str, cache: 
                 cache.remove_known_file(&client_path);
             }
         }
-        // Access denied / not found is expected — the CF API delete callback
-        // may have already removed it, or it's still being processed.
+        // Access denied / not found / not empty is expected
         Err(e) => log::debug!("[sync-watcher] Remove skipped {}: {}", display, e),
     }
 }
@@ -573,7 +582,7 @@ pub fn diff_folder(nas_dir: &Path, client_dir: &Path, echo: &EchoSuppressor, cac
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| !n.starts_with('#') && !n.starts_with('@'))
+        .filter(|n| !n.starts_with('#') && !n.starts_with('@') && !n.starts_with('.'))
         .collect();
 
     let client_entries: std::collections::HashSet<String> = fs::read_dir(client_dir)

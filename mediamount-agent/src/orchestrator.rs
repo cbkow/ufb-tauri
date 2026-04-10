@@ -431,7 +431,8 @@ impl Orchestrator {
                 // Run startup reconciliation (DB-driven diff of visited folders)
                 if let Some(ref sr) = self.sync_root {
                     let mount_id = self.mount_id.clone();
-                    let (checked, changed, added, removed, updated) = sr.reconcile_startup();
+                    let (checked, changed, added, removed, updated) =
+                        sr.reconcile_startup();
                     if changed > 0 {
                         log::info!(
                             "[{}] Reconciliation: {}/{} folders changed (+{} -{} ~{})",

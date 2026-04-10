@@ -399,6 +399,67 @@ impl SyncRoot {
             total_updated += updated;
         }
 
+        // Second pass: scan visited folders for untracked real files that were
+        // deleted on NAS (in #recycle). Honors remote deletions for files created
+        // locally while offline. Untracked files NOT in #recycle are left for
+        // write-through to upload naturally.
+        let last_connected = self.cache.last_connected_at().unwrap_or(0);
+        for (_nas_dir, client_dir, _mtime) in &visited {
+            if !client_dir.is_dir() {
+                continue;
+            }
+            let entries = match fs::read_dir(client_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Local directory not on NAS — create it
+                    let relative = match path.strip_prefix(&self.client_root) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let nas_dir = self.nas_root.join(relative);
+                    if !nas_dir.exists() {
+                        match fs::create_dir_all(&nas_dir) {
+                            Ok(()) => log::info!(
+                                "[sync-reconcile] Created NAS directory: {}",
+                                relative.display()
+                            ),
+                            Err(e) => log::debug!(
+                                "[sync-reconcile] Failed to create NAS dir {:?}: {}",
+                                nas_dir, e
+                            ),
+                        }
+                    }
+                    continue;
+                }
+                if super::cache::is_cf_placeholder(&path) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let relative = match path.strip_prefix(&self.client_root) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let nas_path = self.nas_root.join(relative);
+                if nas_path.exists() {
+                    continue; // Already on NAS
+                }
+                if self.was_recycled_while_offline(&name, &path, last_connected) {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {
+                            total_removed += 1;
+                            log::info!("[sync-reconcile] - {} (recycled on NAS)", name);
+                        }
+                        Err(e) => log::warn!("[sync-reconcile] Remove failed {}: {}", name, e),
+                    }
+                }
+                // else: leave for write-through to upload
+            }
+        }
+
         log::info!(
             "[sync] Startup reconciliation done: {}/{} folders changed, +{} -{} ~{}",
             folders_changed,
@@ -415,6 +476,66 @@ impl SyncRoot {
             total_removed,
             total_updated,
         )
+    }
+
+    /// Check if a file was deleted on the NAS while we were offline (exists in #recycle
+    /// with mtime after last_connected_at) AND the local file matches the recycled version.
+    /// Returns true only if safe to honor the deletion — i.e., the local file isn't a
+    /// newer/different version that was never uploaded.
+    fn was_recycled_while_offline(
+        &self,
+        filename: &str,
+        local_path: &Path,
+        last_connected: i64,
+    ) -> bool {
+        let recycle_path = self.nas_root.join("#recycle").join(filename);
+        let recycle_meta = match fs::metadata(&recycle_path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        let recycle_mtime = recycle_meta
+            .modified()
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+            .unwrap_or(0);
+
+        // Was it recycled while we were offline?
+        if recycle_mtime <= last_connected {
+            return false;
+        }
+
+        // Compare local file against recycled version — only honor deletion if
+        // the local file matches (same size AND not modified after recycling).
+        let local_meta = match fs::metadata(local_path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        let local_mtime = local_meta
+            .modified()
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+            .unwrap_or(0);
+
+        let size_matches = local_meta.len() == recycle_meta.len();
+        let local_not_newer = local_mtime <= recycle_mtime;
+
+        if !size_matches || !local_not_newer {
+            log::info!(
+                "[sync-reconcile] Keeping {} — local differs from recycled (local: {} bytes mtime={}, recycled: {} bytes mtime={})",
+                filename, local_meta.len(), local_mtime, recycle_meta.len(), recycle_mtime
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Three-way diff for a single folder: DB (known state) vs NAS (current) vs Local (current).
@@ -453,7 +574,7 @@ impl SyncRoot {
             .filter_map(|e| e.ok())
             .filter(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
-                !n.starts_with('#') && !n.starts_with('@')
+                !n.starts_with('#') && !n.starts_with('@') && !n.starts_with('.')
             })
             .filter_map(|e| {
                 let meta = e.metadata().ok()?;
@@ -505,21 +626,38 @@ impl SyncRoot {
             }
         }
 
-        // In local but gone from NAS → remove placeholder
+        // In local but gone from NAS → classify and handle
+        let last_connected = self.cache.last_connected_at().unwrap_or(0);
+
         for name in local_names.difference(&nas_names) {
             let client_path = client_dir.join(*name);
-            // Only remove placeholders (dehydrated files), not hydrated user data
             if client_path.is_dir() {
                 continue;
             }
-            let result = fs::remove_file(&client_path);
-            match result {
-                Ok(()) => {
-                    self.cache.remove_known_file(&client_path);
-                    removed += 1;
-                    log::debug!("[sync-reconcile] - {}", name);
+
+            if super::cache::is_cf_placeholder(&client_path) {
+                // CF placeholder with no NAS backing — safe to remove
+                match fs::remove_file(&client_path) {
+                    Ok(()) => {
+                        self.cache.remove_known_file(&client_path);
+                        removed += 1;
+                        log::debug!("[sync-reconcile] - {} (placeholder)", name);
+                    }
+                    Err(e) => log::debug!("[sync-reconcile] Remove skipped {}: {}", name, e),
                 }
-                Err(e) => log::debug!("[sync-reconcile] Remove skipped {}: {}", name, e),
+            } else if self.was_recycled_while_offline(name, &client_path, last_connected) {
+                // Real file deleted on NAS while offline — honor the deletion
+                match fs::remove_file(&client_path) {
+                    Ok(()) => {
+                        self.cache.remove_known_file(&client_path);
+                        removed += 1;
+                        log::info!("[sync-reconcile] - {} (recycled on NAS)", name);
+                    }
+                    Err(e) => log::warn!("[sync-reconcile] Remove failed {}: {}", name, e),
+                }
+            } else {
+                // Real file not on NAS — leave for write-through to upload
+                log::info!("[sync-reconcile] Untracked local file, leaving for upload: {}", name);
             }
         }
 
