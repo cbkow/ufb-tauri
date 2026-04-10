@@ -427,6 +427,18 @@ impl Orchestrator {
                 self.sync_root = Some(sync_root);
                 self.sync_state = SyncState::Active;
                 log::info!("[{}] Sync root active", self.mount_id);
+
+                // Run startup reconciliation (DB-driven diff of visited folders)
+                if let Some(ref sr) = self.sync_root {
+                    let mount_id = self.mount_id.clone();
+                    let (checked, changed, added, removed, updated) = sr.reconcile_startup();
+                    if changed > 0 {
+                        log::info!(
+                            "[{}] Reconciliation: {}/{} folders changed (+{} -{} ~{})",
+                            mount_id, changed, checked, added, removed, updated
+                        );
+                    }
+                }
             }
             Err(e) => {
                 log::error!("[{}] Sync root failed: {}", self.mount_id, e);

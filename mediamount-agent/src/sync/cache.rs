@@ -105,12 +105,25 @@ impl CacheIndex {
                  value TEXT NOT NULL
              );
 
-             -- Migrate from old cache_index if it exists
-             INSERT OR IGNORE INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
-                 SELECT path, size, 0, 1, size, accessed FROM cache_index
-                 WHERE EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='cache_index');
              DROP TABLE IF EXISTS cache_index;",
-        )
+        )?;
+
+        // Migrate from old cache_index if it still exists (separate step —
+        // referencing a non-existent table in execute_batch fails even with
+        // a WHERE EXISTS guard because SQLite compiles the statement first).
+        let has_old_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cache_index')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_old_table {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
+                     SELECT path, size, 0, 1, size, accessed FROM cache_index;
+                 DROP TABLE cache_index;",
+            )?;
+        }
+        Ok(())
     }
 
     fn check_integrity(conn: &Connection) -> bool {
@@ -233,6 +246,18 @@ impl CacheIndex {
         let _ = db.execute(
             "INSERT OR REPLACE INTO visited_folders (nas_path, client_path, folder_mtime) VALUES (?1, ?2, ?3)",
             params![nas_str.as_ref(), client_str.as_ref(), folder_mtime],
+        );
+    }
+
+    /// Ensure a visited folder exists in the DB. If already present, keeps existing mtime.
+    /// If new, inserts with mtime=0 (forces reconciliation on next startup).
+    pub fn ensure_visited_folder(&self, nas_path: &Path, client_path: &Path) {
+        let nas_str = nas_path.to_string_lossy();
+        let client_str = client_path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO visited_folders (nas_path, client_path, folder_mtime) VALUES (?1, ?2, 0)",
+            params![nas_str.as_ref(), client_str.as_ref()],
         );
     }
 

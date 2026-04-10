@@ -472,6 +472,21 @@ fn convert_to_placeholder(local_path: &Path, nas_path: &Path) {
     }
 }
 
+/// Check if a file is a CF placeholder (has the reparse point attribute).
+fn is_placeholder(path: &Path) -> bool {
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let attrs = unsafe {
+        windows::Win32::Storage::FileSystem::GetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+        )
+    };
+    attrs != u32::MAX && (attrs & 0x400) != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+}
+
 /// Map a client path to its NAS counterpart.
 fn to_nas_path(local: &Path, client_root: &Path, nas_root: &Path) -> PathBuf {
     let relative = local.strip_prefix(client_root).unwrap_or(Path::new(""));
@@ -556,23 +571,9 @@ fn queue_non_placeholders(
 
         if path.is_dir() {
             queue_non_placeholders(client_root, &path, nas_root, job_tx);
-        } else if client_watcher::is_file(&path) {
-            let local_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        } else if client_watcher::is_file(&path) && !is_placeholder(&path) {
             let relative = path.strip_prefix(client_root).unwrap_or(Path::new(""));
             let nas_path = nas_root.join(relative);
-
-            // Don't upload 0-byte local files over non-empty NAS files —
-            // these are dehydrated placeholders that lost their reparse point.
-            if local_size == 0 {
-                let nas_size = std::fs::metadata(&nas_path).map(|m| m.len()).unwrap_or(0);
-                if nas_size > 0 {
-                    log::info!(
-                        "[write-through] Skipping 0-byte local file (NAS has {} bytes): {:?}",
-                        nas_size, relative
-                    );
-                    continue;
-                }
-            }
 
             let (_cancel_tx, cancel_rx) = oneshot::channel();
             let job = UploadJob {

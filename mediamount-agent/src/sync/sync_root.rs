@@ -73,7 +73,12 @@ impl SyncRoot {
         }
 
         // Create watcher
-        let watcher = Arc::new(NasWatcher::new(nas_root.clone(), echo.clone()));
+        let watcher = Arc::new(NasWatcher::new(
+            nas_root.clone(),
+            client_root.clone(),
+            echo.clone(),
+            cache.clone(),
+        ));
 
         // Helper to create a fresh filter instance
         let make_filter = |oh: Arc<Mutex<HashMap<PathBuf, u32>>>| {
@@ -124,6 +129,26 @@ impl SyncRoot {
         if !needs_repair && cache.total_cached_bytes() == 0 && is_reconnect {
             cache.rebuild(false); // scan and index, don't dehydrate
         }
+
+        // Ensure every locally-existing directory is registered in visited_folders.
+        // This is a local-only walk (no NAS I/O). Folders already in the DB keep
+        // their mtime; new ones get mtime=0 which forces reconcile_startup to diff them.
+        if is_reconnect {
+            let seeded = Self::seed_visited_folders(&nas_root, &client_root, &cache);
+            log::info!("[sync] Seeded {} local folders into visited_folders", seeded);
+        }
+
+        // Seed the watched map for overflow fallback (full_diff_all_watched).
+        // Live events use prefix swap and don't need the map.
+        watcher.register(nas_root.clone(), client_root.clone());
+        if is_reconnect {
+            for (nas_dir, client_dir, _mtime) in cache.visited_folders() {
+                watcher.register(nas_dir, client_dir);
+            }
+        }
+
+        // Start the NAS watcher thread
+        watcher.start();
 
         // Start the write-through pipeline
         let write_through = WriteThrough::start(
@@ -246,6 +271,295 @@ impl SyncRoot {
         if let Some(ref w) = self.nas_watcher {
             w.restart();
         }
+    }
+
+    /// Walk local directories and ensure each has an entry in visited_folders.
+    /// No NAS I/O — purely local filesystem + SQLite. Existing entries keep their
+    /// mtime; new ones get mtime=0 which tells reconcile_startup to diff them.
+    /// Returns the number of folders seeded.
+    fn seed_visited_folders(nas_root: &Path, client_root: &Path, cache: &Arc<CacheIndex>) -> u32 {
+        let mut count = 0u32;
+        // Seed the root itself
+        cache.ensure_visited_folder(nas_root, client_root);
+        count += 1;
+        // Seed all subdirectories
+        Self::seed_visited_inner(nas_root, client_root, client_root, cache, &mut count);
+        count
+    }
+
+    fn seed_visited_inner(
+        nas_root: &Path,
+        client_root: &Path,
+        dir: &Path,
+        cache: &Arc<CacheIndex>,
+        count: &mut u32,
+    ) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name.starts_with('#') || name.starts_with('@') {
+                continue;
+            }
+
+            // Map local dir to NAS dir via prefix swap
+            let relative = match path.strip_prefix(client_root) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let nas_dir = nas_root.join(relative);
+
+            // Insert with mtime=0 if not already in DB (existing entries keep their mtime)
+            cache.ensure_visited_folder(&nas_dir, &path);
+            *count += 1;
+
+            // Recurse
+            Self::seed_visited_inner(nas_root, client_root, &path, cache, count);
+        }
+    }
+
+    /// Startup reconciliation: diff visited folders against NAS to catch offline changes.
+    /// Uses folder mtime to skip unchanged folders, then three-way diff for changed ones.
+    /// Returns (folders_checked, folders_changed, files_added, files_removed, files_updated).
+    pub fn reconcile_startup(&self) -> (u32, u32, u32, u32, u32) {
+        let visited = self.cache.visited_folders();
+        if visited.is_empty() {
+            log::info!("[sync] Startup reconciliation: no visited folders in DB");
+            return (0, 0, 0, 0, 0);
+        }
+
+        log::info!(
+            "[sync] Startup reconciliation: checking {} visited folders",
+            visited.len()
+        );
+
+        let mut folders_checked = 0u32;
+        let mut folders_changed = 0u32;
+        let mut total_added = 0u32;
+        let mut total_removed = 0u32;
+        let mut total_updated = 0u32;
+
+        for (nas_dir, client_dir, stored_mtime) in &visited {
+            folders_checked += 1;
+
+            // Skip folders where client dir no longer exists (user deleted sync root content)
+            if !client_dir.is_dir() {
+                log::debug!(
+                    "[sync] Reconcile skip {:?}: client dir gone",
+                    client_dir
+                );
+                continue;
+            }
+
+            // Stat NAS folder — skip if unreachable
+            let nas_meta = match fs::metadata(nas_dir) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!(
+                        "[sync] Reconcile skip {:?}: NAS stat failed ({})",
+                        nas_dir, e
+                    );
+                    continue;
+                }
+            };
+
+            // Compare folder mtime — skip unchanged
+            let current_mtime = nas_meta
+                .modified()
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                })
+                .unwrap_or(0);
+
+            if current_mtime == *stored_mtime && *stored_mtime != 0 {
+                log::debug!(
+                    "[sync] Reconcile skip {:?}: mtime unchanged ({})",
+                    nas_dir, current_mtime
+                );
+                continue;
+            }
+
+            folders_changed += 1;
+
+            // Folder changed — three-way diff: DB vs NAS vs Local
+            let (added, removed, updated) =
+                self.reconcile_folder(nas_dir, client_dir, current_mtime);
+            total_added += added;
+            total_removed += removed;
+            total_updated += updated;
+        }
+
+        log::info!(
+            "[sync] Startup reconciliation done: {}/{} folders changed, +{} -{} ~{}",
+            folders_changed,
+            folders_checked,
+            total_added,
+            total_removed,
+            total_updated,
+        );
+
+        (
+            folders_checked,
+            folders_changed,
+            total_added,
+            total_removed,
+            total_updated,
+        )
+    }
+
+    /// Three-way diff for a single folder: DB (known state) vs NAS (current) vs Local (current).
+    /// NAS is truth. Returns (added, removed, updated).
+    fn reconcile_folder(
+        &self,
+        nas_dir: &Path,
+        client_dir: &Path,
+        current_mtime: i64,
+    ) -> (u32, u32, u32) {
+        use cloud_filter::{metadata::Metadata, placeholder_file::PlaceholderFile};
+        use std::collections::{HashMap, HashSet};
+
+        let mut added = 0u32;
+        let mut removed = 0u32;
+        let mut updated = 0u32;
+
+        // 1. DB state: known files in this folder (path, nas_size, nas_mtime)
+        let db_files = self.cache.known_files_in_folder(client_dir);
+        let db_map: HashMap<String, (i64, i64)> = db_files
+            .iter()
+            .map(|(path, size, mtime)| {
+                let name = Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                (name, (*size, *mtime))
+            })
+            .collect();
+
+        // 2. NAS state: current directory listing
+        let nas_entries: HashMap<String, (u64, i64)> = fs::read_dir(nas_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                !n.starts_with('#') && !n.starts_with('@')
+            })
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                if meta.is_dir() {
+                    return None; // Only reconcile files, not subdirs
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                let mtime = meta
+                    .modified()
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64
+                    })
+                    .unwrap_or(0);
+                Some((name, (meta.len(), mtime)))
+            })
+            .collect();
+
+        // 3. Local state: files currently on disk in client folder
+        let local_entries: HashSet<String> = fs::read_dir(client_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        let nas_names: HashSet<&String> = nas_entries.keys().collect();
+        let local_names: HashSet<&String> = local_entries.iter().collect();
+
+        // New on NAS, not in local → push placeholder
+        for name in nas_names.difference(&local_names) {
+            let nas_path = nas_dir.join(*name);
+            let (size, mtime) = nas_entries[*name];
+            let blob = nas_path.to_string_lossy().as_bytes().to_vec();
+            let cf_meta = Metadata::file().size(size);
+            let placeholder = PlaceholderFile::new(*name)
+                .metadata(cf_meta)
+                .mark_in_sync()
+                .blob(blob);
+            match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
+                Ok(_) => {
+                    let client_path = client_dir.join(*name);
+                    self.cache.record_known_file(&client_path, size, mtime);
+                    added += 1;
+                    log::debug!("[sync-reconcile] + {} ({})", name, size);
+                }
+                Err(e) => log::debug!("[sync-reconcile] Failed to add {}: {}", name, e),
+            }
+        }
+
+        // In local but gone from NAS → remove placeholder
+        for name in local_names.difference(&nas_names) {
+            let client_path = client_dir.join(*name);
+            // Only remove placeholders (dehydrated files), not hydrated user data
+            if client_path.is_dir() {
+                continue;
+            }
+            let result = fs::remove_file(&client_path);
+            match result {
+                Ok(()) => {
+                    self.cache.remove_known_file(&client_path);
+                    removed += 1;
+                    log::debug!("[sync-reconcile] - {}", name);
+                }
+                Err(e) => log::debug!("[sync-reconcile] Remove skipped {}: {}", name, e),
+            }
+        }
+
+        // Files in both NAS and local — check for metadata changes (size/mtime)
+        for name in nas_names.intersection(&local_names) {
+            let (nas_size, nas_mtime) = nas_entries[*name];
+            if let Some(&(db_size, db_mtime)) = db_map.get(*name) {
+                if nas_size as i64 == db_size && nas_mtime == db_mtime {
+                    continue; // No change
+                }
+            }
+            // Size or mtime changed — update placeholder
+            let client_path = client_dir.join(*name);
+            let nas_path = nas_dir.join(*name);
+            if client_path.is_dir() {
+                continue;
+            }
+            // Delete and recreate (same strategy as watcher update_placeholder)
+            let _ = fs::remove_file(&client_path);
+            let blob = nas_path.to_string_lossy().as_bytes().to_vec();
+            let cf_meta = Metadata::file().size(nas_size);
+            let placeholder = PlaceholderFile::new(*name)
+                .metadata(cf_meta)
+                .mark_in_sync()
+                .blob(blob);
+            match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
+                Ok(_) => {
+                    self.cache
+                        .record_known_file(&client_path, nas_size, nas_mtime);
+                    updated += 1;
+                    log::debug!("[sync-reconcile] ~ {} ({})", name, nas_size);
+                }
+                Err(e) => log::debug!("[sync-reconcile] Update failed {}: {}", name, e),
+            }
+        }
+
+        // Update folder mtime in DB
+        self.cache.update_folder_mtime(nas_dir, current_mtime);
+
+        (added, removed, updated)
     }
 
     /// Clear all cached (hydrated) data for this mount.

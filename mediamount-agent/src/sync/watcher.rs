@@ -1,8 +1,9 @@
 /// NAS directory watcher via ReadDirectoryChangesW.
 ///
-/// Watches the NAS root with subtree support. When a change is detected in a
-/// folder that the user has visited (registered during FETCH_PLACEHOLDERS),
-/// the watcher pushes/removes placeholders in the corresponding client folder.
+/// Watches the NAS root with subtree support. Live events are handled eagerly
+/// for the entire tree (client path derived from NAS root prefix swap).
+/// Buffer overflow fallback uses the `watched` map (visited folders only)
+/// to avoid walking an entire large share.
 
 use cloud_filter::{metadata::Metadata, placeholder_file::PlaceholderFile};
 use std::collections::HashMap;
@@ -19,15 +20,19 @@ use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
+use super::cache::CacheIndex;
 use super::write_through::EchoSuppressor;
 
 /// Watches a NAS share for changes and syncs placeholders to the client folder.
 pub struct NasWatcher {
-    /// Map of NAS folder → client folder for all visited folders.
+    /// Map of NAS folder → client folder for visited folders (used for overflow fallback).
     watched: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     nas_root: PathBuf,
+    client_root: PathBuf,
     /// Echo suppression — skip placeholders for files we just uploaded.
     echo: Arc<EchoSuppressor>,
+    /// Cache index for recording known files during live sync.
+    cache: Arc<CacheIndex>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
     /// Directory handle stored as usize for CancelIoEx on shutdown.
@@ -37,11 +42,18 @@ pub struct NasWatcher {
 }
 
 impl NasWatcher {
-    pub fn new(nas_root: PathBuf, echo: Arc<EchoSuppressor>) -> Self {
+    pub fn new(
+        nas_root: PathBuf,
+        client_root: PathBuf,
+        echo: Arc<EchoSuppressor>,
+        cache: Arc<CacheIndex>,
+    ) -> Self {
         Self {
             watched: Arc::new(Mutex::new(HashMap::new())),
             nas_root,
+            client_root,
             echo,
+            cache,
             shutdown: Arc::new(AtomicBool::new(false)),
             dir_handle: Arc::new(AtomicUsize::new(0)),
             thread: Mutex::new(None),
@@ -49,6 +61,7 @@ impl NasWatcher {
     }
 
     /// Register a folder pair for watching. Called when FETCH_PLACEHOLDERS fires.
+    /// Used by the overflow fallback (full_diff_all_watched) to scope the diff.
     pub fn register(&self, nas_dir: PathBuf, client_dir: PathBuf) {
         let mut map = self.watched.lock().unwrap();
         map.insert(nas_dir, client_dir);
@@ -57,15 +70,25 @@ impl NasWatcher {
     /// Start the background watcher thread.
     pub fn start(&self) {
         let nas_root = self.nas_root.clone();
+        let client_root = self.client_root.clone();
         let watched = self.watched.clone();
         let echo = self.echo.clone();
+        let cache = self.cache.clone();
         let shutdown = self.shutdown.clone();
         let dir_handle = self.dir_handle.clone();
 
         let handle = std::thread::Builder::new()
             .name("nas-watcher".into())
             .spawn(move || {
-                if let Err(e) = run_watcher_loop(&nas_root, &watched, &echo, &shutdown, &dir_handle) {
+                if let Err(e) = run_watcher_loop(
+                    &nas_root,
+                    &client_root,
+                    &watched,
+                    &echo,
+                    &cache,
+                    &shutdown,
+                    &dir_handle,
+                ) {
                     if !shutdown.load(Ordering::Relaxed) {
                         log::error!("[sync-watcher] Watcher exited with error: {}", e);
                     }
@@ -128,8 +151,10 @@ impl NasWatcher {
 
 fn run_watcher_loop(
     nas_root: &Path,
+    client_root: &Path,
     watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     echo: &Arc<EchoSuppressor>,
+    cache: &Arc<CacheIndex>,
     shutdown: &AtomicBool,
     dir_handle_store: &AtomicUsize,
 ) -> Result<(), String> {
@@ -157,8 +182,8 @@ fn run_watcher_loop(
 
     log::info!("[sync-watcher] Watching {:?}", nas_root);
 
-    // Reconcile any changes missed while offline (e.g., after a reconnect)
-    full_diff_all_watched(nas_root, watched, echo);
+    // Reconcile visited folders missed while offline (scoped to watched map)
+    full_diff_all_watched(watched, echo, cache);
 
     let mut buffer = vec![0u8; 16384];
     let mut bytes_returned: u32 = 0;
@@ -190,11 +215,12 @@ fn run_watcher_loop(
 
         match result {
             Ok(()) if bytes_returned > 0 => {
-                process_events(&buffer, bytes_returned, nas_root, watched, echo);
+                process_events(&buffer, bytes_returned, nas_root, client_root, echo, cache);
             }
             Ok(()) => {
-                log::warn!("[sync-watcher] Buffer overflow, running full diff on watched folders");
-                full_diff_all_watched(nas_root, watched, echo);
+                // Buffer overflow — only diff visited folders (safe on large shares)
+                log::warn!("[sync-watcher] Buffer overflow, running full diff on visited folders");
+                full_diff_all_watched(watched, echo, cache);
             }
             Err(e) => {
                 if !shutdown.load(Ordering::Relaxed) {
@@ -215,12 +241,14 @@ fn run_watcher_loop(
     Ok(())
 }
 
+/// Process live events eagerly — derive client path via prefix swap, no map lookup.
 fn process_events(
     buffer: &[u8],
     bytes_returned: u32,
     nas_root: &Path,
-    watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    client_root: &Path,
     echo: &EchoSuppressor,
+    cache: &CacheIndex,
 ) {
     let mut offset: usize = 0;
 
@@ -250,17 +278,8 @@ fn process_events(
         }
 
         let nas_path = nas_root.join(&relative_str);
-        // Normalize parent: strip trailing backslash for consistent map lookup.
-        // Path::parent() on UNC paths like \\server\share\file returns \\server\share\
-        // but the watched map stores \\server\share (no trailing separator).
-        let raw_parent = nas_path.parent().unwrap_or(nas_root);
-        let parent_str = raw_parent.to_string_lossy();
-        let parent_nas = if parent_str.ends_with('\\') || parent_str.ends_with('/') {
-            PathBuf::from(parent_str.trim_end_matches(|c| c == '\\' || c == '/'))
-        } else {
-            raw_parent.to_path_buf()
-        };
-        let parent_nas = parent_nas.as_path();
+        let client_path = client_root.join(&relative_str);
+        let client_dir = client_path.parent().unwrap_or(client_root);
         let file_name = nas_path
             .file_name()
             .unwrap_or_default()
@@ -277,46 +296,34 @@ fn process_events(
             _ => "UNKNOWN",
         };
 
-        let client_dir = {
-            let map = watched.lock().unwrap();
-            let result = map.get(parent_nas).cloned();
-            if result.is_none() {
-                log::debug!(
-                    "[sync-watcher] {} {} (no watched folder for {:?})",
-                    action_name, relative_str, parent_nas
-                );
+        match action {
+            1 | 5 => {
+                // FILE_ACTION_ADDED or FILE_ACTION_RENAMED_NEW — create placeholder
+                if echo.is_suppressed(&nas_path) {
+                    log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
+                } else {
+                    // Ensure parent directory exists locally (may not if user hasn't browsed there)
+                    if !client_dir.exists() {
+                        let _ = ensure_parent_placeholders(nas_root, client_root, client_dir, cache);
+                    }
+                    push_placeholder(&nas_path, client_dir, &file_name, &relative_str, cache);
+                }
             }
-            result
-        };
-
-        if let Some(client_dir) = client_dir {
-            match action {
-                1 | 5 => {
-                    // FILE_ACTION_ADDED or FILE_ACTION_RENAMED_NEW — create placeholder
-                    if echo.is_suppressed(&nas_path) {
-                        log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
-                    } else {
-                        log::debug!("[sync-watcher] {} {}", action_name, relative_str);
-                        push_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
-                    }
+            2 | 4 => {
+                // FILE_ACTION_REMOVED or FILE_ACTION_RENAMED_OLD — remove placeholder
+                if echo.is_suppressed(&nas_path) {
+                    log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
+                } else {
+                    remove_placeholder(client_dir, &file_name, &relative_str, cache);
                 }
-                2 | 4 => {
-                    // FILE_ACTION_REMOVED or FILE_ACTION_RENAMED_OLD — remove placeholder
-                    if echo.is_suppressed(&nas_path) {
-                        log::debug!("[sync-watcher] {} {} (echo suppressed)", action_name, relative_str);
-                    } else {
-                        log::debug!("[sync-watcher] {} {}", action_name, relative_str);
-                        remove_placeholder(&client_dir, &file_name, &relative_str);
-                    }
-                }
-                3 => {
-                    // FILE_ACTION_MODIFIED — update placeholder metadata (file size)
-                    if !echo.is_suppressed(&nas_path) {
-                        update_placeholder(&nas_path, &client_dir, &file_name, &relative_str);
-                    }
-                }
-                _ => {}
             }
+            3 => {
+                // FILE_ACTION_MODIFIED — update placeholder metadata (file size)
+                if !echo.is_suppressed(&nas_path) {
+                    update_placeholder(&nas_path, client_dir, &file_name, &relative_str, cache);
+                }
+            }
+            _ => {}
         }
 
         if info.NextEntryOffset == 0 {
@@ -326,7 +333,63 @@ fn process_events(
     }
 }
 
-fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str) {
+/// Ensure all parent directories exist as placeholders between client_root and target_dir.
+/// Creates directory placeholders for any missing intermediate folders.
+fn ensure_parent_placeholders(
+    nas_root: &Path,
+    client_root: &Path,
+    target_dir: &Path,
+    cache: &CacheIndex,
+) -> Result<(), ()> {
+    // Collect missing ancestors from target_dir up to client_root
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut dir = target_dir.to_path_buf();
+    while dir != client_root && !dir.exists() {
+        missing.push(dir.clone());
+        dir = match dir.parent() {
+            Some(p) => p.to_path_buf(),
+            None => break,
+        };
+    }
+
+    // Create from shallowest to deepest
+    for dir in missing.into_iter().rev() {
+        let relative = dir.strip_prefix(client_root).map_err(|_| ())?;
+        let nas_dir = nas_root.join(relative);
+        let dir_name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let parent = dir.parent().unwrap_or(client_root);
+
+        let blob = nas_dir.to_string_lossy().as_bytes().to_vec();
+        let placeholder = PlaceholderFile::new(&dir_name)
+            .metadata(Metadata::directory())
+            .mark_in_sync()
+            .blob(blob);
+        match placeholder.create::<PathBuf>(parent.to_path_buf()) {
+            Ok(_) => {
+                log::debug!("[sync-watcher] + dir {}", relative.display());
+            }
+            Err(e) => {
+                // Directory might have been created by CF API concurrently
+                if !dir.exists() {
+                    log::warn!(
+                        "[sync-watcher] Failed to create dir placeholder {}: {}",
+                        relative.display(),
+                        e
+                    );
+                    return Err(());
+                }
+            }
+        }
+    }
+    let _ = cache; // available for future folder tracking
+    Ok(())
+}
+
+fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str, cache: &CacheIndex) {
     let client_path = client_dir.join(file_name);
     if client_path.exists() {
         return;
@@ -345,7 +408,19 @@ fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display
             .blob(blob);
         match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
             Ok(_) => {
-                log::debug!("[sync-watcher] + {} ({})", display, meta.len());
+                log::info!("[sync-watcher] + {} ({})", display, meta.len());
+                // Record in DB (files only)
+                if !meta.is_dir() {
+                    let entry_mtime = meta
+                        .modified()
+                        .map(|t| {
+                            t.duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64
+                        })
+                        .unwrap_or(0);
+                    cache.record_known_file(&client_path, meta.len(), entry_mtime);
+                }
                 // 0-byte placeholder — NAS might not send MODIFIED reliably.
                 // Poll for the real size as a fallback.
                 if !meta.is_dir() && meta.len() == 0 {
@@ -363,36 +438,43 @@ fn push_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display
 }
 
 
-fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str) {
+fn remove_placeholder(client_dir: &Path, file_name: &str, display: &str, cache: &CacheIndex) {
     let client_path = client_dir.join(file_name);
     if !client_path.exists() {
         return;
     }
 
-    let result = if client_path.is_dir() {
+    let is_dir = client_path.is_dir();
+    let result = if is_dir {
         fs::remove_dir_all(&client_path)
     } else {
         fs::remove_file(&client_path)
     };
     match result {
-        Ok(()) => log::debug!("[sync-watcher] - {}", display),
+        Ok(()) => {
+            log::debug!("[sync-watcher] - {}", display);
+            if !is_dir {
+                cache.remove_known_file(&client_path);
+            }
+        }
         // Access denied / not found is expected — the CF API delete callback
         // may have already removed it, or it's still being processed.
         Err(e) => log::debug!("[sync-watcher] Remove skipped {}: {}", display, e),
     }
 }
 
-fn update_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str) {
+fn update_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, display: &str, cache: &CacheIndex) {
     let client_path = client_dir.join(file_name);
     if !client_path.exists() || client_path.is_dir() {
         return;
     }
 
-    let nas_size = match fs::metadata(nas_path) {
-        Ok(m) => m.len(),
+    let nas_meta = match fs::metadata(nas_path) {
+        Ok(m) => m,
         Err(_) => return,
     };
 
+    let nas_size = nas_meta.len();
     if nas_size == 0 {
         return;
     }
@@ -407,7 +489,18 @@ fn update_placeholder(nas_path: &Path, client_dir: &Path, file_name: &str, displ
         .mark_in_sync()
         .blob(blob);
     match placeholder.create::<PathBuf>(client_dir.to_path_buf()) {
-        Ok(_) => log::info!("[sync-watcher] ~ {} ({})", display, nas_size),
+        Ok(_) => {
+            log::info!("[sync-watcher] ~ {} ({})", display, nas_size);
+            let entry_mtime = nas_meta
+                .modified()
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                })
+                .unwrap_or(0);
+            cache.record_known_file(&client_path, nas_size, entry_mtime);
+        }
         Err(e) => log::debug!("[sync-watcher] Update failed {}: {}", display, e),
     }
 }
@@ -452,11 +545,12 @@ fn deferred_size_update(nas_path: &Path, client_path: &Path, display: &str) {
     log::debug!("[sync-watcher] Deferred update gave up: {}", display);
 }
 
-/// Full readdir + diff on all watched folders. Used when the event buffer overflows.
+/// Full readdir + diff on visited folders only. Used on buffer overflow and startup.
+/// Scoped to the watched map to avoid walking an entire large share.
 fn full_diff_all_watched(
-    _nas_root: &Path,
     watched: &Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
     echo: &EchoSuppressor,
+    cache: &CacheIndex,
 ) {
     let folders: Vec<(PathBuf, PathBuf)> = {
         let map = watched.lock().unwrap();
@@ -464,12 +558,12 @@ fn full_diff_all_watched(
     };
 
     for (nas_dir, client_dir) in folders {
-        diff_folder(&nas_dir, &client_dir, echo);
+        diff_folder(&nas_dir, &client_dir, echo, cache);
     }
 }
 
 /// Diff a single NAS folder against its client counterpart and reconcile.
-fn diff_folder(nas_dir: &Path, client_dir: &Path, echo: &EchoSuppressor) {
+pub fn diff_folder(nas_dir: &Path, client_dir: &Path, echo: &EchoSuppressor, cache: &CacheIndex) {
     if !client_dir.is_dir() || !nas_dir.is_dir() {
         return;
     }
@@ -493,12 +587,12 @@ fn diff_folder(nas_dir: &Path, client_dir: &Path, echo: &EchoSuppressor) {
     for name in nas_entries.difference(&client_entries) {
         let nas_path = nas_dir.join(name);
         if !echo.is_suppressed(&nas_path) {
-            push_placeholder(&nas_path, client_dir, name, name);
+            push_placeholder(&nas_path, client_dir, name, name, cache);
         }
     }
 
     // Gone from NAS
     for name in client_entries.difference(&nas_entries) {
-        remove_placeholder(client_dir, name, name);
+        remove_placeholder(client_dir, name, name, cache);
     }
 }

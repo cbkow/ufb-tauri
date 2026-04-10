@@ -905,5 +905,39 @@ without admin). The orphan quarantine pattern works identically via FSEvents.
 If connect fails, a new filter instance must be created for the registration path. Solved
 with a `make_filter` closure that creates fresh instances.
 
-**Next:** Step 3 (startup reconciliation) — replace the old startup recovery (which blindly
-uploads existing placeholders) with DB-driven NAS diff on visited folders.
+**Step 3 DONE: Startup reconciliation (DB-driven diff).**
+
+Three-layer reconciliation strategy:
+
+1. **Visited folders seeding** (`seed_visited_folders`): On reconnect, walks local directories
+   only (no NAS I/O) and ensures each has an entry in `visited_folders`. New entries get
+   mtime=0 (forces diff); existing entries keep their mtime. Cost: milliseconds.
+
+2. **Startup reconciliation** (`reconcile_startup`): Iterates all visited folders. Checks NAS
+   folder mtime — skips unchanged folders (fast). For changed folders (or mtime=0 first-timers),
+   performs three-way diff: DB (known_files) vs NAS (readdir) vs Local (on-disk). NAS is truth:
+   new files → push placeholder, missing files → remove, changed size/mtime → update.
+   Updates DB mtime after each folder. Cost: one SMB stat per folder, readdir only for changed.
+
+3. **Live watcher**: `NasWatcher` uses prefix swap (NAS root → client root) for all events —
+   no map lookup needed. Handles real-time changes eagerly across entire tree. Buffer overflow
+   fallback diffs only visited folders (safe on large shares).
+
+Supporting changes:
+- `filter.rs`: FETCH_PLACEHOLDERS records `visited_folders` (with folder mtime) and
+  `known_files` (with NAS size + mtime) in the cache DB during directory enumeration.
+- `watcher.rs`: `NasWatcher` holds `Arc<CacheIndex>` and `client_root`. All live placeholder
+  operations (push/remove/update) update `known_files` in DB. `ensure_parent_placeholders`
+  creates intermediate directory placeholders for deep events.
+- `cache.rs`: New `ensure_visited_folder` method (INSERT OR IGNORE with mtime=0).
+- `orchestrator.rs`: Calls `reconcile_startup()` after `SyncRoot::start()` succeeds.
+
+Bug fixes discovered during testing:
+- `init_schema`: Migration from old `cache_index` table failed on fresh DBs because SQLite
+  compiles `FROM cache_index` even inside a `WHERE EXISTS` guard. Fixed with separate step.
+- `NasWatcher::start()` was never called on initial startup (only on reconnect via restart).
+- Write-through `startup_recovery` was re-uploading all existing placeholders — added
+  `is_placeholder()` check to skip CF reparse point files.
+
+**Next:** Step 4 (orphan quarantine) — files that don't fit reconciliation logic get moved
+to `\\server\share\.orphaned\` with timestamped duplicates.

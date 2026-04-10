@@ -96,6 +96,18 @@ impl SyncFilter for NasSyncFilter {
         // Register this folder for live watching
         self.watcher.register(nas_dir.clone(), request_path.clone());
 
+        // Get folder mtime for reconciliation tracking
+        let folder_mtime = fs::metadata(&nas_dir)
+            .and_then(|m| m.modified())
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+            .unwrap_or(0);
+        self.cache
+            .record_visited_folder(&nas_dir, &request_path, folder_mtime);
+
         let mut placeholders = Vec::new();
         let mut skip_count = 0;
         for entry in fs::read_dir(&nas_dir).into_iter().flatten() {
@@ -123,6 +135,21 @@ impl SyncFilter for NasSyncFilter {
             } else {
                 Metadata::file().size(meta.len())
             };
+
+            // Record known file in DB for reconciliation (files only, not dirs)
+            if !meta.is_dir() {
+                let entry_mtime = meta
+                    .modified()
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64
+                    })
+                    .unwrap_or(0);
+                let client_path = request_path.join(&name_str);
+                self.cache
+                    .record_known_file(&client_path, meta.len(), entry_mtime);
+            }
 
             placeholders.push(
                 PlaceholderFile::new(&name_str)
