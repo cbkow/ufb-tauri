@@ -23,6 +23,9 @@ pub struct MountStateUpdateMsg {
     /// Human-readable sync status detail
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_state_detail: Option<String>,
+    /// True if symlink creation requires elevation (Windows)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_elevation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +50,7 @@ pub enum UfbToAgent {
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
     ClearSyncCache(MountIdMsg),
+    CreateSymlinks,
     ReloadConfig,
     GetStates,
     Ping,
@@ -73,6 +77,7 @@ mod tests {
             state_detail: "Mounted".into(),
             sync_state: None,
             sync_state_detail: None,
+            needs_elevation: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -143,6 +148,7 @@ mod tests {
                 state_detail: "d".into(),
                 sync_state: Some("active".into()),
                 sync_state_detail: Some("Watching 3 folders".into()),
+                needs_elevation: None,
             }),
         ];
         for v in variants {

@@ -958,4 +958,87 @@ New helpers:
 - `sync_root.rs`: `was_recycled_while_offline()` — checks `#recycle` with size+mtime comparison
 - NAS readdir filters now exclude dot-prefixed entries (`.DS_Store`, etc.)
 
-**Next:** Step 5 (symlink module) — creation/removal/elevation for cross-platform mount points.
+### Steps 5+6+7 DONE: Symlink mounts + drive letter replacement + cache location (2026-04-10)
+
+**Architecture (final):**
+```
+User-visible:  C:\Volumes\ufb\{shareName}\ 
+  Drive mount:  symlink → \\server\share (UNC) — requires Dev Mode or elevation
+  Sync mount:   junction → %LOCALAPPDATA%\ufb\sync\{shareName}\ (no elevation needed)
+
+Cache root:    %LOCALAPPDATA%\ufb\sync\ (default) or user-selected via Settings
+Cache DB:      %LOCALAPPDATA%\ufb\cache\{mountId}.db
+```
+
+**Key decisions made during implementation:**
+- **Junctions for local targets, symlinks for UNC**: `CreateSymbolicLinkW` to a local path
+  causes Explorer to resolve the symlink and show the real path in the address bar. Junctions
+  don't have this problem — Explorer keeps the junction path. Junctions also don't need elevation.
+  UNC targets must use symlinks (junctions can't point to UNC paths).
+- **SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE (0x2)**: Required flag for Developer Mode to
+  work. Without it, CreateSymbolicLinkW still demands admin even with Dev Mode enabled.
+- **SMB sessions in background**: Traditional mounts establish SMB sessions via `tokio::spawn`
+  after reporting "mounted" state. This avoids blocking the agent startup. Windows authenticates
+  on-demand when the user accesses the symlink if the session isn't ready yet.
+- **Teardown on agent stop**: All symlinks/junctions removed on agent stop (both graceful and
+  crash recovery). `C:\Volumes\ufb\` is empty when agent is down — prevents users from
+  accidentally working with stale/broken paths. Originally planned to keep sync mount junctions
+  on crash for offline cached file access, but simpler/safer to remove everything.
+- **Cache path change = nuke + re-register**: When user changes sync cache location in Settings,
+  all sync mounts are stopped, unregistered at old path, and re-started fresh at new path.
+  Hydrated files are lost (they're cache — NAS is truth). Option A from design discussion.
+
+**New files:**
+- `platform/windows/mountpoint.rs`: `WindowsMountMapping` with `CreateSymbolicLinkW` (UNC)
+  and `mklink /J` (local). `DriveMapping` trait implementation. `SymlinkError::NeedsElevation`.
+- `platform/windows/elevation.rs`: `ShellExecuteW` runas launcher for `--create-symlinks` mode.
+
+**Config changes:**
+- `MountsConfig.sync_cache_root`: Global cache root (default `%LOCALAPPDATA%\ufb\sync`).
+- `MountConfig.share_name()`: Now returns last UNC component (not second). Public method.
+- `MountConfig.volume_path()`: User-facing path `C:\Volumes\ufb\{share_name}`.
+- `MountConfig.volumes_base()`: Platform-specific base dir for volume mounts.
+- `MountConfig.mount_path()`: Windows always returns volume_path(). No more drive letters.
+- `MountConfig.sync_root_dir(cache_root)`: Takes cache root param (was hardcoded).
+- `MountsConfig.cache_root()`: Resolves effective cache root from config or default.
+
+**Agent changes:**
+- `main.rs --create-symlinks`: Elevated mode. Creates all symlinks/junctions, migrates old
+  drive letters, exits. Called via ShellExecuteW runas from normal agent.
+- `orchestrator.rs mount_drive()`: SMB session in background, symlink check/create foreground.
+  Reports `needs_elevation` if symlink creation fails.
+- `orchestrator.rs start_sync()`: Creates junction to cache dir after CF registration.
+- `orchestrator.rs disconnect_drive()/stop_sync()`: Removes symlinks/junctions on teardown.
+- `mount_service.rs apply_config()`: Detects cache root change, stops all sync mounts for
+  re-registration at new path.
+- `messages.rs`: `needs_elevation` field on state updates, `CreateSymlinks` IPC command.
+
+**Frontend changes:**
+- Sidebar: removed per-mount toggle buttons, added "Mount Volumes" button (when needs_elevation).
+- Settings: replaced drive letter input with read-only volume path. Added "Sync Cache Location"
+  with folder picker and reset button. Cache path change triggers agent config reload.
+- `mountStore.ts`: `getMountPath()` always returns volume path on Windows. Simplified
+  `getMountForPath()` to use volume paths. `needsElevation` computed, `createSymlinks()`.
+- Explorer pins: now point to volume paths, run in background `spawn_blocking`.
+
+**IPC reconnect optimization:**
+- Reduced initial backoff from 5s to 500ms (first 5 attempts), then 3s.
+
+### macOS port notes
+
+The architecture is designed for cross-platform. macOS equivalents:
+- **Mount paths**: Already uses `/opt/ufb/mounts/{id}` symlinks (no elevation needed on macOS).
+  Could switch to `/opt/ufb/mounts/{share_name}` for path consistency.
+- **Sync mounts**: FileProvider domains live in `~/Library/CloudStorage/`. The junction/symlink
+  approach doesn't apply — macOS shows FileProvider in Finder's sidebar natively.
+- **Cache location**: `~/.local/share/ufb/sync/` or user-selected. Same config field works.
+- **Elevation**: macOS symlinks don't need admin. The `/opt/ufb/mounts/` base dir needs admin
+  to create (one-time), already handled via `osascript` with admin privileges.
+- **Teardown**: Same pattern — remove symlinks on agent stop. macOS `open smb://` mounts
+  persist in `/Volumes/` but the symlink in `/opt/ufb/mounts/` is removed.
+- **Explorer pins → Finder sidebar**: macOS uses `LSSharedFileListInsertItemURL` or
+  FileProvider sidebar integration. Different API but same concept.
+- **DB schema, reconciliation, watcher**: All cross-platform Rust. Only the mount/unmount
+  and symlink/junction code is platform-specific.
+
+**Next:** Step 8 (Frontend UI polish) and Step 9 (cleanup/dead code removal).

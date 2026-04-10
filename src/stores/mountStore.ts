@@ -10,6 +10,7 @@ import {
   mountSaveConfig,
   mountGetConfig,
   mountLaunchAgent,
+  mountCreateSymlinks,
 } from "../lib/tauri";
 
 export interface MountStateUpdate {
@@ -18,6 +19,7 @@ export interface MountStateUpdate {
   stateDetail: string;
   syncState?: string;
   syncStateDetail?: string;
+  needsElevation?: boolean;
 }
 
 export interface MountConfig {
@@ -39,6 +41,7 @@ export interface MountConfig {
 export interface MountsConfig {
   version: number;
   mounts: MountConfig[];
+  syncCacheRoot?: string;
 }
 
 interface MountStoreState {
@@ -74,30 +77,14 @@ function setupListeners() {
 /** Get the mount state for a given path via prefix matching against mount paths. */
 function getMountForPath(path: string): MountStateUpdate | undefined {
   if (state.configs.length === 0) return undefined;
-  const isWindows = path.length >= 2 && path[1] === ":";
-  if (isWindows) {
-    const normalized = path.replace(/\//g, "\\").toLowerCase();
-    for (const cfg of state.configs) {
-      if (!cfg.mountDriveLetter) continue;
-      const mountPrefix = (cfg.mountDriveLetter + ":\\").toLowerCase();
-      if (normalized.startsWith(mountPrefix)) {
-        return state.states[cfg.id];
-      }
-    }
-  } else {
-    // Linux/macOS: match against mount path fields
-    for (const cfg of state.configs) {
-      const mountPath = getMountPath(cfg);
-      if (mountPath && (path === mountPath || path.startsWith(mountPath + "/"))) {
-        return state.states[cfg.id];
-      }
-      // Also check explicit path fields
-      const extraPaths = [cfg.mountPathLinux, cfg.mountPathMacos, cfg.smbMountPath].filter(Boolean) as string[];
-      for (const mp of extraPaths) {
-        if (path === mp || path.startsWith(mp + "/")) {
-          return state.states[cfg.id];
-        }
-      }
+  const normalized = path.replace(/\//g, "\\").toLowerCase();
+  for (const cfg of state.configs) {
+    const mountPath = getMountPath(cfg);
+    if (!mountPath) continue;
+    const mountNormalized = mountPath.replace(/\//g, "\\").toLowerCase();
+    const sep = mountNormalized.includes("\\") ? "\\" : "/";
+    if (normalized === mountNormalized || normalized.startsWith(mountNormalized + sep)) {
+      return state.states[cfg.id];
     }
   }
   return undefined;
@@ -183,21 +170,14 @@ async function loadConfig(): Promise<MountsConfig> {
 
 /** Get the user-facing mount path for a config (platform-aware). */
 function getMountPath(cfg: MountConfig): string {
-  // Sync mounts use the sync root path
-  if (cfg.syncEnabled) {
-    if (cfg.syncRootPath) return cfg.syncRootPath;
-    // Default: C:\Volumes\ufb\{shareName}
-    const shareName = cfg.nasSharePath.replace(/^\\\\/, "").split("\\")[1] || cfg.id;
-    if (platformStore.platform === "win") {
-      return `C:\\Volumes\\ufb\\${shareName}`;
-    }
-    return `${platformStore.home || "~"}/.local/share/ufb/sync/${shareName}`;
-  }
   if (platformStore.platform === "win") {
-    return cfg.mountDriveLetter ? cfg.mountDriveLetter + ":\\" : "";
+    // Windows: all mounts use C:\Volumes\ufb\{shareName}
+    // Sync mounts may have an explicit override
+    if (cfg.syncEnabled && cfg.syncRootPath) return cfg.syncRootPath;
+    const shareName = getShareName(cfg);
+    return `C:\\Volumes\\ufb\\${shareName}`;
   }
   if (platformStore.platform === "mac") {
-    // macOS: explicit path or auto-derived /opt/ufb/mounts/{id}
     if (cfg.mountPathMacos) return cfg.mountPathMacos;
     if (cfg.id) return `/opt/ufb/mounts/${cfg.id}`;
     return "";
@@ -210,6 +190,30 @@ function getMountPath(cfg: MountConfig): string {
   return "";
 }
 
+/** Extract the last component of the NAS path (matches agent's share_name()). */
+function getShareName(cfg: MountConfig): string {
+  const parts = cfg.nasSharePath.replace(/\\+$/, "").split("\\").filter(Boolean);
+  return parts[parts.length - 1] || cfg.id;
+}
+
+/** Check if any mount needs elevation for symlink creation. */
+function needsElevation(): boolean {
+  return Object.values(state.states).some((ms) => ms.needsElevation);
+}
+
+async function createSymlinks() {
+  try {
+    await mountCreateSymlinks();
+  } catch (e) {
+    console.error("Failed to create symlinks:", e);
+  }
+}
+
+/** Default cache root display — matches agent's default_cache_root(). */
+const defaultCacheRoot = platformStore.platform === "win"
+  ? "%LOCALAPPDATA%\\ufb\\sync"
+  : `${platformStore.home || "~"}/.local/share/ufb/sync`;
+
 export const mountStore = {
   get states() {
     return state.states;
@@ -220,14 +224,20 @@ export const mountStore = {
   get configs() {
     return state.configs;
   },
+  get needsElevation() {
+    return needsElevation();
+  },
+  defaultCacheRoot,
   getMountForPath,
   getMountPath,
+  getShareName,
   loadStates,
   launchAgent,
   restart,
   start,
   stop,
   toggleMount,
+  createSymlinks,
   saveConfig,
   loadConfig,
 };

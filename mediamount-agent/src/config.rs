@@ -3,9 +3,15 @@ use std::path::PathBuf;
 
 /// Top-level config file schema for mounts.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MountsConfig {
     pub version: u32,
     pub mounts: Vec<MountConfig>,
+    /// Global cache root for all sync mounts.
+    /// Default: %LOCALAPPDATA%\ufb\sync (Windows) or ~/.local/share/ufb/sync (Unix).
+    /// Sync roots live at {sync_cache_root}\{share_name}\.
+    #[serde(default)]
+    pub sync_cache_root: Option<String>,
 }
 
 /// Configuration for a single mount.
@@ -122,40 +128,86 @@ pub struct MountConfig {
     pub extra_rclone_flags: Vec<String>,
 }
 
+impl MountsConfig {
+    /// Resolve the effective cache root for sync mounts.
+    pub fn cache_root(&self) -> PathBuf {
+        if let Some(ref p) = self.sync_cache_root {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        MountConfig::default_cache_root()
+    }
+}
+
 impl MountConfig {
     /// Returns true if this mount uses on-demand sync instead of a traditional drive mount.
     pub fn is_sync_mode(&self) -> bool {
         self.sync_enabled
     }
 
-    /// The local folder path for the sync root.
-    /// Uses explicit override if set, otherwise C:\Volumes\ufb\{shareName} on Windows.
-    pub fn sync_root_dir(&self) -> PathBuf {
+    /// The local folder path for the sync root (where CF API operates).
+    /// This is the internal cache path, NOT the user-facing volume path.
+    /// Uses per-mount override if set, otherwise {cache_root}\{shareName}.
+    pub fn sync_root_dir(&self, cache_root: &std::path::Path) -> PathBuf {
         if let Some(ref p) = self.sync_root_path {
             if !p.is_empty() {
                 return PathBuf::from(p);
             }
         }
-        Self::default_sync_root_base().join(self.share_name())
+        cache_root.join(self.share_name())
     }
 
-    /// Extract the share name from the NAS path.
+    /// Extract the folder name from the NAS path (last path component).
     /// e.g., \\192.168.40.100\test1 → test1
     ///       \\nas\Jobs_Live → Jobs_Live
-    fn share_name(&self) -> String {
+    ///       \\nas\FlameServer\Flame\FLAME_JOBS → FLAME_JOBS
+    pub fn share_name(&self) -> String {
         self.nas_share_path
-            .trim_start_matches('\\')
+            .trim_end_matches('\\')
             .split('\\')
-            .nth(1) // skip server, take share
+            .last()
+            .filter(|s| !s.is_empty())
             .unwrap_or(&self.id)
             .to_string()
     }
 
-    /// Default base directory for sync roots.
-    fn default_sync_root_base() -> PathBuf {
+    /// The user-facing volume path: C:\Volumes\ufb\{share_name} on Windows.
+    /// This is a symlink pointing to either the UNC path (traditional) or cache dir (sync).
+    pub fn volume_path(&self) -> String {
+        Self::volumes_base()
+            .join(self.share_name())
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Base directory for user-facing volume symlinks.
+    pub fn volumes_base() -> PathBuf {
         #[cfg(windows)]
         {
             PathBuf::from(r"C:\Volumes\ufb")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            PathBuf::from("/opt/ufb/mounts")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(".local/share/ufb/mnt");
+            }
+            PathBuf::from("/tmp/ufb-mnt")
+        }
+    }
+
+    /// Default cache root for sync data.
+    pub fn default_cache_root() -> PathBuf {
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                return PathBuf::from(local).join("ufb").join("sync");
+            }
+            PathBuf::from(r"C:\ufb\sync")
         }
         #[cfg(not(windows))]
         {
@@ -179,19 +231,14 @@ impl MountConfig {
         base
     }
 
-    /// The path apps use to access the mount.
-    /// If sync is enabled, returns the sync root path instead of the drive letter.
-    /// Windows (drive): "M:\\"
-    /// Windows (sync): "C:\\Volumes\\ufb\\{shareName}"
-    /// macOS: mount_path_macos, or auto-derived /opt/ufb/mounts/<id>
-    /// Linux: mount_path_linux, or auto-derived ~/.local/share/ufb/mnt/<id>
+    /// The user-facing path for this mount (where the user navigates).
+    /// Windows: C:\Volumes\ufb\{shareName} (symlink)
+    /// macOS: /opt/ufb/mounts/{id} or explicit override
+    /// Linux: ~/.local/share/ufb/mnt/{id} or explicit override
     pub fn mount_path(&self) -> String {
-        if self.sync_enabled {
-            return self.sync_root_dir().to_string_lossy().to_string();
-        }
         #[cfg(windows)]
         {
-            format!("{}:\\", self.mount_drive_letter)
+            self.volume_path()
         }
         #[cfg(target_os = "macos")]
         {
@@ -256,6 +303,7 @@ pub fn load_config() -> MountsConfig {
             return MountsConfig {
                 version: 1,
                 mounts: vec![],
+                sync_cache_root: None,
             };
         }
     };
@@ -265,6 +313,7 @@ pub fn load_config() -> MountsConfig {
         return MountsConfig {
             version: 1,
             mounts: vec![],
+            sync_cache_root: None,
         };
     }
 
@@ -283,6 +332,7 @@ pub fn load_config() -> MountsConfig {
                 MountsConfig {
                     version: 1,
                     mounts: vec![],
+                    sync_cache_root: None,
                 }
             }
         },
@@ -291,6 +341,7 @@ pub fn load_config() -> MountsConfig {
             MountsConfig {
                 version: 1,
                 mounts: vec![],
+                sync_cache_root: None,
             }
         }
     }
@@ -304,6 +355,7 @@ mod tests {
     fn test_config_round_trip() {
         let config = MountsConfig {
             version: 1,
+            sync_cache_root: None,
             mounts: vec![MountConfig {
                 id: "primary-nas".into(),
                 enabled: true,
@@ -354,6 +406,7 @@ mod tests {
     fn test_mount_path() {
         let config = MountsConfig {
             version: 1,
+            sync_cache_root: None,
             mounts: vec![MountConfig {
                 id: "test".into(),
                 enabled: true,
@@ -390,7 +443,8 @@ mod tests {
                 extra_rclone_flags: vec![],
             }],
         };
-        assert_eq!(config.mounts[0].mount_path(), r"M:\");
+        // Windows: all mounts use volume path now (not drive letter)
+        assert_eq!(config.mounts[0].mount_path(), r"C:\Volumes\ufb\test");
     }
 
     #[test]

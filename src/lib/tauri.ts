@@ -282,6 +282,9 @@ export const mountGetConfig = () =>
 export const mountLaunchAgent = () =>
   invoke<void>("mount_launch_agent");
 
+export const mountCreateSymlinks = () =>
+  invoke<void>("mount_create_symlinks");
+
 export interface CredentialInfo {
   key: string;
   username: string;

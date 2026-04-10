@@ -53,6 +53,7 @@ pub enum UfbToAgent {
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
     ClearSyncCache(MountIdMsg),
+    CreateSymlinks,
     ReloadConfig,
     GetStates,
     Ping,
@@ -69,9 +70,12 @@ pub struct MountIdMsg {
 // ── Config types (must match mediamount-agent/src/config.rs) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MountsConfig {
     pub version: u32,
     pub mounts: Vec<MountConfig>,
+    #[serde(default)]
+    pub sync_cache_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,8 +491,11 @@ impl MountClient {
             // Drain any commands that queued while disconnected
             while cmd_rx.try_recv().is_ok() {}
 
-            // Reconnect backoff
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Reconnect backoff — short initial retries, then longer
+            static RETRY_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = RETRY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let delay = if count < 5 { 500 } else { 3000 };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
     }
 }
@@ -517,14 +524,14 @@ pub fn config_file_path() -> Option<std::path::PathBuf> {
 pub fn load_mount_config() -> MountsConfig {
     let path = match config_file_path() {
         Some(p) => p,
-        None => return MountsConfig { version: 1, mounts: vec![] },
+        None => return MountsConfig { version: 1, mounts: vec![], sync_cache_root: None },
     };
     if !path.exists() {
-        return MountsConfig { version: 1, mounts: vec![] };
+        return MountsConfig { version: 1, mounts: vec![], sync_cache_root: None };
     }
     match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or(MountsConfig { version: 1, mounts: vec![] }),
-        Err(_) => MountsConfig { version: 1, mounts: vec![] },
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or(MountsConfig { version: 1, mounts: vec![], sync_cache_root: None }),
+        Err(_) => MountsConfig { version: 1, mounts: vec![], sync_cache_root: None },
     }
 }
 

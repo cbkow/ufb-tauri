@@ -10,6 +10,8 @@ pub struct Orchestrator {
     pub mount_id: String,
     state: MountState,
     config: MountConfig,
+    /// Global cache root for sync mounts.
+    cache_root: std::path::PathBuf,
     event_tx: mpsc::Sender<MountEvent>,
     event_rx: mpsc::Receiver<MountEvent>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
@@ -25,11 +27,15 @@ pub struct Orchestrator {
     /// Shared NAS connectivity state for reconnect (Windows sync only).
     #[cfg(windows)]
     connectivity: Option<std::sync::Arc<crate::sync::NasConnectivity>>,
+    /// True if symlink creation failed due to missing privileges (Windows).
+    #[cfg(windows)]
+    needs_elevation: bool,
 }
 
 impl Orchestrator {
     pub fn new(
         config: MountConfig,
+        cache_root: std::path::PathBuf,
         ipc_tx: mpsc::Sender<AgentToUfb>,
         connected_servers: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
@@ -40,6 +46,7 @@ impl Orchestrator {
             mount_id,
             state: MountState::Initializing,
             config,
+            cache_root,
             event_tx,
             event_rx,
             ipc_tx,
@@ -50,6 +57,8 @@ impl Orchestrator {
             sync_state: SyncState::Disabled,
             #[cfg(windows)]
             connectivity: None,
+            #[cfg(windows)]
+            needs_elevation: false,
         }
     }
 
@@ -225,35 +234,84 @@ impl Orchestrator {
 
         #[cfg(windows)]
         {
-            // WNetAddConnection2W is a blocking Win32 call that can stall for 30-60s
-            // if the target host is unreachable.  Run it off the async runtime so one
-            // slow mount doesn't block state updates for every other mount.
-            let drive_letter = self.config.mount_drive_letter.clone();
-            let nas_share_path = self.config.nas_share_path.clone();
-            let u = username.clone();
-            let p = password.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                crate::platform::windows::fallback::connect_drive(
-                    &drive_letter,
-                    &nas_share_path,
-                    &u,
-                    &p,
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("connect_drive task panicked: {}", e)));
-            if let Err(e) = result {
-                log::error!("[{}] Mount failed: {}", self.mount_id, e);
-                let _ = self
-                    .event_tx
-                    .send(MountEvent::MountFailed { reason: e })
-                    .await;
+            // Step 1: Verify or create symlink at C:\Volumes\ufb\{share_name}
+            let volume_path = self.config.volume_path();
+            let nas_path = self.config.nas_share_path.clone();
+            let link = std::path::Path::new(&volume_path);
+
+            if link.is_symlink() {
+                log::info!(
+                    "[{}] Mapped {} → {} (symlink exists)",
+                    self.mount_id, volume_path, nas_path
+                );
+            } else if link.exists() {
+                log::info!(
+                    "[{}] Mapped {} (directory exists)",
+                    self.mount_id, volume_path
+                );
             } else {
-                // Mark server as connected so other mounts skip credential lookup
-                let host = Self::server_host(&self.config.nas_share_path);
-                if !host.is_empty() {
-                    self.connected_servers.lock().unwrap().insert(host);
+                // Symlink doesn't exist — try to create it
+                use crate::platform::DriveMapping;
+                let mapping = crate::platform::windows::WindowsMountMapping::new();
+                match mapping.switch(&volume_path, &nas_path) {
+                    Ok(()) => {
+                        log::info!(
+                            "[{}] Created symlink {} → {}",
+                            self.mount_id, volume_path, nas_path
+                        );
+                    }
+                    Err(ref e) if e == "NEEDS_ELEVATION" => {
+                        log::warn!(
+                            "[{}] Symlink requires elevation",
+                            self.mount_id
+                        );
+                        self.needs_elevation = true;
+                    }
+                    Err(e) => {
+                        log::error!("[{}] Symlink creation failed: {}", self.mount_id, e);
+                        let _ = self
+                            .event_tx
+                            .send(MountEvent::MountFailed { reason: e })
+                            .await;
+                        return;
+                    }
                 }
+            }
+
+            // Step 2: Establish SMB session in background (don't block mount state)
+            // Windows will use cached sessions if available; this ensures credentials
+            // are set up for when the user accesses the symlink.
+            {
+                let share = self.config.nas_share_path.clone();
+                let u = username.clone();
+                let p = password.clone();
+                let mid = self.mount_id.clone();
+                let servers = self.connected_servers.clone();
+                tokio::spawn(async move {
+                    let share2 = share.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::platform::windows::fallback::establish_smb_session(&share2, &u, &p)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("SMB session task panicked: {}", e)));
+
+                    match result {
+                        Ok(()) => {
+                            let host = share
+                                .trim_start_matches('\\')
+                                .split('\\')
+                                .next()
+                                .unwrap_or("")
+                                .to_lowercase();
+                            if !host.is_empty() {
+                                servers.lock().unwrap().insert(host);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("[{}] Background SMB session failed: {}", mid, e);
+                        }
+                    }
+                });
             }
         }
 
@@ -329,15 +387,26 @@ impl Orchestrator {
     async fn disconnect_drive(&mut self) {
         #[cfg(windows)]
         {
-            let drive_letter = self.config.mount_drive_letter.clone();
+            // Remove symlink/junction so users can't browse stale paths
+            let volume_path = self.config.volume_path();
+            {
+                use crate::platform::DriveMapping;
+                let mapping = crate::platform::windows::WindowsMountMapping::new();
+                if let Err(e) = mapping.remove(&volume_path) {
+                    log::debug!("[{}] Remove mount link failed (non-fatal): {}", self.mount_id, e);
+                }
+            }
+
+            // Disconnect the deviceless SMB session
+            let share_path = self.config.nas_share_path.clone();
             let mount_id = self.mount_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::platform::windows::fallback::disconnect_drive(&drive_letter)
+                crate::platform::windows::fallback::disconnect_smb_session(&share_path)
             })
             .await
-            .unwrap_or_else(|e| Err(format!("disconnect_drive task panicked: {}", e)));
+            .unwrap_or_else(|e| Err(format!("disconnect_smb task panicked: {}", e)));
             if let Err(e) = result {
-                log::warn!("[{}] Disconnect failed (non-fatal): {}", mount_id, e);
+                log::warn!("[{}] SMB disconnect failed (non-fatal): {}", mount_id, e);
             }
         }
 
@@ -412,7 +481,7 @@ impl Orchestrator {
         let mid = self.mount_id.clone();
         let display_name = self.config.display_name.clone();
         let nas_root = std::path::PathBuf::from(&self.config.nas_share_path);
-        let client_root = self.config.sync_root_dir();
+        let client_root = self.config.sync_root_dir(&self.cache_root);
 
         let cache_limit = self.config.sync_cache_limit_bytes;
         let result = tokio::task::spawn_blocking(move || {
@@ -427,6 +496,30 @@ impl Orchestrator {
                 self.sync_root = Some(sync_root);
                 self.sync_state = SyncState::Active;
                 log::info!("[{}] Sync root active", self.mount_id);
+
+                // Create symlink from user-facing volume path to cache dir
+                let volume_path = self.config.volume_path();
+                let cache_dir = self.config.sync_root_dir(&self.cache_root).to_string_lossy().to_string();
+                {
+                    use crate::platform::DriveMapping;
+                    let mapping = crate::platform::windows::WindowsMountMapping::new();
+                    match mapping.switch(&volume_path, &cache_dir) {
+                        Ok(()) => {
+                            log::info!(
+                                "[{}] Symlinked {} → {}",
+                                self.mount_id, volume_path, cache_dir
+                            );
+                        }
+                        Err(ref e) if e == "NEEDS_ELEVATION" => {
+                            log::warn!("[{}] Sync symlink requires elevation", self.mount_id);
+                            self.needs_elevation = true;
+                        }
+                        Err(e) => {
+                            // Non-fatal for sync — CF root is accessible directly
+                            log::warn!("[{}] Sync symlink failed (non-fatal): {}", self.mount_id, e);
+                        }
+                    }
+                }
 
                 // Run startup reconciliation (DB-driven diff of visited folders)
                 if let Some(ref sr) = self.sync_root {
@@ -456,6 +549,16 @@ impl Orchestrator {
     #[cfg(windows)]
     async fn stop_sync(&mut self) {
         self.sync_state = SyncState::Deregistering;
+
+        // Remove junction so users can't browse cache dir while agent is down
+        let volume_path = self.config.volume_path();
+        {
+            use crate::platform::DriveMapping;
+            let mapping = crate::platform::windows::WindowsMountMapping::new();
+            if let Err(e) = mapping.remove(&volume_path) {
+                log::debug!("[{}] Remove sync link failed (non-fatal): {}", self.mount_id, e);
+            }
+        }
 
         if let Some(mut sync_root) = self.sync_root.take() {
             let result = tokio::task::spawn_blocking(move || {
@@ -659,12 +762,20 @@ impl Orchestrator {
             { (None, None) }
         };
 
+        let needs_elevation = {
+            #[cfg(windows)]
+            { if self.needs_elevation { Some(true) } else { None } }
+            #[cfg(not(windows))]
+            { None }
+        };
+
         let msg = AgentToUfb::MountStateUpdate(MountStateUpdateMsg {
             mount_id: self.mount_id.clone(),
             state: state_name.into(),
             state_detail: self.state.to_string(),
             sync_state,
             sync_state_detail,
+            needs_elevation,
         });
 
         if let Err(e) = self.ipc_tx.send(msg).await {

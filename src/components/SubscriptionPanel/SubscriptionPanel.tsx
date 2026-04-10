@@ -348,17 +348,20 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                     <Show when={isSync()}><span class="item-tag">Sync</span></Show>
                     <Show when={cfg.isJobsFolder && !isSync()}><span class="item-tag">Jobs</span></Show>
                     <span class={`mount-state-label ${stateClass()}`}>{stateLabel()}</span>
-                    <span
-                      class="mount-toggle-btn"
-                      onClick={(e) => { e.stopPropagation(); mountStore.toggleMount(cfg.id); }}
-                      title={isActive() ? "Disconnect" : "Connect"}
-                    >
-                      <span class="icon">{isActive() ? "stop_circle" : "play_circle"}</span>
-                    </span>
                   </div>
                 );
               }}
             </For>
+          </Show>
+          <Show when={mountStore.connected && mountStore.needsElevation}>
+            <div
+              class="panel-item mount-elevation-btn"
+              onClick={() => mountStore.createSymlinks()}
+              title="Create volume symlinks (requires admin)"
+            >
+              <span class="item-icon"><span class="icon">admin_panel_settings</span></span>
+              <span class="item-label">Mount Volumes</span>
+            </div>
           </Show>
           <For each={customBookmarks()}>
             {(bookmark) => (

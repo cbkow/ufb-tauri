@@ -142,13 +142,15 @@ pub fn run() {
 
                 state.mount_client.start(app_handle.clone());
 
-                // Sync Explorer nav pane pins for Jobs folders
+                // Sync Explorer nav pane pins in background (spawns reg.exe processes)
                 #[cfg(windows)]
                 {
                     let pins = crate::explorer_pins::collect_nav_pins(&state);
-                    if let Err(e) = crate::explorer_pins::sync_nav_pins(&pins) {
-                        log::warn!("Failed to sync Explorer nav pins: {}", e);
-                    }
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = crate::explorer_pins::sync_nav_pins(&pins) {
+                            log::warn!("Failed to sync Explorer nav pins: {}", e);
+                        }
+                    });
                 }
             });
             Ok(())
@@ -251,6 +253,7 @@ pub fn run() {
             commands::mount_hide_drives,
             commands::mount_unhide_drives,
             commands::mount_clear_sync_cache,
+            commands::mount_create_symlinks,
             // App lifecycle
             commands::relaunch_app,
             // Platform

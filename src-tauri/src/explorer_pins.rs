@@ -12,15 +12,24 @@ use std::os::windows::process::CommandExt;
 pub fn collect_nav_pins(state: &crate::app_state::AppState) -> Vec<NavPinEntry> {
     let mut entries = Vec::new();
 
-    // 1. Mount configs — each mount's drive letter
+    // 1. Mount configs — volume paths (C:\Volumes\ufb\{shareName})
     let mount_cfg = crate::mount_client::load_mount_config();
     for m in &mount_cfg.mounts {
-        if m.enabled && !m.mount_drive_letter.is_empty() {
-            entries.push(NavPinEntry {
-                name: m.display_name.clone(),
-                target_path: format!("{}:\\", m.mount_drive_letter),
-            });
+        if !m.enabled {
+            continue;
         }
+        // Use volume path: derive share name from NAS path (last component)
+        let share_name = m.nas_share_path
+            .trim_end_matches('\\')
+            .split('\\')
+            .last()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&m.id);
+        let volume_path = format!(r"C:\Volumes\ufb\{}", share_name);
+        entries.push(NavPinEntry {
+            name: m.display_name.clone(),
+            target_path: volume_path,
+        });
     }
 
     // 2. Bookmarks marked as project/Jobs folders

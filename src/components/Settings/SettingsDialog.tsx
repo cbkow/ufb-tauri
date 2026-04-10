@@ -939,6 +939,43 @@ function MountsSection(props: {
         </div>
       </Show>
 
+      {/* Sync cache location — global setting for all sync mounts */}
+      <Show when={props.mountConfig().mounts.some((m) => m.syncEnabled)}>
+        <h3>Sync Cache</h3>
+        <label class="settings-field">
+          <div class="settings-field-header">
+            <span>Cache Location</span>
+            <span class="settings-help" title="Local folder where sync mount data is cached. Changing this will disconnect all sync mounts and re-sync from scratch.">?</span>
+          </div>
+          <div style={{ display: "flex", gap: "var(--spacing-xs)", "align-items": "center" }}>
+            <div class="settings-value-display" style={{ flex: 1 }}>
+              {props.mountConfig().syncCacheRoot || mountStore.defaultCacheRoot}
+            </div>
+            <button
+              class="settings-btn"
+              onClick={async () => {
+                const folder = await pickFolder();
+                if (folder) {
+                  const newCfg = { ...props.mountConfig(), syncCacheRoot: folder };
+                  props.setMountConfig(newCfg);
+                  await mountStore.saveConfig(newCfg);
+                }
+              }}
+            >Browse</button>
+            <Show when={props.mountConfig().syncCacheRoot}>
+              <button
+                class="settings-btn"
+                onClick={async () => {
+                  const newCfg = { ...props.mountConfig(), syncCacheRoot: undefined };
+                  props.setMountConfig(newCfg);
+                  await mountStore.saveConfig(newCfg);
+                }}
+              >Reset</button>
+            </Show>
+          </div>
+        </label>
+      </Show>
+
       {/* Mount configurations */}
       <h3>Configuration</h3>
       <Show when={!editingMount()}>
@@ -1176,18 +1213,16 @@ function MountsSection(props: {
 
             {/* Drive letter — Windows only, hidden when sync enabled */}
             <Show when={props.platform() === "win" && !m().syncEnabled}>
-              <h3>Drive Letter</h3>
+              <h3>Volume Path</h3>
 
               <label class="settings-field">
                 <div class="settings-field-header">
-                  <span>Mount Drive Letter</span>
-                  <span class="settings-help" title="Drive letter that apps use to access media. Maps to SMB share via DefineDosDevice — no Developer Mode required.">?</span>
+                  <span>Mount Path</span>
+                  <span class="settings-help" title="Volume symlink path — derived from share name. Consistent across all machines.">?</span>
                 </div>
-                <SettingsInput
-                  value={m().mountDriveLetter}
-                  placeholder="M"
-                  onCommit={(v) => updateField("mountDriveLetter", v.toUpperCase().charAt(0))}
-                />
+                <div class="settings-value-display">
+                  {`C:\\Volumes\\ufb\\${mountStore.getShareName(m())}`}
+                </div>
               </label>
             </Show>
 

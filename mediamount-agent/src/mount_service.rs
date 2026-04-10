@@ -12,6 +12,8 @@ pub struct MountService {
     ipc_tx: mpsc::Sender<AgentToUfb>,
     /// Servers with active SMB sessions — shared across all orchestrators.
     connected_servers: Arc<Mutex<HashSet<String>>>,
+    /// Global cache root for sync mounts.
+    cache_root: std::path::PathBuf,
 }
 
 struct MountInstance {
@@ -26,6 +28,7 @@ impl MountService {
             mounts: HashMap::new(),
             ipc_tx,
             connected_servers: Arc::new(Mutex::new(HashSet::new())),
+            cache_root: crate::config::MountConfig::default_cache_root(),
         }
     }
 
@@ -44,6 +47,27 @@ impl MountService {
 
     /// Apply a config, starting new mounts and stopping removed ones.
     async fn apply_config(&mut self, config: MountsConfig) {
+        // Detect cache root change — restart all sync mounts to re-register at new path
+        let new_cache_root = config.cache_root();
+        if new_cache_root != self.cache_root {
+            log::info!(
+                "Sync cache root changed: {:?} → {:?}. Restarting all sync mounts.",
+                self.cache_root, new_cache_root
+            );
+            // Stop all sync mounts (they'll be re-started below with the new cache root)
+            let sync_ids: Vec<String> = self.mounts.iter()
+                .filter(|(_, inst)| inst.config.sync_enabled)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in sync_ids {
+                if let Some(instance) = self.mounts.remove(&id) {
+                    log::info!("Stopping sync mount {} for cache migration", id);
+                    let _ = instance.event_tx.send(MountEvent::Stop).await;
+                }
+            }
+        }
+        self.cache_root = new_cache_root;
+
         let new_ids: std::collections::HashSet<String> =
             config.mounts.iter().map(|m| m.id.clone()).collect();
 
@@ -102,6 +126,7 @@ impl MountService {
 
         let mut orchestrator = Orchestrator::new(
             config.clone(),
+            self.cache_root.clone(),
             self.ipc_tx.clone(),
             self.connected_servers.clone(),
         );
@@ -155,6 +180,19 @@ impl MountService {
             UfbToAgent::ClearSyncCache(msg) => {
                 self.send_to_mount(&msg.mount_id, MountEvent::ClearSyncCache, &msg.command_id)
                     .await;
+            }
+            UfbToAgent::CreateSymlinks => {
+                #[cfg(windows)]
+                {
+                    log::info!("CreateSymlinks command received — launching elevated instance");
+                    if let Err(e) = crate::platform::windows::elevation::launch_elevated_symlink_creation() {
+                        log::error!("Elevation launch failed: {}", e);
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    log::debug!("CreateSymlinks ignored on this platform");
+                }
             }
             UfbToAgent::Quit => {
                 log::info!("Quit command received via IPC, shutting down...");

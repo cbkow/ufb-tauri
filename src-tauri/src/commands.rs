@@ -1056,6 +1056,15 @@ pub async fn mount_clear_sync_cache(
         .await
 }
 
+/// Tell the agent to launch an elevated instance for symlink creation.
+#[tauri::command]
+pub async fn mount_create_symlinks(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::CreateSymlinks)
+        .await
+}
+
 // ── System Icons ──
 
 /// Get the OS-native file type icon as a base64-encoded PNG data URL.

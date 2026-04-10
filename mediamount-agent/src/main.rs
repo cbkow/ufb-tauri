@@ -349,6 +349,14 @@ async fn main() {
     init_logging();
     install_panic_hook();
 
+    // Check for --create-symlinks mode (runs elevated, creates symlinks, exits)
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--create-symlinks") {
+        log::info!("mediamount-agent --create-symlinks (elevated mode)");
+        create_symlinks_and_exit();
+        return;
+    }
+
     log::info!(
         "mediamount-agent v{} starting",
         env!("CARGO_PKG_VERSION")
@@ -357,6 +365,73 @@ async fn main() {
     let _mutex_guard = ensure_single_instance();
 
     run_event_loop().await;
+}
+
+/// Elevated mode: create symlinks for all configured mounts, migrate old drive letters, exit.
+/// Called via ShellExecuteW "runas" from the normal agent instance.
+#[cfg(windows)]
+fn create_symlinks_and_exit() {
+    use crate::platform::DriveMapping;
+    use crate::platform::windows::mountpoint::WindowsMountMapping;
+
+    let config = config::load_config();
+    let cache_root = config.cache_root();
+    let mapping = WindowsMountMapping::new();
+
+    // Ensure base directory exists
+    if let Err(e) = WindowsMountMapping::ensure_volumes_dir() {
+        log::error!("[symlinks] Failed to create volumes dir: {}", e);
+        return;
+    }
+
+    let mut created = 0u32;
+    let mut migrated = 0u32;
+
+    for mount in &config.mounts {
+        if !mount.enabled {
+            continue;
+        }
+
+        let volume_path = mount.volume_path();
+
+        // Sync mounts: symlink → cache dir. Traditional mounts: symlink → UNC path.
+        let target = if mount.sync_enabled {
+            mount.sync_root_dir(&cache_root).to_string_lossy().to_string()
+        } else {
+            mount.nas_share_path.clone()
+        };
+
+        // Create symlink
+        match mapping.switch(&volume_path, &target) {
+            Ok(()) => {
+                created += 1;
+                log::info!("[symlinks] Created {} → {}", volume_path, target);
+            }
+            Err(e) => {
+                log::error!("[symlinks] Failed {} → {}: {}", volume_path, target, e);
+            }
+        }
+
+        // Migrate old drive letter if present
+        if !mount.mount_drive_letter.is_empty() {
+            let drive = &mount.mount_drive_letter;
+            match crate::platform::windows::fallback::disconnect_drive(drive) {
+                Ok(()) => {
+                    migrated += 1;
+                    log::info!("[symlinks] Migrated {}:\\ → {}", drive, volume_path);
+                }
+                Err(e) => {
+                    // Not fatal — drive may not be connected
+                    log::debug!("[symlinks] Drive {} disconnect skipped: {}", drive, e);
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "[symlinks] Done: {} created, {} drive letters migrated",
+        created, migrated
+    );
 }
 
 /// macOS: ensure the stable symlink directory exists at /opt/ufb/mounts/.
