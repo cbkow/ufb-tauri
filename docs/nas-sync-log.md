@@ -939,5 +939,23 @@ Bug fixes discovered during testing:
 - Write-through `startup_recovery` was re-uploading all existing placeholders — added
   `is_placeholder()` check to skip CF reparse point files.
 
-**Next:** Step 4 (orphan quarantine) — files that don't fit reconciliation logic get moved
-to `\\server\share\.orphaned\` with timestamped duplicates.
+**Step 4 DONE: Safe handling of untracked local files.**
+
+Originally planned as "orphan quarantine" (.orphaned directory on NAS), simplified after
+testing to a more natural approach: let write-through handle uploads, respect NAS deletions.
+
+Key behaviors:
+- **CF placeholders** not on NAS → removed (stale, no local data to lose)
+- **Real files** not on NAS → left for write-through to upload naturally
+- **Real files** in NAS `#recycle` → deleted locally only if size+mtime match recycled
+  version (same file). If local version differs (newer edits), kept for upload.
+- **Local directories** not on NAS → created on NAS via `fs::create_dir_all`
+- **Watcher `remove_placeholder`** → skips real files, uses `remove_dir` (not `remove_dir_all`)
+  to prevent recursive deletion of user content
+
+New helpers:
+- `cache.rs`: `pub(crate) fn is_cf_placeholder()` — checks reparse point attribute
+- `sync_root.rs`: `was_recycled_while_offline()` — checks `#recycle` with size+mtime comparison
+- NAS readdir filters now exclude dot-prefixed entries (`.DS_Store`, etc.)
+
+**Next:** Step 5 (symlink module) — creation/removal/elevation for cross-platform mount points.
