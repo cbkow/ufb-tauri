@@ -893,8 +893,8 @@ function MountsSection(props: {
         </div>
       </Show>
 
-      {/* Sync cache location — global setting for all sync mounts */}
-      <Show when={props.mountConfig().mounts.some((m) => m.syncEnabled)}>
+      {/* Sync cache location — global setting for all sync mounts (not macOS — FileProvider controls cache) */}
+      <Show when={props.platform() !== "mac" && props.mountConfig().mounts.some((m) => m.syncEnabled)}>
         <h3>Sync Cache</h3>
         <label class="settings-field">
           <div class="settings-field-header">
@@ -1022,8 +1022,8 @@ function MountsSection(props: {
               <span class="settings-hint-inline">Subfolders appear as subscribable jobs</span>
             </div>
 
-            {/* On-demand sync toggle — Windows only */}
-            <Show when={props.platform() === "win"}>
+            {/* On-demand sync toggle — Windows and macOS */}
+            <Show when={props.platform() === "win" || props.platform() === "mac"}>
               <div class="settings-row">
                 <label class="settings-toggle">
                   <input

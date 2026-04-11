@@ -42,7 +42,15 @@ macos-quickactions/
 
 # Swift tray app build artifacts
 mediamount-tray/MediaMountTray
+mediamount-tray/MediaMountTray.bin
 mediamount-tray/MediaMountTray.app/
+mediamount-tray/MediaMountTray.xcodeproj/
+mediamount-tray/build/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
 
 # OS files
 .DS_Store

@@ -179,8 +179,8 @@ function getMountPath(cfg: MountConfig): string {
   }
   if (platformStore.platform === "mac") {
     if (cfg.mountPathMacos) return cfg.mountPathMacos;
-    if (cfg.id) return `/opt/ufb/mounts/${cfg.id}`;
-    return "";
+    const shareName = getShareName(cfg);
+    return `/opt/ufb/mounts/${shareName}`;
   }
   // Linux: explicit path or auto-derived from mount ID
   if (cfg.mountPathLinux) return cfg.mountPathLinux;

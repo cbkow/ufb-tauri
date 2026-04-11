@@ -1027,13 +1027,16 @@ Cache DB:      %LOCALAPPDATA%\ufb\cache\{mountId}.db
 ### macOS port notes
 
 The architecture is designed for cross-platform. macOS equivalents:
-- **Mount paths**: Already uses `/opt/ufb/mounts/{id}` symlinks (no elevation needed on macOS).
-  Could switch to `/opt/ufb/mounts/{share_name}` for path consistency.
-- **Sync mounts**: FileProvider domains live in `~/Library/CloudStorage/`. The junction/symlink
-  approach doesn't apply — macOS shows FileProvider in Finder's sidebar natively.
-- **Cache location**: `~/.local/share/ufb/sync/` or user-selected. Same config field works.
+- **Mount paths**: Currently uses `/opt/ufb/mounts/{id}` symlinks — switching to
+  `/opt/ufb/mounts/{share_name}` for path consistency with Windows. See 2026-04-11 entry.
+- **Sync mounts**: FileProvider domains live in `~/Library/CloudStorage/`. The symlink approach
+  still applies — `/opt/ufb/mounts/{share_name}` symlink targets either `/Volumes/{share}`
+  (SMB mode) or `~/Library/CloudStorage/{domain}` (sync mode). Same stable path regardless.
+- **Cache location**: FileProvider controls cache location on macOS. `sync_cache_root` setting
+  is ignored. Frontend hides "Cache Location" picker on macOS.
 - **Elevation**: macOS symlinks don't need admin. The `/opt/ufb/mounts/` base dir needs admin
-  to create (one-time), already handled via `osascript` with admin privileges.
+  to create (one-time), handled via installer or first-run elevation. Worth the cost for
+  clean, Finder-friendly paths that users interact with daily.
 - **Teardown**: Same pattern — remove symlinks on agent stop. macOS `open smb://` mounts
   persist in `/Volumes/` but the symlink in `/opt/ufb/mounts/` is removed.
 - **Explorer pins → Finder sidebar**: macOS uses `LSSharedFileListInsertItemURL` or
@@ -1142,3 +1145,453 @@ canonical user-facing path.
   updated to use `C:\Volumes\ufb\{share}` paths. Windows-only.
 - macOS needs equivalent Finder integration: Finder Extensions, Services, or Quick Actions
   for project creation, notes, and navigation shortcuts. Not yet implemented.
+
+---
+
+## 2026-04-11 — macOS path consistency & symlink unification
+
+### Problem
+
+Windows unified all mounts under `C:\Volumes\ufb\{share_name}` — symlink target changes
+based on mode (SMB vs sync), but the user-facing path is always the same. macOS was using
+`/opt/ufb/mounts/{id}` where `id` is the config identifier (e.g., `primary-nas`), not the
+human-readable share name. This creates a mismatch:
+
+```
+NAS: \\192.168.40.100\Jobs_Live   config id: primary-nas
+Windows:  C:\Volumes\ufb\Jobs_Live        ← share_name
+macOS:    /opt/ufb/mounts/primary-nas     ← id (doesn't match)
+```
+
+Path mappings between platforms become unintuitive when the last component differs.
+
+### Decision: macOS mount_path() uses share_name
+
+Change `mount_path()` on macOS from `self.id` to `self.share_name()`:
+
+```
+Before:  /opt/ufb/mounts/{id}           → /opt/ufb/mounts/primary-nas
+After:   /opt/ufb/mounts/{share_name}   → /opt/ufb/mounts/Jobs_Live
+```
+
+Uses `volumes_base().join(self.share_name())` — same pattern as Windows `volume_path()`.
+The `mount_path_macos` override still takes precedence for custom paths.
+
+### Decision: symlink approach works for both modes on macOS
+
+The symlink at `/opt/ufb/mounts/{share_name}` is the stable user-facing path. Its target
+changes based on mode:
+
+```
+macOS SMB mode:
+  /opt/ufb/mounts/Jobs_Live  →  /Volumes/Jobs_Live
+
+macOS Sync mode (FileProvider):
+  /opt/ufb/mounts/Jobs_Live  →  ~/Library/CloudStorage/com.unionfiles.mediamount-tray.FileProvider-Jobs_Live/
+```
+
+This mirrors Windows exactly:
+```
+Windows SMB mode:
+  C:\Volumes\ufb\Jobs_Live  →  \\nas\Jobs_Live
+
+Windows Sync mode (Cloud Files):
+  C:\Volumes\ufb\Jobs_Live  →  %LOCALAPPDATA%\ufb\sync\Jobs_Live\
+```
+
+Users always navigate to the same path. Path mappings work because the last component
+(`Jobs_Live`) matches across platforms.
+
+### Decision: keep /opt/ufb/mounts as base path
+
+Considered `~/.local/share/ufb/mounts` (user-writable, no elevation) but rejected because
+users interact with these paths in Finder daily — bookmarks, scripts, drag-drop. `/opt/ufb/mounts`
+is clean, short, and discoverable. One-time `sudo mkdir -p /opt/ufb/mounts && sudo chmod 755
+/opt/ufb` during installer or first-run is an acceptable cost.
+
+### Decision: no cache location setting on macOS
+
+FileProvider controls where the cache lives (`~/Library/CloudStorage/`). Unlike Windows Cloud
+Files where we pick the sync root path, macOS FileProvider assigns it via `NSFileProviderDomain`.
+
+Changes:
+- Frontend: hide "Cache Location" picker when `platform === "mac"`
+- Backend: `sync_root_dir()` returns `fileprovider_domain_path()` on macOS, ignoring `sync_cache_root`
+- `sync_cache_root` config field is simply unused on macOS (no breaking change)
+
+### Decision: FileProvider bundle ID convention
+
+Extension bundle ID: `com.unionfiles.mediamount-tray.FileProvider`
+Domain identifier per mount: `{share_name}` (e.g., `Jobs_Live`)
+CloudStorage path: `~/Library/CloudStorage/com.unionfiles.mediamount-tray.FileProvider-{share_name}/`
+
+### New config helper: fileprovider_domain_path()
+
+Added to `MountConfig` (macOS only):
+```rust
+pub fn fileprovider_domain_path(&self) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join("Library/CloudStorage")
+        .join(format!("com.unionfiles.mediamount-tray.FileProvider-{}", self.share_name()))
+}
+```
+
+### Migration: stale symlink cleanup
+
+Old symlinks at `/opt/ufb/mounts/{id}` become orphaned after switching to `{share_name}`.
+At startup, scan `/opt/ufb/mounts/` and remove symlinks that don't match any active mount's
+`share_name()`. Safe because all symlinks in this directory are agent-managed.
+
+### Share name collisions
+
+Two mounts could have the same `share_name()` (e.g., two NAS servers both sharing `Jobs_Live`).
+Added `share_name_collisions()` detection on `MountsConfig` — logs a warning at startup.
+User resolves by setting `mount_path_macos` override on one mount. Same limitation exists
+on Windows today.
+
+### Frontend changes
+
+- `mountStore.ts getMountPath()`: macOS branch now uses `getShareName(cfg)` instead of `cfg.id`
+- `SettingsDialog.tsx`: Cache location section gated on `platform !== "mac"`
+- `SettingsDialog.tsx`: Sync toggle enabled for macOS (was Windows-only). The actual
+  FileProvider implementation comes later; this just exposes the config toggle.
+
+### Files to modify
+
+| File | Change |
+|------|--------|
+| `mediamount-agent/src/config.rs` | `mount_path()` macOS default uses `share_name()`, add `fileprovider_domain_path()`, `sync_root_dir()` macOS branch, `share_name_collisions()` |
+| `mediamount-agent/src/orchestrator.rs` | Sync mode routing in macOS `mount_drive()` and `disconnect_drive()` |
+| `mediamount-agent/src/mount_service.rs` | Stale symlink cleanup at startup |
+| `src/stores/mountStore.ts` | `getMountPath()` macOS uses `getShareName()` |
+| `src/components/Settings/SettingsDialog.tsx` | Hide cache location on macOS, enable sync toggle on macOS |
+
+All changes implemented and tested. 34/34 agent tests pass. Frontend builds clean.
+Verified symlinks at `/opt/ufb/mounts/` show `Jobs_Live` and `MinRender` (share_name based).
+`test1` sync symlink points to FileProvider domain path (dangling until extension is built).
+
+---
+
+## 2026-04-11 — FileProvider extension: architecture & spike plan
+
+### Current state of MediaMountTray
+
+The tray app is a **single Swift file** (`MediaMountTray.swift`, 340 lines) compiled directly
+with `swiftc`. It communicates with the Rust agent via Unix domain socket IPC (length-prefixed
+JSON, same protocol as the Tauri app on Windows named pipes).
+
+Structure:
+- `MediaMountTrayApp` — SwiftUI MenuBarExtra (LSUIElement)
+- `AgentConnection` — POSIX socket client, auto-reconnect, message parsing
+- `MountInfo` — Observable model for mount status
+
+Build: `swiftc -parse-as-library -O -o MediaMountTray MediaMountTray.swift`
+Bundle: Manually assembled `.app` in `build-macos.sh`
+
+### Why migration is needed
+
+FileProvider extensions are **App Extensions** — they must be bundled inside a host app as
+`.appex` in `Contents/PlugIns/`. This requires:
+- Proper Xcode targets (host app + extension)
+- Entitlements for app groups (shared sandbox container)
+- Info.plist with NSExtension configuration
+- Code signing with developer certificate
+
+Single-file `swiftc` compilation cannot produce App Extensions.
+
+### Decision: XcodeGen for project generation
+
+Using XcodeGen (`brew install xcodegen`) to generate `.xcodeproj` from a `project.yml` spec.
+Keeps project definition in version control as YAML, regenerate with `xcodegen generate`.
+
+### Architecture: FileProvider extension ↔ agent communication
+
+**Phase 0 approach (spike):** Extension accesses NAS files directly via the agent's existing
+SMB mount at `/Volumes/{share}`. No new IPC needed. This mirrors the Windows pattern where
+CF API callbacks use `std::fs` on UNC paths — the OS SMB driver handles the network I/O.
+
+**Sandbox risk:** FileProvider extensions are sandboxed. If they can't access `/Volumes/`,
+we fall back to IPC-based file operations where the extension sends read/write requests to
+the agent via a Unix socket in the shared app group container.
+
+**Phase 0 will test this hypothesis before committing to either architecture.**
+
+### Project structure
+
+```
+mediamount-tray/
+├── project.yml                          (XcodeGen spec)
+├── MediaMountTray/
+│   ├── MediaMountTrayApp.swift          (SwiftUI MenuBarExtra — from existing code)
+│   ├── AgentConnection.swift            (IPC — extracted from existing code)
+│   ├── MountInfo.swift                  (Model — extracted)
+│   ├── DomainManager.swift              (FileProvider domain registration)
+│   ├── Info.plist
+│   └── MediaMountTray.entitlements
+├── FileProviderExtension/
+│   ├── FileProviderExtension.swift      (NSFileProviderReplicatedExtension)
+│   ├── FileProviderItem.swift           (NSFileProviderItem wrapper)
+│   ├── FileProviderEnumerator.swift     (Directory enumeration)
+│   ├── Info.plist
+│   └── FileProviderExtension.entitlements
+└── MediaMountTray.swift                 (original single-file, kept as reference)
+```
+
+### Targets
+
+**MediaMountTray** (host app):
+- Bundle ID: `com.unionfiles.mediamount-tray`
+- macOS 12.0+ (FileProvider Replicated stable from 12)
+- LSUIElement: true
+- App group: `group.com.unionfiles.mediamount-tray`
+- On launch: reads `~/.local/share/ufb/mounts.json`, registers FileProvider domains
+  for sync-enabled mounts via `NSFileProviderManager.add(domain:)`
+
+**FileProviderExtension** (app extension):
+- Bundle ID: `com.unionfiles.mediamount-tray.FileProvider`
+- Extension point: `com.apple.fileprovider-nonui`
+- Same app group
+- NSExtensionFileProviderSupportsEnumeration: true
+- Implements `NSFileProviderReplicatedExtension`:
+  - `item(for:)` — return metadata for a single item
+  - `enumerator(for:)` — return enumerator for directory listing
+  - `fetchContents(for:)` — download file from NAS (sandbox test)
+
+### Domain registration flow
+
+1. Host app reads `mounts.json` on launch
+2. For each mount with `syncEnabled: true`:
+   - Domain identifier = `share_name` (e.g., `Jobs_Live`)
+   - Display name = `mount.displayName` (e.g., `Studio NAS`)
+   - `NSFileProviderManager.add(domain:)` → creates `~/Library/CloudStorage/` entry
+3. Agent creates symlink: `/opt/ufb/mounts/{share_name}` → `~/Library/CloudStorage/{domain}/`
+4. Extension launched by system when user browses the domain
+
+### FileProvider callback → SMB mapping (mirrors Windows CF API)
+
+| FileProvider | Windows CF API | SMB Operation |
+|---|---|---|
+| `enumerateItems` | `fetch_placeholders` | `fs::read_dir(/Volumes/{share}/path)` |
+| `fetchContents` | `fetch_data` | `fs::File::open(/Volumes/{share}/path)` → stream |
+| `createItem` | (write-through) | `fs::File::create(/Volumes/{share}/path)` |
+| `modifyItem` | (write-through) | `fs::write(/Volumes/{share}/path)` |
+| `deleteItem` | `delete` | `fs::remove_file(/Volumes/{share}/path)` |
+
+### Build system changes
+
+`build-macos.sh` step 4 changes from:
+```bash
+swiftc -parse-as-library -O -o MediaMountTray MediaMountTray.swift
+```
+To:
+```bash
+xcodegen generate
+xcodebuild -project MediaMountTray.xcodeproj -scheme MediaMountTray -configuration Release
+```
+
+The built `.app` now contains `Contents/PlugIns/FileProviderExtension.appex`.
+
+### Phase 0 spike success criteria
+
+1. Domain appears in `~/Library/CloudStorage/`
+2. Finder sidebar shows the domain
+3. Browsing domain in Finder triggers `enumerateItems` → shows NAS directory contents
+4. Opening a file triggers `fetchContents` → file opens from NAS
+5. **Sandbox verdict:** either `/Volumes/` access works, or we know the exact error
+
+### Reusable from Windows implementation
+
+- Cache DB schema (`known_files`, `visited_folders`, `metadata` tables)
+- Upload worker logic (temp file, conflict detection, chunked write)
+- Echo suppressor (HashMap with TTL)
+- Coordinator state machine (debounce timers, per-path tracking)
+- NAS connectivity tracking (online/offline state)
+- Startup reconciliation (three-way diff)
+
+### macOS-specific (new code)
+
+- FileProvider extension Swift code (extension, item, enumerator)
+- Domain registration from host app
+- FSEvents-based NAS watcher (replaces ReadDirectoryChangesW)
+- `NSFileProviderManager.signalEnumerator()` for change notifications
+- `NSFileProviderManager.evictItem()` for cache eviction (replaces CfDehydratePlaceholder)
+
+---
+
+## 2026-04-11 — FileProvider Phase 0 spike results
+
+### What was built
+
+Migrated MediaMountTray from single-file `swiftc` build to XcodeGen project with two targets:
+- **MediaMountTray** (host app): MenuBarExtra + `DomainManager` for FileProvider domain registration
+- **FileProviderExtension** (app extension): `NSFileProviderReplicatedExtension` spike
+
+Build: `xcodegen generate && xcodebuild -scheme MediaMountTray -configuration Debug -allowProvisioningUpdates`
+
+### Project structure
+
+```
+mediamount-tray/
+├── project.yml                          (XcodeGen spec → generates .xcodeproj)
+├── MediaMountTray/
+│   ├── MediaMountTrayApp.swift          (SwiftUI MenuBarExtra + DomainManager init)
+│   ├── AgentConnection.swift            (Unix socket IPC to agent)
+│   ├── MountInfo.swift                  (Observable mount state model)
+│   ├── DomainManager.swift              (reads mounts.json, registers NSFileProviderDomain)
+│   ├── Info.plist
+│   └── MediaMountTray.entitlements
+├── FileProviderExtension/
+│   ├── FileProviderExtension.swift      (NSFileProviderReplicatedExtension)
+│   ├── FileProviderItem.swift           (NSFileProviderItem with contentType, itemVersion)
+│   ├── FileProviderEnumerator.swift     (directory listing via FileManager)
+│   ├── Info.plist                       (com.apple.fileprovider-nonui extension point)
+│   └── FileProviderExtension.entitlements
+└── MediaMountTray.swift                 (original single-file, kept as reference)
+```
+
+### Findings during spike
+
+**1. Sandbox entitlement required (CRIT)**
+FileProvider extensions MUST have `com.apple.security.app-sandbox` entitlement.
+Without it: `"Extension must have com.apple.security.app-sandbox entitlement."` and the
+extension process is never created.
+
+**2. App group needs team ID prefix**
+`group.com.unionfiles.mediamount-tray` → REJECTED by containermanagerd.
+`5Z4S9VHV56.group.com.unionfiles.mediamount-tray` → APPROVED.
+Group container IDs must be prefixed with the team ID on macOS.
+
+**3. Root container needs filename and itemVersion**
+FileProvider crashes the extension process (assertion failure) if root container item
+is missing `filename` or `itemVersion`. Both are required even for `.rootContainer`.
+- `filename`: Use `domain.displayName`
+- `itemVersion`: `NSFileProviderItemVersion(contentVersion:metadataVersion:)` with any data
+
+**4. `typeIdentifier` deprecated → use `contentType: UTType`**
+Latest macOS SDK marks `typeIdentifier` as unavailable. Use `contentType` property
+returning `UTType` instead.
+
+**5. `modifyItem` uses `NSFileProviderModifyItemOptions`, not `NSFileProviderCreateItemOptions`**
+Different option types for create vs modify — compiler catches this.
+
+**6. macOS 13+ required for MenuBarExtra**
+`MenuBarExtra` API requires macOS 13.0. Set deployment target accordingly.
+
+### SANDBOX VERDICT: /Volumes/ access BLOCKED
+
+**This is the critical finding.** The sandboxed FileProvider extension cannot access
+`/Volumes/{share}` (SMB mount points). Error:
+
+```
+NSCocoaErrorDomain Code=257
+"The file "test1" couldn't be opened because you don't have permission to view it."
+NSPOSIXErrorDomain Code=1 "Operation not permitted"
+```
+
+The share is mounted and accessible from the host app and terminal, but the extension
+sandbox blocks it. This rules out the direct `/Volumes/` access approach.
+
+**Consequence:** All file I/O must go through IPC to the agent. The extension sends
+requests (list_dir, read_file, write_file) and the agent services them from the
+mounted SMB share.
+
+### Domain registration works
+
+`DomainManager` reads `~/.local/share/ufb/mounts.json`, finds sync-enabled mounts,
+calls `NSFileProviderManager.add(domain:)`. Result:
+- `~/Library/CloudStorage/MediaMountTray-Test1/` appears
+- Finder sidebar shows the domain
+- System launches extension on browse
+
+### IPC architecture (next phase)
+
+Since the extension can't access `/Volumes/` directly, we need a file-operation IPC
+channel between the extension and the agent:
+
+```
+┌─────────────────────────────────┐
+│  FileProviderExtension          │
+│  (sandboxed, no /Volumes/)      │
+│                                 │
+│  enumerateItems ──┐             │
+│  fetchContents  ──┼── IPC ──────┼──► Agent (has /Volumes/ access)
+│  modifyItem     ──┤  (socket    │       │
+│  deleteItem     ──┘   in app    │       ├── SMB readdir
+│                      group)     │       ├── SMB read (stream)
+│                                 │       ├── SMB write
+└─────────────────────────────────┘       └── SMB delete/rename
+```
+
+**IPC transport:** Unix domain socket in the shared app group container:
+`{group_container}/agent.sock`
+
+The agent already has a Unix socket server (`mediamount-agent/src/ipc/unix_server.rs`).
+We add a second listener in the app group container specifically for extension requests.
+
+**New message types needed (Extension → Agent):**
+
+| Message | Purpose | Response |
+|---------|---------|----------|
+| `list_dir(nas_path)` | Directory enumeration | Array of `{name, is_dir, size, mtime}` |
+| `read_file(nas_path, offset, length)` | Chunked file read | Binary data chunk |
+| `write_file(nas_path, data)` | File upload | Success/error |
+| `delete(nas_path)` | File/dir deletion | Success/error |
+| `rename(old_path, new_path)` | Rename/move | Success/error |
+| `stat(nas_path)` | File metadata | `{size, mtime, is_dir}` |
+
+**Agent → Extension notifications:**
+- NAS change detected → agent calls `NSFileProviderManager.signalEnumerator()`
+  via the host app (extension can't do this directly? — verify)
+
+**File streaming for fetchContents:**
+For large files, the agent writes to a temp file in the app group container, then
+returns the path. The extension passes this URL to the FileProvider completion handler.
+This avoids streaming binary data through JSON IPC.
+
+```
+Extension: fetchContents("project/scene.nk")
+  → Agent: reads /Volumes/test1/project/scene.nk
+  → Agent: writes to {group_container}/temp/{uuid}.tmp
+  → Agent: responds with temp file path
+  → Extension: completionHandler(tempFileURL, item, nil)
+```
+
+### App group container path
+
+```swift
+let groupContainer = FileManager.default.containerURL(
+    forSecurityApplicationGroupIdentifier: "5Z4S9VHV56.group.com.unionfiles.mediamount-tray"
+)!
+let socketPath = groupContainer.appendingPathComponent("agent.sock")
+```
+
+Rust agent equivalent:
+```rust
+// macOS: ~/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/
+let group_dir = dirs::home_dir()
+    .join("Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray");
+let socket_path = group_dir.join("agent.sock");
+```
+
+### Implementation order for IPC phase
+
+1. **Agent: second Unix socket listener** in app group container
+2. **Agent: file operation message handlers** (list_dir, stat, read → temp file)
+3. **Extension: IPC client** connecting to app group socket (reuse AgentConnection pattern)
+4. **Extension: enumerateItems** via IPC list_dir instead of FileManager
+5. **Extension: fetchContents** via IPC read → temp file → completion handler
+6. **Test:** browse CloudStorage in Finder, open a file
+7. **Extension: createItem/modifyItem** via IPC write (write-through)
+8. **Agent: NAS watcher** signals extension via signalEnumerator
+
+### Files to modify (IPC phase)
+
+| File | Change |
+|------|--------|
+| `mediamount-agent/src/ipc/mod.rs` | Add app-group socket listener alongside existing |
+| `mediamount-agent/src/ipc/unix_server.rs` | Support file-operation messages |
+| `mediamount-agent/src/messages.rs` | New message types for file ops |
+| `FileProviderExtension/FileProviderExtension.swift` | IPC client, replace FileManager calls |
+| `FileProviderExtension/FileProviderEnumerator.swift` | IPC-based enumeration |
+| `FileProviderExtension/AgentIPCClient.swift` | New: socket client for extension |

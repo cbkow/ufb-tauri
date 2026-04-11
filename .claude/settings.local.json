@@ -12,7 +12,9 @@
       "WebSearch",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:github.com)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(cargo build:*)",
+      "Bash(npm run:*)"
     ]
   }
 }

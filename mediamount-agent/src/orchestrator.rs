@@ -352,7 +352,25 @@ impl Orchestrator {
 
         #[cfg(target_os = "macos")]
         {
-            // macOS: open smb:// to mount, then symlink from stable path
+            if self.config.is_sync_mode() {
+                // Sync mode: symlink from stable path to FileProvider domain
+                use crate::platform::DriveMapping;
+                let dm = crate::platform::macos::MacosMountMapping::new();
+                let mount_point = self.config.mount_path();
+                let fp_path = self.config.fileprovider_domain_path()
+                    .to_string_lossy().to_string();
+                if let Err(e) = dm.switch(&mount_point, &fp_path) {
+                    log::error!("[{}] FileProvider symlink failed: {}", self.mount_id, e);
+                    let _ = self
+                        .event_tx
+                        .send(MountEvent::MountFailed { reason: e })
+                        .await;
+                }
+                // TODO: FileProvider domain registration (requires Swift extension)
+                return;
+            }
+
+            // SMB mode: open smb:// to mount, then symlink from stable path
             let mount_result = crate::platform::macos::macos_smb_mount(
                 &self.config.nas_share_path,
                 &username,
@@ -426,19 +444,21 @@ impl Orchestrator {
             let dm = crate::platform::macos::MacosMountMapping::new();
             let mount_point = self.config.mount_path();
 
-            // Read the symlink target (actual /Volumes/ path) before removing
-            if let Ok(volumes_path) = dm.read_target(&mount_point) {
-                // Remove the symlink first
-                if let Err(e) = dm.remove(&mount_point) {
-                    log::warn!("[{}] Remove symlink failed (non-fatal): {}", self.mount_id, e);
-                }
-                // Unmount the actual SMB mount
-                if let Err(e) = crate::platform::macos::macos_smb_unmount(&volumes_path) {
-                    log::warn!("[{}] Unmount failed (non-fatal): {}", self.mount_id, e);
-                }
-            } else {
-                // No symlink — just try to remove it in case it's stale
+            if self.config.is_sync_mode() {
+                // Sync mode: just remove the symlink; FileProvider manages its own domain
                 let _ = dm.remove(&mount_point);
+            } else {
+                // SMB mode: read target, remove symlink, unmount
+                if let Ok(volumes_path) = dm.read_target(&mount_point) {
+                    if let Err(e) = dm.remove(&mount_point) {
+                        log::warn!("[{}] Remove symlink failed (non-fatal): {}", self.mount_id, e);
+                    }
+                    if let Err(e) = crate::platform::macos::macos_smb_unmount(&volumes_path) {
+                        log::warn!("[{}] Unmount failed (non-fatal): {}", self.mount_id, e);
+                    }
+                } else {
+                    let _ = dm.remove(&mount_point);
+                }
             }
         }
     }

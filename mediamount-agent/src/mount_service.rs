@@ -59,6 +59,41 @@ impl MountService {
                 .collect();
             crate::sync::SyncRoot::cleanup_stale_roots(&active_sync_mounts);
         }
+
+        // macOS: clean up stale symlinks from old {id}-based naming or removed mounts
+        #[cfg(target_os = "macos")]
+        {
+            let active_names: std::collections::HashSet<String> = config
+                .mounts
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.share_name())
+                .collect();
+            let base = config::MountConfig::volumes_base();
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_symlink() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if !active_names.contains(name) {
+                                let _ = std::fs::remove_file(&path);
+                                log::info!("Removed stale symlink: {}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Warn about share name collisions
+            for (name, ids) in config.share_name_collisions() {
+                log::warn!(
+                    "Share name collision: '{}' used by mounts [{}]. Set mount_path_macos to resolve.",
+                    name,
+                    ids.join(", ")
+                );
+            }
+        }
+
         // Detect cache root change — restart all sync mounts to re-register at new path
         let new_cache_root = config.cache_root();
         if new_cache_root != self.cache_root {

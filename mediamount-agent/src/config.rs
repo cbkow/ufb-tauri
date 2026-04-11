@@ -138,6 +138,25 @@ impl MountsConfig {
         }
         MountConfig::default_cache_root()
     }
+
+    /// Detect enabled mounts with duplicate share names.
+    /// Returns pairs of (share_name, [mount_ids]) for any collisions.
+    pub fn share_name_collisions(&self) -> Vec<(String, Vec<String>)> {
+        use std::collections::HashMap;
+        let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        for m in &self.mounts {
+            if m.enabled {
+                by_name
+                    .entry(m.share_name())
+                    .or_default()
+                    .push(m.id.clone());
+            }
+        }
+        by_name
+            .into_iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect()
+    }
 }
 
 impl MountConfig {
@@ -146,16 +165,38 @@ impl MountConfig {
         self.sync_enabled
     }
 
-    /// The local folder path for the sync root (where CF API operates).
-    /// This is the internal cache path, NOT the user-facing volume path.
-    /// Uses per-mount override if set, otherwise {cache_root}\{shareName}.
+    /// The local folder path for the sync root (where CF API / FileProvider operates).
+    /// Windows: internal cache path ({cache_root}\{shareName}).
+    /// macOS: FileProvider domain path (~/Library/CloudStorage/...) — cache_root ignored.
+    /// Uses per-mount override if set (Windows/Linux only).
     pub fn sync_root_dir(&self, cache_root: &std::path::Path) -> PathBuf {
-        if let Some(ref p) = self.sync_root_path {
-            if !p.is_empty() {
-                return PathBuf::from(p);
-            }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = cache_root; // FileProvider controls cache location on macOS
+            return self.fileprovider_domain_path();
         }
-        cache_root.join(self.share_name())
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(ref p) = self.sync_root_path {
+                if !p.is_empty() {
+                    return PathBuf::from(p);
+                }
+            }
+            cache_root.join(self.share_name())
+        }
+    }
+
+    /// The path where macOS FileProvider materializes this domain.
+    /// ~/Library/CloudStorage/{BundleId}-{share_name}/
+    #[cfg(target_os = "macos")]
+    pub fn fileprovider_domain_path(&self) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home)
+            .join("Library/CloudStorage")
+            .join(format!(
+                "com.unionfiles.mediamount-tray.FileProvider-{}",
+                self.share_name()
+            ))
     }
 
     /// Extract the folder name from the NAS path (last path component).
@@ -233,7 +274,7 @@ impl MountConfig {
 
     /// The user-facing path for this mount (where the user navigates).
     /// Windows: C:\Volumes\ufb\{shareName} (symlink)
-    /// macOS: /opt/ufb/mounts/{id} or explicit override
+    /// macOS: /opt/ufb/mounts/{shareName} or explicit override
     /// Linux: ~/.local/share/ufb/mnt/{id} or explicit override
     pub fn mount_path(&self) -> String {
         #[cfg(windows)]
@@ -245,7 +286,7 @@ impl MountConfig {
             if let Some(ref p) = self.mount_path_macos {
                 if !p.is_empty() { return p.clone(); }
             }
-            format!("/opt/ufb/mounts/{}", self.id)
+            self.volume_path()
         }
         #[cfg(target_os = "linux")]
         {
@@ -403,48 +444,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_mount_path() {
-        let config = MountsConfig {
-            version: 1,
-            sync_cache_root: None,
-            mounts: vec![MountConfig {
-                id: "test".into(),
-                enabled: true,
-                display_name: "Test".into(),
-                nas_share_path: r"\\nas\test".into(),
-                credential_key: "test".into(),
-                mount_drive_letter: "M".into(),
-                smb_mount_path: None,
-                mount_path_linux: None,
-                mount_path_macos: None,
-                is_jobs_folder: true,
-                sync_enabled: false,
-                sync_root_path: None,
-                sync_cache_limit_bytes: 0,
-                rclone_drive_letter: String::new(),
-                smb_drive_letter: String::new(),
-                junction_path: String::new(),
-                rclone_mount_path: None,
-                rclone_remote: None,
-                cache_dir_path: String::new(),
-                cache_max_size: String::new(),
-                cache_max_age: String::new(),
-                vfs_write_back: String::new(),
-                vfs_read_chunk_size: String::new(),
-                vfs_read_chunk_streams: 0,
-                vfs_read_ahead: String::new(),
-                buffer_size: String::new(),
-                probe_interval_secs: 0,
-                probe_timeout_ms: 0,
-                fallback_threshold: 0,
-                recovery_threshold: 0,
-                max_rclone_start_attempts: 0,
-                healthcheck_file_name: String::new(),
-                extra_rclone_flags: vec![],
-            }],
-        };
-        // Windows: all mounts use volume path now (not drive letter)
-        assert_eq!(config.mounts[0].mount_path(), r"C:\Volumes\ufb\test");
+        let m = test_mount("test", r"\\nas\test");
+        assert_eq!(m.mount_path(), r"C:\Volumes\ufb\test");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_mount_path() {
+        let m = test_mount("test", r"\\nas\test");
+        assert_eq!(m.mount_path(), "/opt/ufb/mounts/test");
     }
 
     #[test]
@@ -501,5 +511,130 @@ mod tests {
         let json = r#"{ not valid json }"#;
         let result = serde_json::from_str::<MountsConfig>(json);
         assert!(result.is_err());
+    }
+
+    /// Helper to create a minimal MountConfig for tests.
+    fn test_mount(id: &str, nas_share_path: &str) -> MountConfig {
+        MountConfig {
+            id: id.into(),
+            enabled: true,
+            display_name: id.into(),
+            nas_share_path: nas_share_path.into(),
+            credential_key: id.into(),
+            mount_drive_letter: String::new(),
+            smb_mount_path: None,
+            mount_path_linux: None,
+            mount_path_macos: None,
+            is_jobs_folder: true,
+            sync_enabled: false,
+            sync_root_path: None,
+            sync_cache_limit_bytes: 0,
+            rclone_drive_letter: String::new(),
+            smb_drive_letter: String::new(),
+            junction_path: String::new(),
+            rclone_mount_path: None,
+            rclone_remote: None,
+            cache_dir_path: String::new(),
+            cache_max_size: String::new(),
+            cache_max_age: String::new(),
+            vfs_write_back: String::new(),
+            vfs_read_chunk_size: String::new(),
+            vfs_read_chunk_streams: 0,
+            vfs_read_ahead: String::new(),
+            buffer_size: String::new(),
+            probe_interval_secs: 0,
+            probe_timeout_ms: 0,
+            fallback_threshold: 0,
+            recovery_threshold: 0,
+            max_rclone_start_attempts: 0,
+            healthcheck_file_name: String::new(),
+            extra_rclone_flags: vec![],
+        }
+    }
+
+    #[test]
+    fn test_share_name() {
+        let m = test_mount("primary-nas", r"\\192.168.40.100\Jobs_Live");
+        assert_eq!(m.share_name(), "Jobs_Live");
+
+        let m = test_mount("deep", r"\\nas\FlameServer\Flame\FLAME_JOBS");
+        assert_eq!(m.share_name(), "FLAME_JOBS");
+
+        // Trailing backslash
+        let m = test_mount("trailing", r"\\nas\test\");
+        assert_eq!(m.share_name(), "test");
+
+        // Empty NAS path falls back to id
+        let m = test_mount("fallback-id", "");
+        assert_eq!(m.share_name(), "fallback-id");
+    }
+
+    #[test]
+    fn test_volume_path_uses_share_name() {
+        let m = test_mount("primary-nas", r"\\192.168.40.100\Jobs_Live");
+        let vp = m.volume_path();
+        // Last component should be share_name, not id
+        assert!(vp.ends_with("Jobs_Live"), "volume_path should end with share_name, got: {}", vp);
+        assert!(!vp.contains("primary-nas"), "volume_path should not contain id");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_mount_path_macos() {
+        let m = test_mount("primary-nas", r"\\192.168.40.100\Jobs_Live");
+        assert_eq!(m.mount_path(), "/opt/ufb/mounts/Jobs_Live");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_mount_path_macos_override() {
+        let mut m = test_mount("primary-nas", r"\\nas\Jobs_Live");
+        m.mount_path_macos = Some("/custom/path".into());
+        assert_eq!(m.mount_path(), "/custom/path");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_fileprovider_domain_path() {
+        let m = test_mount("primary-nas", r"\\nas\Jobs_Live");
+        let fp = m.fileprovider_domain_path();
+        let fp_str = fp.to_string_lossy();
+        assert!(
+            fp_str.contains("Library/CloudStorage/com.unionfiles.mediamount-tray.FileProvider-Jobs_Live"),
+            "unexpected fileprovider path: {}", fp_str
+        );
+    }
+
+    #[test]
+    fn test_share_name_collisions() {
+        let config = MountsConfig {
+            version: 1,
+            sync_cache_root: None,
+            mounts: vec![
+                test_mount("nas-a", r"\\server-a\Jobs_Live"),
+                test_mount("nas-b", r"\\server-b\Jobs_Live"),
+                test_mount("nas-c", r"\\server-c\Archive"),
+            ],
+        };
+        let collisions = config.share_name_collisions();
+        assert_eq!(collisions.len(), 1);
+        let (name, ids) = &collisions[0];
+        assert_eq!(name, "Jobs_Live");
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_no_collisions_when_disabled() {
+        let mut m = test_mount("nas-b", r"\\server-b\Jobs_Live");
+        m.enabled = false;
+        let config = MountsConfig {
+            version: 1,
+            sync_cache_root: None,
+            mounts: vec![
+                test_mount("nas-a", r"\\server-a\Jobs_Live"),
+                m,
+            ],
+        };
+        assert!(config.share_name_collisions().is_empty());
     }
 }

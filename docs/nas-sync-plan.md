@@ -199,6 +199,43 @@ same concept as the Windows identity blob.
 Same SQLite cache index as Windows. On eviction, call
 `NSFileProviderManager.evictItem(identifier:)` instead of CF API dehydrate.
 
+### Path Architecture (decided 2026-04-11)
+
+User-facing paths use symlinks at `/opt/ufb/mounts/{share_name}`, same pattern as
+Windows `C:\Volumes\ufb\{share_name}`. The symlink target changes based on mode:
+
+```
+SMB mode:   /opt/ufb/mounts/{share_name}  →  /Volumes/{share_name}
+Sync mode:  /opt/ufb/mounts/{share_name}  →  ~/Library/CloudStorage/{bundle}-{share_name}/
+```
+
+- Bundle ID: `com.unionfiles.mediamount-tray.FileProvider`
+- Domain identifier: `{share_name}` (e.g., `Jobs_Live`)
+- Base dir `/opt/ufb/mounts` requires one-time elevation (installer or first-run)
+- macOS symlinks do not require elevation
+- `sync_cache_root` setting is ignored on macOS — FileProvider controls cache location
+- Frontend hides "Cache Location" picker on macOS
+
+### File I/O Architecture (validated 2026-04-11)
+
+**FileProvider extensions are sandboxed and CANNOT access `/Volumes/` SMB mounts.**
+(POSIX error 1: Operation not permitted.) All file I/O must go through IPC to the agent.
+
+The agent listens on a Unix socket in the shared app group container
+(`~/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/agent.sock`).
+The extension sends file operation requests; the agent services them from the mounted SMB share.
+
+For large files (fetchContents), the agent writes to a temp file in the app group container
+and returns the path — avoids streaming binary through JSON.
+
+```
+Extension                          Agent
+enumerateItems ──list_dir──►  fs::read_dir(/Volumes/{share}/...)
+fetchContents  ──read_file──► copy to {group}/temp/ → return path
+createItem     ──write_file──► fs::write(/Volumes/{share}/...)
+deleteItem     ──delete──────► fs::remove(/Volumes/{share}/...)
+```
+
 ---
 
 ## Write-Through Architecture
