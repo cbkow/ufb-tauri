@@ -1116,3 +1116,29 @@ macOS FileProvider manages Finder sidebar entries natively — no equivalent of 
 FileProvider domains appear in `~/Library/CloudStorage/`. The redirect hack is Windows-only.
 macOS needs its own sidebar strategy (likely `LSSharedFileListInsertItemURL` for symlink-based
 entries, or just relying on FileProvider's built-in Finder integration).
+
+**Verify FileProvider path:** On macOS, check whether the FileProvider domain's Finder sidebar
+entry points to `~/Library/CloudStorage/MediaMount-{id}/` or to the symlink at
+`/opt/ufb/mounts/{share}`. If it points to CloudStorage, the user sees internal paths — same
+problem we had on Windows. May need a similar redirect or to ensure the symlink is the
+canonical user-facing path.
+
+### Other fixes in this session (2026-04-10) with macOS relevance
+
+**System icons (cross-platform):**
+- Icons now requested at 256px (was 32px). macOS `NSWorkspace` implementation (not yet built)
+  should also use large icons. See `src-tauri/src/system_icons.rs` — macOS currently returns
+  None, falling back to Material Symbols icon font.
+- `ThumbnailImage.tsx`: System icon now loads immediately as a placeholder while the thumbnail
+  request is queued. Thumbnail overwrites when ready. This is cross-platform SolidJS logic.
+
+**Selection preserved on refresh (cross-platform):**
+- `fileStore.ts navigateTo()`: Same-directory refreshes now preserve selection, pruning only
+  paths that no longer exist. Previously, mount state updates (every ~2s for sync mounts)
+  cleared selection. This fix applies to macOS too.
+
+**Shell context menus (platform-specific):**
+- Nilesoft Shell integration (`union_goto.nss`, `union_projects.nss`, `project_notes.ps1`)
+  updated to use `C:\Volumes\ufb\{share}` paths. Windows-only.
+- macOS needs equivalent Finder integration: Finder Extensions, Services, or Quick Actions
+  for project creation, notes, and navigation shortcuts. Not yet implemented.

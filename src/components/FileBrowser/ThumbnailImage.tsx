@@ -60,7 +60,7 @@ export function ThumbnailImage(props: ThumbnailImageProps) {
     if (props.isDir || !props.extension) {
       // Directories: skip thumbnail, try system folder icon directly
       if (ext) {
-        getSystemIconCached(ext, 32).then((iconUrl) => {
+        getSystemIconCached(ext, 256).then((iconUrl) => {
           if (cancelled) return;
           if (iconUrl) setSrc(iconUrl);
         });
@@ -74,22 +74,25 @@ export function ThumbnailImage(props: ThumbnailImageProps) {
       setSrc(cached);
       return;
     }
+
+    // Show system icon immediately as placeholder while thumbnail loads
+    if (ext) {
+      getSystemIconCached(ext, 256).then((iconUrl) => {
+        if (cancelled) return;
+        // Only set if no thumbnail has arrived yet
+        if (!src()) setSrc(iconUrl);
+      });
+    }
+
     if (noThumbPaths.has(props.filePath)) return;
 
     enqueueRequest(props.filePath).then((dataUrl) => {
       if (cancelled) return;
       if (dataUrl) {
         thumbCache.set(props.filePath, dataUrl);
-        setSrc(dataUrl);
+        setSrc(dataUrl); // Overwrites system icon placeholder
       } else {
         noThumbPaths.add(props.filePath);
-        // No thumbnail — try system icon as fallback
-        if (ext) {
-          getSystemIconCached(ext, 32).then((iconUrl) => {
-            if (cancelled) return;
-            if (iconUrl) setSrc(iconUrl);
-          });
-        }
       }
     });
   });

@@ -7,8 +7,9 @@ $appRoot = Split-Path (Split-Path $PSScriptRoot)
 
 # Job root prefixes (case-insensitive)
 $jobRoots = @(
-    "D:\Jobs_Live",
-    "C:\Volumes\union-ny-gfx\union-jobs"
+    "C:\Volumes\ufb\Jobs_Live",
+    "C:\Volumes\ufb\FLAME_JOBS",
+    "C:\Volumes\ufb\GFX_Dropbox"
 )
 
 # Try to extract job name (NNNNNN_name) from the path
@@ -30,7 +31,7 @@ foreach ($root in $jobRoots) {
 if (-not $jobName) {
     [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms") | Out-Null
     [System.Windows.Forms.MessageBox]::Show(
-        "Could not detect a project from this path.`n`nExpected a path under:`n  D:\Jobs_Live\NNNNNN_jobname`n  C:\Volumes\union-ny-gfx\union-jobs\NNNNNN_jobname",
+        "Could not detect a project from this path.`n`nExpected a path under:`n  C:\Volumes\ufb\Jobs_Live\NNNNNN_jobname",
         "Project Notes",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Warning

@@ -30,16 +30,16 @@ menu(title='Union Projects' type='back|directory|drive|desktop' image=\uE0CF)
         args='-ExecutionPolicy Bypass -WindowStyle Hidden -File "{{INSTDIR}}\assets\scripts\new_shot.ps1" -Title "New Illustrator" -SourceDir "{{INSTDIR}}\assets\projectTemplate\illustrator\_t_project_name" -TargetDir "' + if(sel.back, sel.curdir, sel.path) + '"'
         window=cmd.hidden)
 
-    separator(where=str.contains(if(sel.back, sel.curdir, sel.path), 'Jobs_Live') or str.contains(if(sel.back, sel.curdir, sel.path), 'union-jobs'))
+    separator(where=str.contains(if(sel.back, sel.curdir, sel.path), 'C:\Volumes\ufb\'))
 
     item(title='Project Notes' image=\uE10E
-        where=str.contains(if(sel.back, sel.curdir, sel.path), 'Jobs_Live') or str.contains(if(sel.back, sel.curdir, sel.path), 'union-jobs')
+        where=str.contains(if(sel.back, sel.curdir, sel.path), 'C:\Volumes\ufb\')
         cmd='powershell.exe'
         args='-ExecutionPolicy Bypass -WindowStyle Hidden -File "{{INSTDIR}}\assets\scripts\project_notes.ps1" -Path "' + if(sel.back, sel.curdir, sel.path) + '" -Mode "doc"'
         window=cmd.hidden)
 
     item(title='Project Notes Folder' image=\uE10F
-        where=str.contains(if(sel.back, sel.curdir, sel.path), 'Jobs_Live') or str.contains(if(sel.back, sel.curdir, sel.path), 'union-jobs')
+        where=str.contains(if(sel.back, sel.curdir, sel.path), 'C:\Volumes\ufb\')
         cmd='powershell.exe'
         args='-ExecutionPolicy Bypass -WindowStyle Hidden -File "{{INSTDIR}}\assets\scripts\project_notes.ps1" -Path "' + if(sel.back, sel.curdir, sel.path) + '" -Mode "folder"'
         window=cmd.hidden)
