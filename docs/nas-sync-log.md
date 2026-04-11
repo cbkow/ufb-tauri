@@ -1042,3 +1042,77 @@ The architecture is designed for cross-platform. macOS equivalents:
   and symlink/junction code is platform-specific.
 
 **Next:** Step 8 (Frontend UI polish) and Step 9 (cleanup/dead code removal).
+
+---
+
+## Explorer integration — CF nav entry deduplication (2026-04-10)
+
+### Problem
+
+Sync mounts created **two** Explorer sidebar entries:
+1. Our nav pin (CLSID with `0FB` prefix) → `C:\Volumes\ufb\{share}` (junction path)
+2. CF API auto-created `NamespaceCLSID` → cache path (e.g. `C:\z_ufbCache\test1`)
+
+Users saw duplicate entries, and the CF one pointed to the internal cache path — an
+implementation detail they shouldn't see or use directly.
+
+Additionally, stale sync root registrations (from removed mounts like `sync-test`) left
+orphaned `NamespaceCLSID` entries in `Desktop\NameSpace` even after the `SyncRootManager`
+key was deleted.
+
+### Solution: redirect + skip nav pin
+
+The CF API's `NamespaceCLSID` is a standard shell folder CLSID with an
+`Instance\InitPropertyBag\TargetFolderPath` value. We patch this after registration to
+point at the junction (`C:\Volumes\ufb\{share}`) instead of the cache dir. Explorer then
+navigates through the junction, which preserves the path in the address bar.
+
+Since the CF entry now points to the right place (and has the cloud icon), we skip creating
+a nav pin for sync mounts entirely.
+
+**What was tried and rejected:**
+- **Hiding the CF entry** (deleting from `Desktop\NameSpace`): The CF API re-creates it on
+  `Session::connect()`, causing a race. Would need delayed cleanup with threads — fragile.
+- **Registering CF at the junction path**: Would break the purpose of the junction (disconnect
+  switch) and it's unclear if the CF API follows junctions correctly for placeholder ops.
+
+### Implementation
+
+**Agent (`mediamount-agent/src/sync/sync_root.rs`):**
+- `redirect_sync_root_nav_entry(mount_id, volume_path)`: Looks up the `NamespaceCLSID` from
+  `SyncRootManager`, patches `TargetFolderPath` in `HKCU\Software\Classes\CLSID\{clsid}\
+  Instance\InitPropertyBag` to the junction path.
+- Called in `SyncRoot::start()` after CF connect/register, and in `cleanup_stale_roots()`.
+- `cleanup_stale_roots(active_sync_mounts)`: Takes `HashMap<mount_id, volume_path>`.
+  Active sync roots get redirected. Stale roots get their nav entry removed + unregistered.
+- `remove_orphaned_cf_nav_entries()`: Second-pass cleanup. Scans `Desktop\NameSpace` for
+  entries whose default value is a `MediaMount!...` sync root ID but whose `SyncRootManager`
+  key no longer exists. Removes the orphaned CLSID + class registration.
+- `lookup_namespace_clsid(mount_id)`: Reads `NamespaceCLSID` from `SyncRootManager`.
+- `remove_nav_entry_by_clsid(clsid)`: Deletes from `Desktop\NameSpace` + `Classes\CLSID`.
+
+**Agent (`mediamount-agent/src/mount_service.rs`):**
+- `apply_config()` calls `cleanup_stale_roots()` at startup and on config reload with a
+  `HashMap<mount_id, volume_path>` of enabled sync mounts.
+
+**Tauri app (`src-tauri/src/explorer_pins.rs`):**
+- `collect_nav_pins()` skips mounts where `sync_enabled == true`. CF entry handles them.
+
+### Edge cases
+
+- **Fresh registration**: `register_fresh()` calls `unregister()` then `register()`. The new
+  `register()` creates a fresh CLSID with the cache path. Our redirect runs immediately after.
+- **Agent crash before redirect**: Cache path shows briefly. Fixed on next agent launch when
+  `cleanup_stale_roots()` re-applies the redirect.
+- **NamespaceCLSID changes**: `lookup_namespace_clsid()` reads it fresh from `SyncRootManager`
+  each time, so it always finds the current one.
+- **Orphaned CLSIDs**: Previous runs may have deleted the `SyncRootManager` key without
+  cleaning the CLSID. `remove_orphaned_cf_nav_entries()` catches these by scanning
+  `Desktop\NameSpace` for entries with `MediaMount!` default values.
+
+### macOS implications
+
+macOS FileProvider manages Finder sidebar entries natively — no equivalent of `NamespaceCLSID`.
+FileProvider domains appear in `~/Library/CloudStorage/`. The redirect hack is Windows-only.
+macOS needs its own sidebar strategy (likely `LSSharedFileListInsertItemURL` for symlink-based
+entries, or just relying on FileProvider's built-in Finder integration).
