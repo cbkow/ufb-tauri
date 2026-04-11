@@ -6,6 +6,7 @@ use cloud_filter::root::{
 };
 use std::collections::HashMap;
 use std::fs;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +45,7 @@ impl SyncRoot {
         nas_root: PathBuf,
         client_root: PathBuf,
         cache_limit_bytes: u64,
+        volume_path: &str,
     ) -> Result<Self, String> {
         // Ensure client directory exists
         fs::create_dir_all(&client_root)
@@ -158,6 +160,11 @@ impl SyncRoot {
             connectivity.clone(),
         );
 
+        // Redirect the CF-created Explorer nav entry from the cache path to the
+        // junction path. The CF API auto-pins the cache dir in Explorer's sidebar;
+        // we patch TargetFolderPath so it points to C:\Volumes\ufb\{share} instead.
+        Self::redirect_sync_root_nav_entry(mount_id, volume_path);
+
         Ok(Self {
             mount_id: mount_id.to_string(),
             nas_root,
@@ -208,9 +215,11 @@ impl SyncRoot {
             )
             .map_err(|e| format!("Failed to register sync root: {}", e))?;
 
-        Session::new()
+        let connection = Session::new()
             .connect(client_root, filter)
-            .map_err(|e| format!("Failed to connect sync filter: {}", e))
+            .map_err(|e| format!("Failed to connect sync filter: {}", e))?;
+
+        Ok(connection)
     }
 
     /// Disconnect the sync root session. Does NOT unregister — placeholders survive.
@@ -252,6 +261,69 @@ impl SyncRoot {
         } else {
             log::info!("[sync] Sync root '{}' unregistered", mount_id);
         }
+    }
+
+    /// Remove sync root registrations that no longer have a matching mount in config,
+    /// Remove stale sync root registrations and redirect active CF nav entries
+    /// to point at the junction path instead of the cache path.
+    /// `active_sync_mounts` maps mount_id → volume_path for enabled sync mounts.
+    pub fn cleanup_stale_roots(active_sync_mounts: &HashMap<String, String>) {
+        // Enumerate SyncRootManager registry keys for our provider
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager",
+            ])
+            .creation_flags(0x08000000)
+            .output();
+
+        let text = match output {
+            Ok(ref o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(e) => {
+                log::debug!("[sync] Failed to query SyncRootManager: {}", e);
+                return;
+            }
+        };
+
+        // Each registry subkey name is the sync root ID.
+        // Format: MediaMount!{SID}!{mount_id}
+        // We match on "MediaMount!" prefix and extract mount_id as the last segment.
+        let provider_prefix = format!("{}!", PROVIDER_NAME);
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let key_name = match trimmed.rsplit('\\').next() {
+                Some(k) if k.starts_with(&provider_prefix) => k,
+                _ => continue,
+            };
+            // Extract mount_id: everything after the last '!'
+            let mount_id = match key_name.rsplit('!').next() {
+                Some(id) if !id.is_empty() => id,
+                _ => continue,
+            };
+
+            if let Some(volume_path) = active_sync_mounts.get(mount_id) {
+                // Active — redirect CF nav entry to junction path
+                Self::redirect_sync_root_nav_entry(mount_id, volume_path);
+            } else {
+                // Stale — read the NamespaceCLSID before unregister destroys the key
+                let clsid = Self::lookup_namespace_clsid(mount_id);
+                log::info!(
+                    "[sync] Removing stale sync root '{}' (no matching mount in config)",
+                    mount_id
+                );
+                Self::unregister(mount_id);
+                // Now remove the orphaned nav entry
+                if let Some(ref clsid) = clsid {
+                    Self::remove_nav_entry_by_clsid(clsid);
+                }
+            }
+        }
+
+        // Second pass: remove orphaned NamespaceCLSIDs left in Desktop\NameSpace
+        // from sync roots that were unregistered in a previous run (SyncRootManager
+        // key gone, but the CLSID entry was never cleaned up).
+        Self::remove_orphaned_cf_nav_entries();
     }
 
     /// Get shared connectivity state for the orchestrator.
@@ -711,6 +783,163 @@ impl SyncRoot {
             wt.activity.lock().unwrap().summary()
         } else {
             "Disabled".to_string()
+        }
+    }
+
+    /// Look up the NamespaceCLSID that the CF API auto-created for a sync root.
+    fn lookup_namespace_clsid(mount_id: &str) -> Option<String> {
+        let sid = SecurityId::current_user().ok()?;
+        let sync_root_id = SyncRootIdBuilder::new(PROVIDER_NAME)
+            .user_security_id(sid)
+            .account_name(mount_id)
+            .build();
+        let id_string = sync_root_id.to_os_string().to_string_lossy().to_string();
+
+        let srm_key = format!(
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{}",
+            id_string
+        );
+
+        let output = std::process::Command::new("reg")
+            .args(["query", &srm_key, "/v", "NamespaceCLSID"])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find(|l| l.contains("NamespaceCLSID"))
+            .and_then(|l| l.split_whitespace().last())
+            .map(|s| s.to_string())
+    }
+
+    /// Redirect the CF-created Explorer nav entry to point at the junction path
+    /// instead of the cache path. Patches the TargetFolderPath in the CLSID's
+    /// InitPropertyBag so Explorer navigates to C:\Volumes\ufb\{share}.
+    fn redirect_sync_root_nav_entry(mount_id: &str, volume_path: &str) {
+        let clsid = match Self::lookup_namespace_clsid(mount_id) {
+            Some(c) => c,
+            None => {
+                log::debug!("[sync] No NamespaceCLSID found for '{}', nothing to redirect", mount_id);
+                return;
+            }
+        };
+
+        let init_bag_key = format!(
+            r"HKCU\Software\Classes\CLSID\{}\Instance\InitPropertyBag",
+            clsid
+        );
+
+        let result = std::process::Command::new("reg")
+            .args([
+                "add", &init_bag_key,
+                "/v", "TargetFolderPath",
+                "/t", "REG_SZ",
+                "/d", volume_path,
+                "/f",
+            ])
+            .creation_flags(0x08000000)
+            .output();
+
+        match result {
+            Ok(o) if o.status.success() => {
+                log::info!(
+                    "[sync] Redirected CF nav entry for '{}' → {} (CLSID {})",
+                    mount_id, volume_path, clsid
+                );
+            }
+            _ => {
+                log::warn!("[sync] Failed to redirect CF nav entry for '{}'", mount_id);
+            }
+        }
+    }
+
+    /// Remove a NamespaceCLSID entry from Desktop\NameSpace by CLSID string.
+    fn remove_nav_entry_by_clsid(clsid: &str) {
+        let ns_key = format!(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{}",
+            clsid
+        );
+        let _ = std::process::Command::new("reg")
+            .args(["delete", &ns_key, "/f"])
+            .creation_flags(0x08000000)
+            .output();
+
+        // Also remove the CLSID class registration itself
+        let clsid_key = format!(r"HKCU\Software\Classes\CLSID\{}", clsid);
+        let _ = std::process::Command::new("reg")
+            .args(["delete", &clsid_key, "/f"])
+            .creation_flags(0x08000000)
+            .output();
+
+        log::info!("[sync] Removed orphaned CF nav entry (CLSID {})", clsid);
+    }
+
+    /// Scan Desktop\NameSpace for entries whose default value looks like a
+    /// MediaMount sync root ID (e.g. "MediaMount!S-1-5-...!mount-id") but
+    /// whose SyncRootManager key no longer exists. These are orphans left
+    /// behind when a sync root was unregistered without cleaning up its CLSID.
+    fn remove_orphaned_cf_nav_entries() {
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace",
+                "/s",
+            ])
+            .creation_flags(0x08000000)
+            .output();
+
+        let text = match output {
+            Ok(ref o) => String::from_utf8_lossy(&o.stdout).to_string(),
+            Err(_) => return,
+        };
+
+        let provider_prefix = format!("{}!", PROVIDER_NAME);
+        let mut current_clsid: Option<String> = None;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+
+            // Registry key line — extract the CLSID
+            if trimmed.starts_with("HKEY_CURRENT_USER\\") {
+                current_clsid = trimmed.rsplit('\\').next()
+                    .filter(|s| s.starts_with('{') && s.ends_with('}'))
+                    .map(|s| s.to_string());
+                continue;
+            }
+
+            // Default value line — check if it's a MediaMount sync root ID
+            if trimmed.starts_with("(Default)") && trimmed.contains(&provider_prefix) {
+                if let Some(ref clsid) = current_clsid {
+                    // This CLSID's default value is a MediaMount sync root ID.
+                    // Check if the SyncRootManager entry still exists.
+                    let sync_id = trimmed
+                        .split("REG_SZ")
+                        .nth(1)
+                        .map(|s| s.trim())
+                        .unwrap_or("");
+
+                    if !sync_id.is_empty() {
+                        let srm_key = format!(
+                            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{}",
+                            sync_id
+                        );
+                        let check = std::process::Command::new("reg")
+                            .args(["query", &srm_key])
+                            .creation_flags(0x08000000)
+                            .output();
+
+                        let exists = check.map(|o| o.status.success()).unwrap_or(false);
+                        if !exists {
+                            log::info!(
+                                "[sync] Found orphaned CF nav entry: {} (sync root '{}')",
+                                clsid, sync_id
+                            );
+                            Self::remove_nav_entry_by_clsid(clsid);
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -47,6 +47,18 @@ impl MountService {
 
     /// Apply a config, starting new mounts and stopping removed ones.
     async fn apply_config(&mut self, config: MountsConfig) {
+        // Clean up stale Cloud Files sync root registrations and redirect active
+        // CF nav entries to point at the junction path instead of the cache path
+        #[cfg(windows)]
+        {
+            let active_sync_mounts: std::collections::HashMap<String, String> = config
+                .mounts
+                .iter()
+                .filter(|m| m.enabled && m.sync_enabled)
+                .map(|m| (m.id.clone(), m.volume_path()))
+                .collect();
+            crate::sync::SyncRoot::cleanup_stale_roots(&active_sync_mounts);
+        }
         // Detect cache root change — restart all sync mounts to re-register at new path
         let new_cache_root = config.cache_root();
         if new_cache_root != self.cache_root {

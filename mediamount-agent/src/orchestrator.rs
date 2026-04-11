@@ -484,8 +484,9 @@ impl Orchestrator {
         let client_root = self.config.sync_root_dir(&self.cache_root);
 
         let cache_limit = self.config.sync_cache_limit_bytes;
+        let volume_path = self.config.volume_path();
         let result = tokio::task::spawn_blocking(move || {
-            crate::sync::SyncRoot::start(&mid, &display_name, nas_root, client_root, cache_limit)
+            crate::sync::SyncRoot::start(&mid, &display_name, nas_root, client_root, cache_limit, &volume_path)
         })
         .await
         .unwrap_or_else(|e| Err(format!("SyncRoot::start task panicked: {}", e)));

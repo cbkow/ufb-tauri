@@ -18,6 +18,11 @@ pub fn collect_nav_pins(state: &crate::app_state::AppState) -> Vec<NavPinEntry> 
         if !m.enabled {
             continue;
         }
+        // Sync mounts get their Explorer entry from the CF API registration,
+        // redirected to point at the junction path. No nav pin needed.
+        if m.sync_enabled {
+            continue;
+        }
         // Use volume path: derive share name from NAS path (last component)
         let share_name = m.nas_share_path
             .trim_end_matches('\\')
