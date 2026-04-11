@@ -80,10 +80,25 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
     const { clearThumbnailQueue } = await import("../components/FileBrowser/ThumbnailImage");
     clearThumbnailQueue();
     try {
+      const isRefresh = path === currentPath() && !addToHistory;
       const entries = await listDirectory(path);
       setState("entries", entries);
-      setState("selection", new Set());
-      setState("lastSelectedPath", null);
+
+      if (isRefresh) {
+        // Preserve selection on same-directory refresh, but prune paths
+        // that no longer exist (e.g. deleted files)
+        const validPaths = new Set(entries.map((e) => e.path));
+        const pruned = new Set(
+          [...state.selection].filter((p) => validPaths.has(p))
+        );
+        setState("selection", pruned);
+        if (state.lastSelectedPath && !validPaths.has(state.lastSelectedPath)) {
+          setState("lastSelectedPath", null);
+        }
+      } else {
+        setState("selection", new Set());
+        setState("lastSelectedPath", null);
+      }
       setCurrentPath(path);
 
       if (addToHistory) {
