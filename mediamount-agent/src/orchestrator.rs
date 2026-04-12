@@ -30,6 +30,9 @@ pub struct Orchestrator {
     /// True if symlink creation failed due to missing privileges (Windows).
     #[cfg(windows)]
     needs_elevation: bool,
+    /// NAS file watcher for macOS sync mode.
+    #[cfg(target_os = "macos")]
+    nas_watcher: Option<crate::sync::MacosNasWatcher>,
 }
 
 impl Orchestrator {
@@ -59,6 +62,8 @@ impl Orchestrator {
             connectivity: None,
             #[cfg(windows)]
             needs_elevation: false,
+            #[cfg(target_os = "macos")]
+            nas_watcher: None,
         }
     }
 
@@ -363,6 +368,14 @@ impl Orchestrator {
                 match &smb_result {
                     Ok(volumes_path) => {
                         log::info!("[{}] Headless SMB mount at {}", self.mount_id, volumes_path);
+
+                        // Start NAS watcher for live change detection
+                        let watcher = crate::sync::MacosNasWatcher::new(
+                            std::path::PathBuf::from(volumes_path),
+                            self.config.share_name(),
+                        );
+                        watcher.start();
+                        self.nas_watcher = Some(watcher);
                     }
                     Err(e) => {
                         log::error!("[{}] Headless SMB mount failed: {}", self.mount_id, e);
@@ -464,7 +477,10 @@ impl Orchestrator {
             let mount_point = self.config.mount_path();
 
             if self.config.is_sync_mode() {
-                // Sync mode: remove symlink + unmount the headless SMB mount
+                // Sync mode: stop watcher, remove symlink, unmount headless SMB
+                if let Some(watcher) = self.nas_watcher.take() {
+                    watcher.stop();
+                }
                 let _ = dm.remove(&mount_point);
                 // Find and unmount the SMB share at /Volumes/{share_name}
                 let volumes_path = format!("/Volumes/{}", self.config.share_name());

@@ -75,6 +75,8 @@ pub enum FileOpsRequest {
     ReadFile(ReadFileReq),
     WriteFile(WriteFileReq),
     DeleteItem(DeleteItemReq),
+    RecordEnumeration(RecordEnumerationReq),
+    GetChanges(GetChangesReq),
     Ping,
 }
 
@@ -126,6 +128,23 @@ pub struct DeleteItemReq {
     pub relative_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordEnumerationReq {
+    pub request_id: String,
+    pub domain: String,
+    pub relative_path: String,
+    pub entries: Vec<DirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetChangesReq {
+    pub request_id: String,
+    pub domain: String,
+    pub since_anchor: String,
+}
+
 // ── Agent → FileProvider Extension (file operation responses) ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +155,8 @@ pub enum FileOpsResponse {
     FileReady(FileReadyResp),
     WriteOk(WriteOkResp),
     DeleteOk(DeleteOkResp),
+    RecordOk(RecordOkResp),
+    Changes(ChangesResp),
     Error(FileOpsErrorResp),
     Pong,
 }
@@ -199,6 +220,32 @@ pub struct DeleteOkResp {
 pub struct FileOpsErrorResp {
     pub request_id: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordOkResp {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangesResp {
+    pub request_id: String,
+    pub updated: Vec<ChangedEntry>,
+    pub deleted: Vec<String>,
+    pub new_anchor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedEntry {
+    pub relative_path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: f64,
+    pub created: f64,
 }
 
 #[cfg(test)]

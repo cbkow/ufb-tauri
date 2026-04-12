@@ -22,7 +22,8 @@ gtk = "0.18"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# No tray deps — macOS tray UI handled by companion Swift MenuBarExtra app
+notify = "7"  # FSEvents file watcher for NAS change detection
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.6"

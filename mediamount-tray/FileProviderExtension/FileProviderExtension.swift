@@ -16,10 +16,48 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         self.domain = domain
         super.init()
         NSLog("[FileProvider] Extension initialized for domain: \(domainId)")
+        registerForNasChangeNotifications()
+
+        // Signal working set on init to catch up with any changes since last run
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+            NSLog("[FileProvider] Initial working set signal for \(self.domainId)")
+            NSFileProviderManager(for: self.domain)?.signalEnumerator(for: .workingSet) { error in
+                if let error = error {
+                    NSLog("[FileProvider] Initial signal error: \(error)")
+                }
+            }
+        }
     }
 
     func invalidate() {
         NSLog("[FileProvider] Extension invalidated for domain: \(domainId)")
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    /// Listen for distributed notifications from the agent when NAS contents change.
+    private func registerForNasChangeNotifications() {
+        let notifName = "com.unionfiles.ufb.nas-changed.\(domainId)"
+        NSLog("[FileProvider] Registering for notifications: \(notifName)")
+
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(nasDidChange(_:)),
+            name: NSNotification.Name(notifName),
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
+    }
+
+    @objc private func nasDidChange(_ notification: Notification) {
+        NSLog("[FileProvider] NAS change notification received for \(domainId)")
+        // MUST signal .workingSet — signaling .rootContainer is silently ignored by the system
+        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { error in
+            if let error = error {
+                NSLog("[FileProvider] signalEnumerator error: \(error)")
+            } else {
+                NSLog("[FileProvider] signalEnumerator(.workingSet) succeeded for \(self.domainId)")
+            }
+        }
     }
 
     // MARK: - NSFileProviderReplicatedExtension

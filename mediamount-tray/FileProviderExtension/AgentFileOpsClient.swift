@@ -216,6 +216,68 @@ class AgentFileOpsClient {
         }
     }
 
+    /// Get changes since a given sync anchor. Agent diffs its cache DB against live NAS state.
+    func getChanges(domain: String, sinceAnchor: String) throws -> ChangesResponse {
+        let requestId = makeRequestId()
+        let request: [String: Any] = [
+            "type": "get_changes",
+            "requestId": requestId,
+            "domain": domain,
+            "sinceAnchor": sinceAnchor,
+        ]
+
+        let response = try sendAndReceive(request)
+
+        guard let type_ = response["type"] as? String else {
+            throw FileOpsError.invalidResponse("Missing type field")
+        }
+
+        if type_ == "error" {
+            let message = response["message"] as? String ?? "Unknown error"
+            throw FileOpsError.agentError(message)
+        }
+
+        guard type_ == "changes" else {
+            throw FileOpsError.invalidResponse("Expected changes response, got \(type_)")
+        }
+
+        let updated = (response["updated"] as? [[String: Any]] ?? []).compactMap { ChangedEntryResponse(json: $0) }
+        let deleted = response["deleted"] as? [String] ?? []
+        let newAnchor = response["newAnchor"] as? String ?? ""
+
+        return ChangesResponse(updated: updated, deleted: deleted, newAnchor: newAnchor)
+    }
+
+    /// Tell the agent to record an enumeration in its cache DB.
+    /// Called after enumerateItems completes so the agent knows what we've reported.
+    func recordEnumeration(domain: String, relativePath: String, entries: [DirEntryResponse]) {
+        let requestId = makeRequestId()
+        let entriesJson: [[String: Any]] = entries.map { entry in
+            [
+                "name": entry.name,
+                "isDir": entry.isDir,
+                "size": entry.size,
+                "modified": entry.modified,
+                "created": entry.created,
+            ] as [String: Any]
+        }
+
+        let request: [String: Any] = [
+            "type": "record_enumeration",
+            "requestId": requestId,
+            "domain": domain,
+            "relativePath": relativePath,
+            "entries": entriesJson,
+        ]
+
+        // Fire and forget — don't block on response
+        do {
+            let _ = try sendAndReceive(request)
+        } catch {
+            NSLog("[FileOpsClient] recordEnumeration failed: \(error)")
+        }
+    }
+
     // MARK: - Connection
 
     private func ensureConnected() throws {
@@ -421,6 +483,32 @@ struct FileStatResponse {
         self.size = size
         self.modified = modified
         self.created = created
+    }
+}
+
+struct ChangesResponse {
+    let updated: [ChangedEntryResponse]
+    let deleted: [String]
+    let newAnchor: String
+}
+
+struct ChangedEntryResponse {
+    let relativePath: String
+    let name: String
+    let isDir: Bool
+    let size: UInt64
+    let modified: Double
+    let created: Double
+
+    init?(json: [String: Any]) {
+        guard let relativePath = json["relativePath"] as? String,
+              let name = json["name"] as? String else { return nil }
+        self.relativePath = relativePath
+        self.name = name
+        self.isDir = json["isDir"] as? Bool ?? false
+        self.size = json["size"] as? UInt64 ?? 0
+        self.modified = json["modified"] as? Double ?? 0
+        self.created = json["created"] as? Double ?? 0
     }
 }
 

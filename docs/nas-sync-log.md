@@ -1794,7 +1794,147 @@ in the host app's Info.plist.
 | App icon in Finder | Done |
 | Cache persistence | Done |
 | Error handling | Done |
-| NAS watcher → signalEnumerator | Not started |
+| NAS watcher → signalEnumerator | Done |
+| SQLite cache DB (change tracking) | Done |
+| Live deep folder changes | Done |
+| Cold start catch-up | Done |
 | Rename support | Not started |
 | Cache eviction (evictItem) | Not started |
 | build-macos.sh update | Not started |
+
+---
+
+## 2026-04-12 — Live change detection + cache DB
+
+### The problem
+
+FileProvider caches enumeration results. Once the system has called `enumerateItems` for a
+folder, subsequent visits use the cache and only call `enumerateChanges`. Without a way to
+compute deltas, Finder shows stale data.
+
+### Key findings
+
+**1. `signalEnumerator` only works with `.workingSet`**
+Calling `signalEnumerator(for: .rootContainer)` is silently ignored by the system. Only
+`.workingSet` triggers the system to call `enumerateChanges`. This was the primary blocker
+for live updates. Discovered via Apple docs research — the FileProvider API requires the
+working set pattern for change propagation.
+
+**2. `enumerateChanges` for individual folders is never called by the system**
+When the user browses a folder, the system serves from its internal cache. It does NOT call
+`enumerateChanges` for that specific container. All change propagation flows through the
+working set. This means the working set `enumerateChanges` must report items from ALL
+visited folders, not just root.
+
+**3. Extension process caching during development**
+The system caches the FileProvider extension process. After rebuilding, you must kill
+`FileProviderExtension` and `fileproviderd` to force a fresh load of the new binary.
+Without this, the old code runs even after xcodebuild succeeds.
+
+### Architecture: SQLite cache + FSEvents + working set
+
+```
+FSEvents on /Volumes/{share} (recursive)
+  │
+  ├── Detects file changes at any depth
+  │
+  └── Posts DistributedNotification → Extension receives
+        │
+        └── signalEnumerator(.workingSet)
+              │
+              └── System calls enumerateChanges on working set enumerator
+                    │
+                    └── Extension calls agent IPC: getChanges(domain, anchor)
+                          │
+                          └── Agent diffs ALL visited folders:
+                              DB (known_files) vs NAS (live readdir)
+                              │
+                              └── Returns {updated: [...], deleted: [...]}
+                                    │
+                                    └── Extension reports to system
+                                          │
+                                          └── Finder updates
+```
+
+### SQLite cache DB
+
+**Location:** `~/.local/share/ufb/cache/{domain}.db`
+
+**Schema:**
+```sql
+CREATE TABLE known_files (
+    path TEXT PRIMARY KEY,       -- relative path from share root
+    name TEXT NOT NULL,
+    is_dir INTEGER NOT NULL DEFAULT 0,
+    nas_size INTEGER NOT NULL,
+    nas_mtime REAL NOT NULL,
+    nas_created REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE visited_folders (
+    path TEXT PRIMARY KEY,       -- relative path from share root
+    folder_mtime REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
+
+Simplified vs Windows: no hydration/eviction columns (FileProvider manages materialization).
+Only tracks NAS-side metadata for three-way diffing.
+
+**How it populates:**
+- `ListDir` handler records entries in `known_files` and folder in `visited_folders`
+- `WriteFile` handler updates `known_files` after successful write
+- `DeleteItem` handler removes from `known_files` after successful delete
+- Root folder is always included in change detection even if never visited
+
+**How it detects changes:**
+- `get_changes_since()` walks ALL visited folders
+- For each: readdir NAS, compare against `known_files` in DB
+- New on NAS (not in DB) → reported as update
+- Gone from NAS (in DB) → reported as deletion
+- Size/mtime changed → reported as update
+- Updates DB with current state after diffing
+
+### New IPC messages
+
+| Request | Response | Purpose |
+|---------|----------|---------|
+| `get_changes(domain, anchor)` | `{updated, deleted, new_anchor}` | Delta query for working set |
+| `record_enumeration(domain, path, entries)` | `ack` | Record enumeration in cache |
+
+### Notification mechanism
+
+Using `DistributedNotificationCenter` (not Darwin notifications via `notify_post`).
+Darwin notifications require a CFRunLoop which the extension's XPC service queue may not have.
+DistributedNotificationCenter works across processes without run loop requirements.
+
+Agent posts: `CFNotificationCenterPostNotification` via raw FFI to the distributed center.
+Extension listens: `DistributedNotificationCenter.default().addObserver(...)`.
+Notification name: `com.unionfiles.ufb.nas-changed.{domain}`.
+
+### FSEvents behavior on SMB
+
+- Recursive watching works for live changes (tested with deep folder creation)
+- Does NOT detect changes that happened before the watch started (cold start gap)
+- Poll fallback (5-second interval, root only) catches changes FSEvents might miss
+- FSEvents fires reliably for most operations; poll is a safety net
+
+### Development workflow
+
+After rebuilding the extension, you must force-reload it:
+```
+killall FileProviderExtension; killall fileproviderd
+```
+Then relaunch the tray app. The system will load the fresh binary.
+
+### Remaining work
+
+- Rename support (modifyItem for renames, not just content changes)
+- Cache eviction via `NSFileProviderManager.evictItem()`
+- `build-macos.sh` update for xcodebuild
+- mtime optimization for `get_changes_since` (skip unchanged folders — currently diffs all)
+- Echo suppression (own writes triggering spurious change notifications)

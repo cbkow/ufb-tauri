@@ -24,3 +24,12 @@ pub mod connectivity;
 pub use sync_root::SyncRoot;
 #[cfg(windows)]
 pub use connectivity::{NasConnectivity, NasStatus};
+
+#[cfg(target_os = "macos")]
+pub mod macos_watcher;
+#[cfg(target_os = "macos")]
+pub mod macos_cache;
+#[cfg(target_os = "macos")]
+pub use macos_watcher::MacosNasWatcher;
+#[cfg(target_os = "macos")]
+pub use macos_cache::MacosCache;
