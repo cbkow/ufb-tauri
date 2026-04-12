@@ -2146,3 +2146,22 @@ User can drag mount folders to sidebar Favorites as a one-time setup.
 
 `RenameItem` IPC message + handler. Extension's `modifyItem` checks `changedFields.contains(.filename)`
 and calls `renameItem` instead of `writeFile`. Agent does `fs::rename` on NAS, updates cache DB.
+
+---
+
+## Future cleanup — rclone/WinFSP legacy (noted 2026-04-12)
+
+Dropped rclone + WinFSP entirely when sync moved to CF API / FileProvider, but a few
+dead references remain. Not urgent — safe to defer.
+
+- `mediamount-agent/src/config.rs`: `rclone_drive_letter`, `rclone_mount_path`,
+  `rclone_remote`, `max_rclone_start_attempts`, `extra_rclone_flags` fields are marked
+  `Legacy: rclone (no longer used, silently ignored)` and preserved for deserializing
+  old config files. Mirror fields exist in `src-tauri/src/mount_client.rs`. Can be
+  removed once we're confident no user configs in the wild still carry them (or add
+  a one-shot migration step).
+- `src-tauri/target/release/rclone.exe`: stale build artifact. Not referenced by the
+  Inno Setup installer (`installer/ufb_tauri_installer.iss`), so it doesn't ship.
+  Will disappear on next `cargo clean`.
+- `LICENSES/WinFSP-LICENSE.txt` and the corresponding `THIRD_PARTY_NOTICES.txt` entry
+  were removed in this session.
