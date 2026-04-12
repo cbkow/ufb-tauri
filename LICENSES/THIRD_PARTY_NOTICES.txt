@@ -40,11 +40,31 @@ individual LICENSE files in this directory.
    License: BSD-3-Clause
    File: OpenEXR-LICENSE.txt
 
-8. WinFSP - Windows File System Proxy
-   Copyright (c) 2015-2025 Bill Zissimopoulos
-   License: GPLv3 (runtime dependency, not bundled)
-   File: WinFSP-LICENSE.txt
-   https://github.com/winfsp/winfsp
+8. PDFium
+   Copyright 2014 The PDFium Authors
+   License: BSD-3-Clause (with Apache-2.0 portions)
+   File: Pdfium-LICENSE.txt
+   Shipped as pdfium.dll (Windows) / libpdfium (macOS)
+   https://pdfium.googlesource.com/pdfium/
+
+9. cloud-filter (Rust crate - Windows Cloud Files API wrapper)
+   Copyright (c) 2022 ok-nick
+   License: MIT
+   https://github.com/ho-229/cloud-filter-rs
+
+10. notify (Rust crate - cross-platform filesystem watcher, used for FSEvents on macOS)
+    License: CC0-1.0
+    https://github.com/notify-rs/notify
+
+11. rusqlite (Rust crate - SQLite bindings, used for sync cache index)
+    Copyright (c) The rusqlite developers
+    License: MIT
+    https://github.com/rusqlite/rusqlite
+
+12. pdfium-render (Rust crate - high-level wrapper around PDFium)
+    Copyright (c) Alastair Carey
+    License: MIT OR Apache-2.0
+    https://github.com/ajrcarey/pdfium-render
 
 ===============================================================================
 
