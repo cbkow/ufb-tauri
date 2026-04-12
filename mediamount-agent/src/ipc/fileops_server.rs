@@ -177,15 +177,18 @@ fn resolve_path(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
         .find(|m| m.share_name() == domain && m.enabled)
         .ok_or_else(|| format!("No enabled mount found for domain '{}'", domain))?;
 
-    let base = if mount.is_sync_mode() {
+    // macOS: all mounts go through FileProvider, resolve to /Volumes/{share} directly
+    // (not through the symlink which points to CloudStorage — circular)
+    #[cfg(target_os = "macos")]
+    let base = {
         let volumes_path = PathBuf::from("/Volumes").join(&mount.share_name());
         if !volumes_path.exists() {
             return Err(format!("SMB mount not found at {}", volumes_path.display()));
         }
         volumes_path
-    } else {
-        PathBuf::from(mount.mount_path())
     };
+    #[cfg(not(target_os = "macos"))]
+    let base = PathBuf::from(mount.mount_path());
 
     let base_canonical = base
         .canonicalize()
@@ -217,11 +220,10 @@ fn resolve_path_for_write(domain: &str, relative_path: &str) -> Result<PathBuf, 
             let mount = config.mounts.iter()
                 .find(|m| m.share_name() == domain && m.enabled)
                 .ok_or_else(|| format!("No mount for domain '{}'", domain))?;
-            let base = if mount.is_sync_mode() {
-                PathBuf::from("/Volumes").join(&mount.share_name())
-            } else {
-                PathBuf::from(mount.mount_path())
-            };
+            #[cfg(target_os = "macos")]
+            let base = PathBuf::from("/Volumes").join(&mount.share_name());
+            #[cfg(not(target_os = "macos"))]
+            let base = PathBuf::from(mount.mount_path());
             Ok(base.join(relative_path))
         }
     }
@@ -589,9 +591,45 @@ fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsRespons
             new_anchor: format!("{}", result.new_anchor),
         })
     } else {
+        // Passthrough mount (no cache DB) — do a fresh readdir of root
+        // and return everything as "updated". The system diffs against its cache.
+        let config = config::load_config();
+        let mount = config.mounts.iter()
+            .find(|m| m.share_name() == req.domain && m.enabled);
+
+        let updated = if let Some(mount) = mount {
+            let nas_root = PathBuf::from("/Volumes").join(&mount.share_name());
+            std::fs::read_dir(&nas_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') || name.starts_with('@') || name.starts_with('#') {
+                        return None;
+                    }
+                    let meta = entry.metadata().ok()?;
+                    Some(ChangedEntry {
+                        relative_path: name.clone(),
+                        name,
+                        is_dir: meta.is_dir(),
+                        size: meta.len(),
+                        modified: meta.modified().ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                        created: meta.created().ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
         FileOpsResponse::Changes(ChangesResp {
             request_id: req.request_id,
-            updated: vec![],
+            updated,
             deleted: vec![],
             new_anchor: format!("{}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
