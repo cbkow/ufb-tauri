@@ -1991,3 +1991,38 @@ updates through the normal app install flow.
 | Echo suppression | Deferred (harmless) |
 | Cache eviction (evictItem) | Not needed (FileProvider manages) |
 | mtime optimization | Deferred (optimize later for large shares) |
+
+---
+
+## 2026-04-12 — Architecture decisions: FileProvider scope + Finder sidebar
+
+### FileProvider for sync mounts only (not all mounts)
+
+Explored making ALL mounts use FileProvider for unified Finder sidebar integration. Rejected
+because FileProvider materializes files locally on access — every opened file gets cached on
+disk. For sync mounts this is the point (NVMe speeds). For regular mounts (file copying
+between departments) it would hoard files and waste disk space.
+
+**Decision:** Keep the split:
+- **Sync mounts** (`syncEnabled: true`): FileProvider + cache DB + FSEvents + sidebar under "UFB"
+- **Regular mounts**: direct SMB + symlink at `/opt/ufb/mounts/` + appears under Finder Locations
+
+### Finder sidebar favorites — no programmatic API
+
+Researched adding regular SMB mounts to Finder sidebar programmatically:
+- `LSSharedFileList` API: deprecated macOS 10.11, crashes on Tahoe (SIGSEGV)
+- `sfltool`: can list sidebar items but not add them
+- AppleScript: Finder has no sidebar scripting dictionary
+- Direct plist manipulation: protected by `sharedfilelistd` daemon
+- LucidLink (macFUSE-based): also relies on manual user drag to Favorites
+
+**No supported public API exists on modern macOS.** Same situation as LucidLink, Dropbox
+(non-FileProvider), and every other third-party app.
+
+**Solution:** "Show Mounts in Finder" button in tray menu opens `/opt/ufb/mounts/` in Finder.
+User can drag mount folders to sidebar Favorites as a one-time setup.
+
+### Rename support added
+
+`RenameItem` IPC message + handler. Extension's `modifyItem` checks `changedFields.contains(.filename)`
+and calls `renameItem` instead of `writeFile`. Agent does `fs::rename` on NAS, updates cache DB.
