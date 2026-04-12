@@ -161,6 +161,7 @@ fn handle_request(req: FileOpsRequest, state: &ServerState) -> FileOpsResponse {
         FileOpsRequest::ReadFile(r) => handle_read_file(r),
         FileOpsRequest::WriteFile(r) => handle_write_file(r, state),
         FileOpsRequest::DeleteItem(r) => handle_delete_item(r, state),
+        FileOpsRequest::RenameItem(r) => handle_rename_item(r, state),
         FileOpsRequest::RecordEnumeration(r) => handle_record_enumeration(r, state),
         FileOpsRequest::GetChanges(r) => handle_get_changes(r, state),
     }
@@ -486,6 +487,72 @@ fn handle_delete_item(req: DeleteItemReq, state: &ServerState) -> FileOpsRespons
 
     FileOpsResponse::DeleteOk(DeleteOkResp {
         request_id: req.request_id,
+    })
+}
+
+fn handle_rename_item(req: RenameItemReq, state: &ServerState) -> FileOpsResponse {
+    let old_path = match resolve_path(&req.domain, &req.old_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return FileOpsResponse::Error(FileOpsErrorResp {
+                request_id: req.request_id,
+                message: e,
+            });
+        }
+    };
+
+    let new_path = match resolve_path_for_write(&req.domain, &req.new_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return FileOpsResponse::Error(FileOpsErrorResp {
+                request_id: req.request_id,
+                message: e,
+            });
+        }
+    };
+
+    log::info!("[FileOps] Rename: {} → {}", old_path.display(), new_path.display());
+
+    if let Err(e) = std::fs::rename(&old_path, &new_path) {
+        return FileOpsResponse::Error(FileOpsErrorResp {
+            request_id: req.request_id,
+            message: format!("Rename failed: {}", e),
+        });
+    }
+
+    // Update cache
+    if let Some(cache) = state.caches.get(&req.domain) {
+        cache.remove_known_file(&req.old_path);
+        let meta = std::fs::metadata(&new_path).ok();
+        let name = new_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        cache.record_known_file(&req.new_path, &DirEntry {
+            name,
+            is_dir,
+            size,
+            modified,
+            created: modified,
+        });
+    }
+
+    let meta = std::fs::metadata(&new_path).ok();
+    FileOpsResponse::RenameOk(RenameOkResp {
+        request_id: req.request_id,
+        new_path: req.new_path,
+        size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+        modified: meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
     })
 }
 

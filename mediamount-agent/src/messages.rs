@@ -75,6 +75,7 @@ pub enum FileOpsRequest {
     ReadFile(ReadFileReq),
     WriteFile(WriteFileReq),
     DeleteItem(DeleteItemReq),
+    RenameItem(RenameItemReq),
     RecordEnumeration(RecordEnumerationReq),
     GetChanges(GetChangesReq),
     Ping,
@@ -130,6 +131,15 @@ pub struct DeleteItemReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenameItemReq {
+    pub request_id: String,
+    pub domain: String,
+    pub old_path: String,
+    pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordEnumerationReq {
     pub request_id: String,
     pub domain: String,
@@ -155,6 +165,7 @@ pub enum FileOpsResponse {
     FileReady(FileReadyResp),
     WriteOk(WriteOkResp),
     DeleteOk(DeleteOkResp),
+    RenameOk(RenameOkResp),
     RecordOk(RecordOkResp),
     Changes(ChangesResp),
     Error(FileOpsErrorResp),
@@ -220,6 +231,15 @@ pub struct DeleteOkResp {
 pub struct FileOpsErrorResp {
     pub request_id: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameOkResp {
+    pub request_id: String,
+    pub new_path: String,
+    pub size: u64,
+    pub modified: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

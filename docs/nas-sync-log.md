@@ -1931,10 +1931,63 @@ killall FileProviderExtension; killall fileproviderd
 ```
 Then relaunch the tray app. The system will load the fresh binary.
 
-### Remaining work
+---
 
-- Rename support (modifyItem for renames, not just content changes)
-- Cache eviction via `NSFileProviderManager.evictItem()`
-- `build-macos.sh` update for xcodebuild
-- mtime optimization for `get_changes_since` (skip unchanged folders — currently diffs all)
-- Echo suppression (own writes triggering spurious change notifications)
+## 2026-04-12 — Rename support + build script update
+
+### Rename support — implemented
+
+New `RenameItem` IPC message: extension sends old path + new path, agent does `fs::rename`
+on the NAS, updates cache DB (removes old entry, adds new). `modifyItem` in the extension
+checks `changedFields.contains(.filename)` and calls `renameItem` instead of `writeFile`.
+
+The renamed item gets a new `NSFileProviderItemIdentifier` (based on the new relative path).
+The system handles updating its internal state when the extension returns the new item from
+`modifyItem`.
+
+### build-macos.sh updated
+
+Step 4 replaced: old `swiftc` single-file build → `xcodegen generate` + `xcodebuild`.
+The built `UFB.app` includes the embedded `FileProviderExtension.appex` in `Contents/PlugIns/`.
+Signing order: extension first (inner), then tray app (outer), then main UFB app.
+
+### Echo suppression — deferred
+
+Own writes trigger FSEvents → spurious re-enumeration. Not breaking: the extra `getChanges`
+call diffs the folder and finds no real changes (the DB already has the new entry). The 500ms
+FSEvents debounce coalesces rapid events. Will add suppression later if bulk operations
+(e.g., dragging 500 files) cause performance issues.
+
+### Dev workflow: auto-reload extension
+
+The system caches the FileProvider extension binary. In debug builds, the tray app now
+kills `fileproviderd` on launch (`#if DEBUG` guard), forcing the system to reload the
+fresh extension. No more manual `killall FileProviderExtension; killall fileproviderd`
+after each rebuild. In production/release builds this is skipped — macOS handles binary
+updates through the normal app install flow.
+
+### Current status — macOS FileProvider Phase 1 complete
+
+| Feature | Status |
+|---|---|
+| Domain registration | Done |
+| Browse (enumerateItems) | Done |
+| Open files (fetchContents) | Done |
+| Create files/folders | Done |
+| Modify files | Done |
+| Delete (trash) | Done |
+| Rename | Done |
+| Multi-domain | Done |
+| Headless SMB mount | Done |
+| Agent auto-launch | Done |
+| App icon in Finder | Done |
+| Cache persistence | Done |
+| Error handling | Done |
+| Live change detection (FSEvents) | Done |
+| SQLite cache DB | Done |
+| Cold start catch-up | Done |
+| Working set change propagation | Done |
+| build-macos.sh | Done |
+| Echo suppression | Deferred (harmless) |
+| Cache eviction (evictItem) | Not needed (FileProvider manages) |
+| mtime optimization | Deferred (optimize later for large shares) |

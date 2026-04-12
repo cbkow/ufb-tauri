@@ -216,6 +216,37 @@ class AgentFileOpsClient {
         }
     }
 
+    /// Rename a file or directory on the NAS.
+    func renameItem(domain: String, oldPath: String, newPath: String) throws -> (size: UInt64, modified: Double) {
+        let requestId = makeRequestId()
+        let request: [String: Any] = [
+            "type": "rename_item",
+            "requestId": requestId,
+            "domain": domain,
+            "oldPath": oldPath,
+            "newPath": newPath,
+        ]
+
+        let response = try sendAndReceive(request)
+
+        guard let type_ = response["type"] as? String else {
+            throw FileOpsError.invalidResponse("Missing type field")
+        }
+
+        if type_ == "error" {
+            let message = response["message"] as? String ?? "Unknown error"
+            throw FileOpsError.agentError(message)
+        }
+
+        guard type_ == "rename_ok" else {
+            throw FileOpsError.invalidResponse("Expected rename_ok response")
+        }
+
+        let size = response["size"] as? UInt64 ?? 0
+        let modified = response["modified"] as? Double ?? 0
+        return (size, modified)
+    }
+
     /// Get changes since a given sync anchor. Agent diffs its cache DB against live NAS state.
     func getChanges(domain: String, sinceAnchor: String) throws -> ChangesResponse {
         let requestId = makeRequestId()

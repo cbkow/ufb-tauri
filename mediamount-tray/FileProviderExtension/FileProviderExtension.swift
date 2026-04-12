@@ -222,19 +222,52 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        let relativePath = item.itemIdentifier.rawValue
-        NSLog("[FileProvider] modifyItem: \(relativePath) fields=\(changedFields)")
+        let oldRelativePath = item.itemIdentifier.rawValue
+        NSLog("[FileProvider] modifyItem: \(oldRelativePath) fields=\(changedFields)")
 
-        // If there are new contents, upload them
-        if let contentsURL = newContents {
-            do {
+        do {
+            // Check for rename
+            if changedFields.contains(.filename) {
+                let newFilename = item.filename
+                let parentPath = (oldRelativePath as NSString).deletingLastPathComponent
+                let newRelativePath = parentPath.isEmpty ? newFilename : parentPath + "/" + newFilename
+                let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
+                    ? .rootContainer
+                    : NSFileProviderItemIdentifier(rawValue: parentPath)
+
+                NSLog("[FileProvider] Rename: \(oldRelativePath) → \(newRelativePath)")
+
+                let (size, modified) = try AgentFileOpsClient.shared.renameItem(
+                    domain: domainId,
+                    oldPath: oldRelativePath,
+                    newPath: newRelativePath
+                )
+
+                let isDir = item.contentType == .folder
+                let renamedItem = FileProviderItem(
+                    identifier: NSFileProviderItemIdentifier(rawValue: newRelativePath),
+                    parentIdentifier: parentId,
+                    filename: newFilename,
+                    isDirectory: isDir,
+                    size: Int64(size),
+                    modified: Date(timeIntervalSince1970: modified),
+                    created: item.creationDate ?? nil,
+                    smbPath: ""
+                )
+
+                completionHandler(renamedItem, [], false, nil)
+                return Progress()
+            }
+
+            // Content change
+            if let contentsURL = newContents {
                 let (size, modified) = try AgentFileOpsClient.shared.writeFile(
                     domain: domainId,
-                    relativePath: relativePath,
+                    relativePath: oldRelativePath,
                     sourceURL: contentsURL
                 )
 
-                let parentPath = (relativePath as NSString).deletingLastPathComponent
+                let parentPath = (oldRelativePath as NSString).deletingLastPathComponent
                 let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
                     ? .rootContainer
                     : NSFileProviderItemIdentifier(rawValue: parentPath)
@@ -251,13 +284,13 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 )
 
                 completionHandler(updatedItem, [], false, nil)
-            } catch {
-                NSLog("[FileProvider] ERROR modifyItem \(relativePath): \(error.localizedDescription)")
-                completionHandler(nil, [], false, (error as? FileOpsError)?.asNSError ?? (error as NSError))
+            } else {
+                // No content change, no rename — just acknowledge
+                completionHandler(item, [], false, nil)
             }
-        } else {
-            // Metadata-only change (rename, etc.) — not yet supported
-            completionHandler(item, [], false, nil)
+        } catch {
+            NSLog("[FileProvider] ERROR modifyItem \(oldRelativePath): \(error.localizedDescription)")
+            completionHandler(nil, [], false, (error as? FileOpsError)?.asNSError ?? (error as NSError))
         }
 
         return Progress()
