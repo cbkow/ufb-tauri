@@ -1,31 +1,25 @@
 import FileProvider
 import UniformTypeIdentifiers
 
-/// Minimal NSFileProviderReplicatedExtension for the Phase 0 spike.
-///
-/// Architecture: The extension reads NAS files directly via the SMB mount at /Volumes/.
-/// The agent mounts the SMB share headlessly, and this extension accesses the files
-/// through the standard filesystem — same pattern as Windows CF API using std::fs on UNC paths.
-///
-/// If the sandbox blocks /Volumes/ access, we'll fall back to IPC-based file operations.
+/// NSFileProviderReplicatedExtension that proxies all file operations through
+/// IPC to the mediamount-agent. The agent has /Volumes/ access; the extension
+/// is sandboxed and cannot read SMB mounts directly.
 class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     let domain: NSFileProviderDomain
 
-    /// The NAS mount path. Domain identifier is the share_name (e.g., "test1"),
-    /// and the SMB mount lives at /Volumes/{share_name}.
-    private var nasBasePath: String {
-        return "/Volumes/\(domain.identifier.rawValue)"
+    /// The domain identifier is the share_name (e.g., "test1").
+    private var domainId: String {
+        return domain.identifier.rawValue
     }
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
         super.init()
-        NSLog("[FileProvider] Extension initialized for domain: \(domain.identifier.rawValue)")
-        NSLog("[FileProvider] NAS base path: \(nasBasePath)")
+        NSLog("[FileProvider] Extension initialized for domain: \(domainId)")
     }
 
     func invalidate() {
-        NSLog("[FileProvider] Extension invalidated for domain: \(domain.identifier.rawValue)")
+        NSLog("[FileProvider] Extension invalidated for domain: \(domainId)")
     }
 
     // MARK: - NSFileProviderReplicatedExtension
@@ -38,40 +32,35 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         NSLog("[FileProvider] item(for: \(identifier.rawValue))")
 
         if identifier == .rootContainer {
-            completionHandler(FileProviderItem.rootContainer(displayName: domain.displayName, smbPath: nasBasePath), nil)
+            completionHandler(
+                FileProviderItem.rootContainer(displayName: domain.displayName, smbPath: ""),
+                nil
+            )
             return Progress()
         }
 
-        // Item identifier is the relative path from NAS root
-        let fullPath = nasBasePath + "/" + identifier.rawValue
+        let relativePath = identifier.rawValue
+        let name = (relativePath as NSString).lastPathComponent
+        let parentPath = (relativePath as NSString).deletingLastPathComponent
+        let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
+            ? .rootContainer
+            : NSFileProviderItemIdentifier(rawValue: parentPath)
 
-        let fm = FileManager.default
         do {
-            let attrs = try fm.attributesOfItem(atPath: fullPath)
-            let name = (identifier.rawValue as NSString).lastPathComponent
-            let parentPath = (identifier.rawValue as NSString).deletingLastPathComponent
-            let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
-                ? .rootContainer
-                : NSFileProviderItemIdentifier(rawValue: parentPath)
-
-            let isDir = (attrs[.type] as? FileAttributeType) == .typeDirectory
-            let size = attrs[.size] as? Int64
-            let modified = attrs[.modificationDate] as? Date
-            let created = attrs[.creationDate] as? Date
-
+            let stat = try AgentFileOpsClient.shared.stat(domain: domainId, relativePath: relativePath)
             let item = FileProviderItem(
                 identifier: identifier,
                 parentIdentifier: parentId,
                 filename: name,
-                isDirectory: isDir,
-                size: size,
-                modified: modified,
-                created: created,
-                smbPath: fullPath
+                isDirectory: stat.isDir,
+                size: Int64(stat.size),
+                modified: Date(timeIntervalSince1970: stat.modified),
+                created: Date(timeIntervalSince1970: stat.created),
+                smbPath: ""
             )
             completionHandler(item, nil)
         } catch {
-            NSLog("[FileProvider] ERROR item lookup \(fullPath): \(error)")
+            NSLog("[FileProvider] ERROR stat \(relativePath): \(error.localizedDescription)")
             completionHandler(nil, NSFileProviderError(.noSuchItem))
         }
 
@@ -85,72 +74,56 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         NSLog("[FileProvider] enumerator(for: \(containerItemIdentifier.rawValue))")
         return FileProviderEnumerator(
             enumeratedItemIdentifier: containerItemIdentifier,
-            nasBasePath: nasBasePath
+            domainId: domainId
         )
     }
 
-    /// Called when a user opens/accesses a file. This is the SANDBOX TEST.
-    /// If this succeeds, direct /Volumes/ access works from the extension sandbox.
+    /// Called when a user opens/accesses a file.
+    /// Agent copies the file to a temp path in the app group container.
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion?,
         request: NSFileProviderRequest,
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
-        NSLog("[FileProvider] fetchContents(for: \(itemIdentifier.rawValue))")
-
-        let sourcePath = nasBasePath + "/" + itemIdentifier.rawValue
-        NSLog("[FileProvider] Reading from SMB: \(sourcePath)")
-
-        // Copy file from NAS mount to a temporary location that FileProvider can serve
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("FileProvider-\(domain.identifier.rawValue)", isDirectory: true)
+        let relativePath = itemIdentifier.rawValue
+        NSLog("[FileProvider] fetchContents(for: \(relativePath))")
 
         do {
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        } catch {
-            NSLog("[FileProvider] ERROR creating temp dir: \(error)")
-            completionHandler(nil, nil, error)
-            return Progress()
-        }
-
-        let filename = (itemIdentifier.rawValue as NSString).lastPathComponent
-        let tempFile = tempDir.appendingPathComponent(filename)
-
-        // Remove old temp copy if exists
-        try? FileManager.default.removeItem(at: tempFile)
-
-        do {
-            // THIS IS THE SANDBOX TEST — can we read from /Volumes/?
-            try FileManager.default.copyItem(
-                atPath: sourcePath,
-                toPath: tempFile.path
+            let (tempURL, stat) = try AgentFileOpsClient.shared.readFile(
+                domain: domainId,
+                relativePath: relativePath
             )
-            NSLog("[FileProvider] SUCCESS: Copied \(sourcePath) → \(tempFile.path)")
 
-            // Return the item metadata alongside the file URL
-            let attrs = try FileManager.default.attributesOfItem(atPath: sourcePath)
+            NSLog("[FileProvider] File ready at \(tempURL.path) (\(stat.size) bytes)")
+
+            let name = (relativePath as NSString).lastPathComponent
+            let parentPath = (relativePath as NSString).deletingLastPathComponent
+            let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
+                ? .rootContainer
+                : NSFileProviderItemIdentifier(rawValue: parentPath)
+
             let item = FileProviderItem(
                 identifier: itemIdentifier,
-                parentIdentifier: .rootContainer, // simplified for spike
-                filename: filename,
+                parentIdentifier: parentId,
+                filename: name,
                 isDirectory: false,
-                size: attrs[.size] as? Int64,
-                modified: attrs[.modificationDate] as? Date,
-                created: attrs[.creationDate] as? Date,
-                smbPath: sourcePath
+                size: Int64(stat.size),
+                modified: Date(timeIntervalSince1970: stat.modified),
+                created: Date(timeIntervalSince1970: stat.created),
+                smbPath: ""
             )
 
-            completionHandler(tempFile, item, nil)
+            completionHandler(tempURL, item, nil)
         } catch {
-            NSLog("[FileProvider] SANDBOX TEST FAILED or file error: \(error)")
-            completionHandler(nil, nil, error)
+            NSLog("[FileProvider] ERROR fetchContents \(relativePath): \(error.localizedDescription)")
+            completionHandler(nil, nil, (error as? FileOpsError)?.asNSError ?? (error as NSError))
         }
 
         return Progress()
     }
 
-    // MARK: - Stub methods (not implemented in spike)
+    // MARK: - Write operations
 
     func createItem(
         basedOn itemTemplate: NSFileProviderItem,
@@ -160,8 +133,45 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        NSLog("[FileProvider] createItem — NOT IMPLEMENTED (spike)")
-        completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        let filename = itemTemplate.filename
+        let parentId = itemTemplate.parentItemIdentifier
+        let isDir = itemTemplate.contentType == .folder
+
+        // Build the relative path for the new item
+        let relativePath: String
+        if parentId == .rootContainer {
+            relativePath = filename
+        } else {
+            relativePath = parentId.rawValue + "/" + filename
+        }
+
+        NSLog("[FileProvider] createItem: \(relativePath) isDir=\(isDir)")
+
+        do {
+            let (size, modified) = try AgentFileOpsClient.shared.writeFile(
+                domain: domainId,
+                relativePath: relativePath,
+                sourceURL: url,
+                isDir: isDir
+            )
+
+            let item = FileProviderItem(
+                identifier: NSFileProviderItemIdentifier(rawValue: relativePath),
+                parentIdentifier: parentId,
+                filename: filename,
+                isDirectory: isDir,
+                size: Int64(size),
+                modified: Date(timeIntervalSince1970: modified),
+                created: Date(timeIntervalSince1970: modified),
+                smbPath: ""
+            )
+
+            completionHandler(item, [], false, nil)
+        } catch {
+            NSLog("[FileProvider] ERROR createItem \(relativePath): \(error.localizedDescription)")
+            completionHandler(nil, [], false, (error as? FileOpsError)?.asNSError ?? (error as NSError))
+        }
+
         return Progress()
     }
 
@@ -174,8 +184,44 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        NSLog("[FileProvider] modifyItem — NOT IMPLEMENTED (spike)")
-        completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        let relativePath = item.itemIdentifier.rawValue
+        NSLog("[FileProvider] modifyItem: \(relativePath) fields=\(changedFields)")
+
+        // If there are new contents, upload them
+        if let contentsURL = newContents {
+            do {
+                let (size, modified) = try AgentFileOpsClient.shared.writeFile(
+                    domain: domainId,
+                    relativePath: relativePath,
+                    sourceURL: contentsURL
+                )
+
+                let parentPath = (relativePath as NSString).deletingLastPathComponent
+                let parentId: NSFileProviderItemIdentifier = parentPath.isEmpty
+                    ? .rootContainer
+                    : NSFileProviderItemIdentifier(rawValue: parentPath)
+
+                let updatedItem = FileProviderItem(
+                    identifier: item.itemIdentifier,
+                    parentIdentifier: parentId,
+                    filename: item.filename,
+                    isDirectory: false,
+                    size: Int64(size),
+                    modified: Date(timeIntervalSince1970: modified),
+                    created: item.creationDate ?? nil,
+                    smbPath: ""
+                )
+
+                completionHandler(updatedItem, [], false, nil)
+            } catch {
+                NSLog("[FileProvider] ERROR modifyItem \(relativePath): \(error.localizedDescription)")
+                completionHandler(nil, [], false, (error as? FileOpsError)?.asNSError ?? (error as NSError))
+            }
+        } else {
+            // Metadata-only change (rename, etc.) — not yet supported
+            completionHandler(item, [], false, nil)
+        }
+
         return Progress()
     }
 
@@ -186,8 +232,17 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
-        NSLog("[FileProvider] deleteItem — NOT IMPLEMENTED (spike)")
-        completionHandler(NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError))
+        let relativePath = identifier.rawValue
+        NSLog("[FileProvider] deleteItem: \(relativePath)")
+
+        do {
+            try AgentFileOpsClient.shared.deleteItem(domain: domainId, relativePath: relativePath)
+            completionHandler(nil)
+        } catch {
+            NSLog("[FileProvider] ERROR deleteItem \(relativePath): \(error.localizedDescription)")
+            completionHandler((error as? FileOpsError)?.asNSError ?? (error as NSError))
+        }
+
         return Progress()
     }
 }

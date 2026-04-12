@@ -65,6 +65,142 @@ pub struct MountIdMsg {
     pub command_id: String,
 }
 
+// ── FileProvider Extension → Agent (file operations) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileOpsRequest {
+    ListDir(ListDirReq),
+    Stat(StatReq),
+    ReadFile(ReadFileReq),
+    WriteFile(WriteFileReq),
+    DeleteItem(DeleteItemReq),
+    Ping,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirReq {
+    pub request_id: String,
+    /// The FileProvider domain / share name (e.g., "test1")
+    pub domain: String,
+    /// Path relative to the share root (e.g., "project/assets"). Empty string = root.
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatReq {
+    pub request_id: String,
+    pub domain: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadFileReq {
+    pub request_id: String,
+    pub domain: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteFileReq {
+    pub request_id: String,
+    pub domain: String,
+    /// Destination path relative to share root (e.g., "project/new_file.txt")
+    pub relative_path: String,
+    /// Path to the source file in the app group container (written by the extension)
+    pub source_path: String,
+    /// True if this is a directory creation (no source file)
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteItemReq {
+    pub request_id: String,
+    pub domain: String,
+    pub relative_path: String,
+}
+
+// ── Agent → FileProvider Extension (file operation responses) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileOpsResponse {
+    DirListing(DirListingResp),
+    FileStat(FileStatResp),
+    FileReady(FileReadyResp),
+    WriteOk(WriteOkResp),
+    DeleteOk(DeleteOkResp),
+    Error(FileOpsErrorResp),
+    Pong,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirListingResp {
+    pub request_id: String,
+    pub entries: Vec<DirEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Seconds since Unix epoch
+    pub modified: f64,
+    /// Seconds since Unix epoch
+    pub created: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStatResp {
+    pub request_id: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: f64,
+    pub created: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReadyResp {
+    pub request_id: String,
+    /// Path to the temp file in the app group container
+    pub temp_path: String,
+    pub size: u64,
+    pub modified: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteOkResp {
+    pub request_id: String,
+    pub size: u64,
+    pub modified: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteOkResp {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOpsErrorResp {
+    pub request_id: String,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

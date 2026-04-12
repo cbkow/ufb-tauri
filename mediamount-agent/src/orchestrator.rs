@@ -353,7 +353,27 @@ impl Orchestrator {
         #[cfg(target_os = "macos")]
         {
             if self.config.is_sync_mode() {
-                // Sync mode: symlink from stable path to FileProvider domain
+                // Sync mode: mount SMB headlessly (so the fileops server can read /Volumes/),
+                // then create symlink from stable path to FileProvider domain
+                let smb_result = crate::platform::macos::macos_smb_mount(
+                    &self.config.nas_share_path,
+                    &username,
+                    &password,
+                );
+                match &smb_result {
+                    Ok(volumes_path) => {
+                        log::info!("[{}] Headless SMB mount at {}", self.mount_id, volumes_path);
+                    }
+                    Err(e) => {
+                        log::error!("[{}] Headless SMB mount failed: {}", self.mount_id, e);
+                        let _ = self
+                            .event_tx
+                            .send(MountEvent::MountFailed { reason: e.clone() })
+                            .await;
+                        return;
+                    }
+                }
+
                 use crate::platform::DriveMapping;
                 let dm = crate::platform::macos::MacosMountMapping::new();
                 let mount_point = self.config.mount_path();
@@ -366,7 +386,6 @@ impl Orchestrator {
                         .send(MountEvent::MountFailed { reason: e })
                         .await;
                 }
-                // TODO: FileProvider domain registration (requires Swift extension)
                 return;
             }
 
@@ -445,8 +464,15 @@ impl Orchestrator {
             let mount_point = self.config.mount_path();
 
             if self.config.is_sync_mode() {
-                // Sync mode: just remove the symlink; FileProvider manages its own domain
+                // Sync mode: remove symlink + unmount the headless SMB mount
                 let _ = dm.remove(&mount_point);
+                // Find and unmount the SMB share at /Volumes/{share_name}
+                let volumes_path = format!("/Volumes/{}", self.config.share_name());
+                if std::path::Path::new(&volumes_path).exists() {
+                    if let Err(e) = crate::platform::macos::macos_smb_unmount(&volumes_path) {
+                        log::warn!("[{}] Headless SMB unmount failed (non-fatal): {}", self.mount_id, e);
+                    }
+                }
             } else {
                 // SMB mode: read target, remove symlink, unmount
                 if let Ok(volumes_path) = dm.read_target(&mount_point) {

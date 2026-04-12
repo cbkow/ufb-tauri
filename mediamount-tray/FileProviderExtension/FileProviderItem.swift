@@ -34,11 +34,12 @@ class FileProviderItem: NSObject, NSFileProviderItem {
 
         if isDirectory {
             self.contentType = .folder
-            self.capabilities = [.allowsReading, .allowsContentEnumerating]
+            self.capabilities = [.allowsReading, .allowsWriting, .allowsDeleting,
+                                 .allowsRenaming, .allowsAddingSubItems, .allowsContentEnumerating]
         } else {
             let ext = (filename as NSString).pathExtension
             self.contentType = UTType(filenameExtension: ext) ?? .data
-            self.capabilities = [.allowsReading]
+            self.capabilities = [.allowsReading, .allowsWriting, .allowsDeleting, .allowsRenaming]
         }
 
         self.documentSize = size.map { NSNumber(value: $0) }

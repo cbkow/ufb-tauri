@@ -1595,3 +1595,206 @@ let socket_path = group_dir.join("agent.sock");
 | `FileProviderExtension/FileProviderExtension.swift` | IPC client, replace FileManager calls |
 | `FileProviderExtension/FileProviderEnumerator.swift` | IPC-based enumeration |
 | `FileProviderExtension/AgentIPCClient.swift` | New: socket client for extension |
+
+---
+
+## 2026-04-12 — FileProvider IPC implementation (Phase 1)
+
+### IPC file operations server — implemented and working
+
+Built a separate request-response IPC channel between the FileProvider extension and the agent.
+The existing mount-management IPC (broadcast-based, `/tmp/ufb-mediamount-agent.sock`) is
+untouched. The new file ops socket is purpose-built for per-client request-response.
+
+**Architecture:**
+```
+Existing (unchanged):
+  /tmp/ufb-mediamount-agent.sock  →  broadcast mount state to all clients
+
+New (file operations):
+  ~/Library/Group Containers/.../fp.sock  →  request-response per-client
+  FileProviderExtension ──request──► Agent ──response──► same client
+```
+
+### Implementation
+
+**Rust side (mediamount-agent):**
+
+- `messages.rs`: Added `FileOpsRequest` and `FileOpsResponse` enums with tagged JSON serde.
+  Request types: `ListDir`, `Stat`, `ReadFile`, `Ping`.
+  Response types: `DirListing`, `FileStat`, `FileReady`, `Error`, `Pong`.
+  All requests carry a `request_id` for matching.
+
+- `ipc/fileops_server.rs`: New Unix socket server in the app group container.
+  - Listens on `{group_container}/fp.sock`
+  - Per-client blocking read loop (not broadcast)
+  - `handle_request()` dispatches to `handle_list_dir`, `handle_stat`, `handle_read_file`
+  - Path resolution: maps domain (share_name) → mount config → filesystem path
+  - For sync mode mounts: resolves directly to `/Volumes/{share_name}` (not through the
+    FileProvider symlink, which would be circular)
+  - `ReadFile`: copies file to `{group_container}/temp/{timestamp}.tmp`, returns path
+  - Path traversal protection via `canonicalize()` + `starts_with()` check
+  - Filters hidden/system files (`.`, `@`, `#` prefixes)
+
+- `ipc/mod.rs`: Added `pub mod fileops_server` (macOS only)
+- `main.rs`: `FileOpsServer::start()` called in `run_event_loop()` on macOS
+
+**Swift side (FileProviderExtension):**
+
+- `AgentFileOpsClient.swift`: New synchronous socket client.
+  - Connects to `{group_container}/fp.sock` via POSIX Unix domain socket
+  - Same wire protocol as existing IPC (4-byte LE length + JSON)
+  - `listDir(domain:relativePath:)` → sends `list_dir`, returns `[DirEntryResponse]`
+  - `stat(domain:relativePath:)` → sends `stat`, returns `FileStatResponse`
+  - `readFile(domain:relativePath:)` → sends `read_file`, returns `(URL, FileStatResponse)`
+  - Thread-safe via `NSLock`, auto-reconnect on failure
+  - Singleton: `AgentFileOpsClient.shared`
+
+- `FileProviderExtension.swift`: Updated to use IPC.
+  - `item(for:)` → `client.stat()` instead of `FileManager.attributesOfItem`
+  - `fetchContents(for:)` → `client.readFile()` returns temp file URL
+  - `enumerator(for:)` passes `domainId` instead of `nasBasePath`
+
+- `FileProviderEnumerator.swift`: Updated to use IPC.
+  - `enumerateItems` → `client.listDir()` instead of `FileManager.contentsOfDirectory`
+  - Builds `FileProviderItem` from `DirEntryResponse`
+
+### Findings during implementation
+
+**1. Unix socket path length limit (104 bytes on macOS)**
+`agent-fileops.sock` in the app group container exceeded the `sun_path` limit (104 chars).
+Shortened to `fp.sock` (93 chars). This is a hard macOS kernel limit.
+
+**2. Sync mode path resolution is circular**
+For sync-enabled mounts, `mount_path()` returns `/opt/ufb/mounts/{share}` which symlinks
+to `~/Library/CloudStorage/...` — the FileProvider domain itself. The agent can't read from
+there (that's what the extension provides). Fix: for sync mode mounts, the fileops server
+resolves directly to `/Volumes/{share_name}` where the actual SMB mount lives.
+
+**3. Product name controls Finder sidebar label**
+Finder sidebar shows the host app's `PRODUCT_NAME`, not `CFBundleName`. Changed from
+`MediaMountTray` to `UFB` in `project.yml`. Required killing `fileproviderd` and Finder
+to clear cached state. The DomainManager now removes all existing domains before
+re-registering to ensure config changes take effect.
+
+**4. Domain re-registration needed for name changes**
+Simply changing `CFBundleName` doesn't update the sidebar. Must remove old domain via
+`NSFileProviderManager.remove()` and re-add. The `DomainManager.registerDomains()` now
+always removes all existing domains first, then registers fresh.
+
+**5. Single domain shows app name only**
+With one FileProvider domain, Finder sidebar shows just "UFB". With multiple domains,
+it shows "UFB - {displayName}" to disambiguate.
+
+### Test results
+
+- Agent starts, fileops socket listens at `~/Library/Group Containers/.../fp.sock`
+- MediaMountTray launches, registers domain, extension connects to socket
+- Browsing `~/Library/CloudStorage/UFB-Test1/` in Finder shows NAS directory contents
+- Files listed via IPC (agent reads `/Volumes/test1`, returns entries to extension)
+- Finder sidebar shows "UFB"
+
+### Remaining work (as of early 2026-04-12)
+
+- `fetchContents` (file download) — not yet tested end-to-end
+- `createItem` / `modifyItem` — write-through not implemented
+- `deleteItem` — not implemented
+- NAS watcher → `signalEnumerator` — not implemented
+- Cache eviction via `evictItem` — not implemented
+- Agent should mount SMB headlessly for sync-mode shares (currently requires manual `open smb://`)
+
+---
+
+## 2026-04-12 — Write-through, headless SMB, agent lifecycle, icon
+
+### Write-through (create/modify/delete) — working
+
+Implemented full write support through the IPC channel:
+
+**Agent side (`fileops_server.rs`):**
+- `WriteFile` handler: receives staged file path from group container, copies to NAS
+- `DeleteItem` handler: deletes file or directory on NAS
+- Both new handlers with path traversal protection
+
+**Swift side (`AgentFileOpsClient.swift`):**
+- `writeFile()` stages content in `{group_container}/staging/` before sending to agent
+- `deleteItem()` sends delete request to agent
+
+**Key finding: file staging required for writes.**
+The system provides file content to the extension via a URL in FileProvider's internal
+staging area (`~/Library/Application Support/FileProvider/.../wharf/propagate/`). The agent
+cannot read this path — it's sandboxed to the extension process. Fix: extension copies
+the file to the shared app group container first, then tells the agent the staged path.
+Same pattern as `fetchContents` but in reverse — the group container is the handoff zone.
+
+**Extension capabilities updated:**
+Items now have full capabilities: `.allowsReading`, `.allowsWriting`, `.allowsDeleting`,
+`.allowsRenaming`, `.allowsAddingSubItems` (directories), `.allowsContentEnumerating`.
+
+**Error domain fix:**
+FileProvider only accepts `NSCocoaErrorDomain` and `NSFileProviderErrorDomain`. Our custom
+`FileOpsError` type was being rejected. Added `.asNSError` converter that maps errors to
+appropriate `NSCocoaErrorDomain` codes.
+
+**Working set / trash containers:**
+Extension now returns empty results for `.workingSet` and `.trashContainer` enumerations
+instead of trying to resolve them as NAS paths.
+
+### Headless SMB mount for sync-mode shares — working
+
+The agent now mounts SMB shares in the background for sync-mode mounts. Previously required
+manual `open smb://` before the FileProvider could browse.
+
+**Orchestrator change:** In `mount_drive()` for macOS sync mode, the agent:
+1. Mounts SMB via `macos_smb_mount()` (same as regular mounts)
+2. Creates symlink from `/opt/ufb/mounts/{share}` → FileProvider domain path
+
+On disconnect, it unmounts the headless SMB mount at `/Volumes/{share_name}`.
+
+### Multi-domain support — working
+
+Tested with two sync-enabled shares (`test1` on home NAS, `GFX_Dropbox` on work NAS).
+Both appear in Finder sidebar under "UFB". DomainManager correctly:
+- Preserves existing domains across relaunches (cache persists)
+- Only removes stale domains (ones no longer in config)
+- Registers new domains as needed
+
+### Agent lifecycle — tray app manages it
+
+New `AgentProcess.swift` manages the agent binary lifecycle:
+- On tray app launch: finds and spawns `mediamount-agent` as a background process
+- On quit: terminates agent gracefully (SIGTERM, then SIGINT after 2s)
+- Skips launch if agent is already running (checked via `pgrep`)
+- Binary search order: bundled Resources → sibling → cargo debug build → system path
+
+No more terminal window needed to run the agent.
+
+### App icon
+
+Host app uses the main UFB icon (`AppIcon.icns` from `src-tauri/icons/icon.icns`).
+FileProvider picks this up automatically for the Finder sidebar via `CFBundleIconFile`
+in the host app's Info.plist.
+
+`PRODUCT_NAME: UFB` controls the sidebar label. With multiple domains, Finder shows
+"UFB - Test 1" and "UFB - GFX Dropbox".
+
+### Current status
+
+| Feature | Status |
+|---|---|
+| Domain registration | Done |
+| Browse (enumerateItems) | Done |
+| Open files (fetchContents) | Done |
+| Create files/folders | Done |
+| Modify files | Done |
+| Delete (trash) | Done |
+| Multi-domain | Done |
+| Headless SMB mount | Done |
+| Agent auto-launch | Done |
+| App icon in Finder | Done |
+| Cache persistence | Done |
+| Error handling | Done |
+| NAS watcher → signalEnumerator | Not started |
+| Rename support | Not started |
+| Cache eviction (evictItem) | Not started |
+| build-macos.sh update | Not started |

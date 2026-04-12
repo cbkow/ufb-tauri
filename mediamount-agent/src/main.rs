@@ -212,6 +212,10 @@ async fn run_event_loop() {
     #[cfg(unix)]
     let mut ipc_server = ipc::unix_server::IpcServer::start();
 
+    // Start file operations server for FileProvider extension (macOS only)
+    #[cfg(target_os = "macos")]
+    ipc::fileops_server::FileOpsServer::start();
+
     #[cfg(not(any(windows, unix)))]
     {
         log::error!("IPC server not implemented for this platform");

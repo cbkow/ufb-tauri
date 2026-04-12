@@ -22,7 +22,7 @@ targets:
         INFOPLIST_FILE: MediaMountTray/Info.plist
         CODE_SIGN_ENTITLEMENTS: MediaMountTray/MediaMountTray.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.unionfiles.mediamount-tray
-        PRODUCT_NAME: MediaMountTray
+        PRODUCT_NAME: UFB
         COMBINE_HIDPI_IMAGES: true
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 5Z4S9VHV56

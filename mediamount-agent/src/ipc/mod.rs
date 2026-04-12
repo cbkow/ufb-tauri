@@ -4,6 +4,9 @@ pub mod server;
 #[cfg(unix)]
 pub mod unix_server;
 
+#[cfg(target_os = "macos")]
+pub mod fileops_server;
+
 use std::io::{self, Read, Write};
 
 /// Write a length-prefixed JSON message.
