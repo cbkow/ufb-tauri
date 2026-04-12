@@ -36,7 +36,8 @@ export default function App() {
     const accent = settingsStore.getAccentColor();
     document.documentElement.style.setProperty("--accent-color", accent);
 
-    // Initialize mount store
+    // Initialize mount store — launch agent + tray on macOS
+    mountStore.launchAgent();
     mountStore.loadStates();
 
     setReady(true);
@@ -117,7 +118,7 @@ export default function App() {
       <div class="app-root">
       <Splitter
         direction="horizontal"
-        initialSize={220}
+        initialSize={250}
         minSize={160}
         minSecondSize={400}
         class="app-layout"

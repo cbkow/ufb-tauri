@@ -78,6 +78,7 @@ pub enum FileOpsRequest {
     RenameItem(RenameItemReq),
     RecordEnumeration(RecordEnumerationReq),
     GetChanges(GetChangesReq),
+    ClearCache(ClearCacheReq),
     Ping,
 }
 
@@ -136,6 +137,13 @@ pub struct RenameItemReq {
     pub domain: String,
     pub old_path: String,
     pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCacheReq {
+    pub request_id: String,
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +262,8 @@ pub struct ChangesResp {
     pub request_id: String,
     pub updated: Vec<ChangedEntry>,
     pub deleted: Vec<String>,
+    #[serde(default)]
+    pub evict: Vec<String>,
     pub new_anchor: String,
 }
 

@@ -108,6 +108,11 @@ impl Orchestrator {
                                     bytes as f64 / (1024.0 * 1024.0)
                                 );
                             }
+                            #[cfg(target_os = "macos")]
+                            if self.config.is_sync_mode() {
+                                log::info!("[{}] Clear cache requested — notifying extension", self.mount_id);
+                                crate::sync::macos_watcher::post_clear_cache_notification(&self.config.share_name());
+                            }
                         }
                         Some(event) => {
                             self.handle_event(event).await;

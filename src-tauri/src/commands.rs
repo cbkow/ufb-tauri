@@ -1806,10 +1806,10 @@ pub fn mount_launch_agent() -> Result<(), String> {
     {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
-                // Production: MediaMountTray.app in Contents/Resources/
+                // Production: UFB.app in Contents/Resources/
                 let tray_candidates = [
-                    dir.join("../Resources/MediaMountTray.app"),
-                    dir.join("../../../mediamount-tray/MediaMountTray.app"),
+                    dir.join("../Resources/UFB.app"),
+                    dir.join("../Resources/MediaMountTray.app"), // legacy fallback
                 ];
                 for tray_path in &tray_candidates {
                     if tray_path.exists() {

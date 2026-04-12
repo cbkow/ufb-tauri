@@ -1991,6 +1991,126 @@ updates through the normal app install flow.
 | Echo suppression | Deferred (harmless) |
 | Cache eviction (evictItem) | Not needed (FileProvider manages) |
 | mtime optimization | Deferred (optimize later for large shares) |
+| Settings UI macOS polish | Done |
+| System icons (NSWorkspace) | Done |
+| Show Mounts in Finder (tray) | Done |
+| Cache eviction (LRU + Clear Cache) | Done |
+| Rename | Done |
+| Tray auto-launch from Tauri app | Done |
+| Production build + sign + notarize | Done |
+| Version bump to 0.3.1 | Done |
+
+---
+
+## 2026-04-12 — Production build + remaining fixes
+
+### Version 0.3.1 released
+
+All components bumped to 0.3.1: package.json, tauri.conf.json, both Cargo.toml files,
+both Info.plist files.
+
+### Tray auto-launch on app startup
+
+The Tauri app now calls `mountStore.launchAgent()` in `App.tsx` `onMount`, which:
+1. Launches `mediamount-agent` (if not already running)
+2. Launches `UFB.app` tray (if found in Resources)
+3. Tray app registers FileProvider domains + starts agent
+
+**Fix:** Tray launch path was still `MediaMountTray.app` → changed to `UFB.app`.
+
+### Build + sign flow updated for FileProvider
+
+**`build-macos.sh`:** Already updated with xcodegen + xcodebuild.
+
+**`sign-and-notarize.sh`:** Updated to sign FileProvider extension:
+- FileProviderExtension.appex signed with sandbox + app group entitlements
+- UFB.app (tray) signed with app group entitlements
+- Inside-out signing order: extension → tray → agent → main app
+- Notarization: Accepted
+
+### Cache DB migration fix
+
+Existing cache DBs (created before hydration columns were added) failed to open
+because `CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated)` ran
+before the migration added the column. Fix: create tables without hydration columns,
+migrate to add them, then create indexes.
+
+### On-demand cache opening
+
+FileOps server now opens cache DBs on demand when a request arrives for an unknown
+domain. Uses `RwLock<HashMap>` for thread-safe dynamic insertion. Handles mounts
+added while the agent is running.
+
+### Frontend fixes
+
+- Sidebar width: 220px → 250px (less truncation)
+- Drives section filtered: mounts shown as bookmarks excluded from Drives list
+- Mount toggle persistence: now updates both local state + saves to disk
+- `saveConfig` updates `mountStore.configs` so bookmarks panel reflects changes immediately
+- Sync mount bookmarks navigate to `~/Library/CloudStorage/UFB-{displayName}`
+- `confirm()` dialog removed from Clear Cache (blocks in Tauri WebView)
+
+### Windows build notes for 0.3.1
+
+Shared code was modified in this session. Before building on Windows, verify:
+
+1. **messages.rs** — New message types: `RenameItem`, `ClearCache`, `RecordEnumeration`,
+   `GetChanges`, plus response types `RenameOk`, `RecordOk`, `ChangesResp`. All behind
+   the shared `FileOpsRequest`/`FileOpsResponse` enums. macOS-only usage, but enums are
+   compiled on all platforms. Run `cargo build -p mediamount-agent` on Windows to verify.
+
+2. **mountStore.ts getMountPath()** — macOS sync path now returns
+   `~/Library/CloudStorage/UFB-{displayName}`. Windows path unchanged
+   (`C:\Volumes\ufb\{shareName}`). Conditional on `platform === "mac"`.
+
+3. **App.tsx** — `mountStore.launchAgent()` now called on startup before `loadStates()`.
+   On Windows this launches `mediamount-agent.exe`. Verify agent doesn't double-launch
+   if already running as a Windows service or from the tray.
+
+4. **SubscriptionPanel.tsx** — Drives section filtered via `filteredDrives()` to exclude
+   paths already shown as mount bookmarks. On Windows, mount paths are `C:\Volumes\ufb\{share}`.
+   Verify drive letters (C:\, D:\, etc.) are NOT accidentally filtered — they shouldn't
+   match mount paths.
+
+5. **SettingsDialog.tsx** — `mountPathMacos` added to `defaultMountConfig()`. Serializes
+   as empty string. Verify config round-trip on Windows doesn't break.
+
+6. **Sidebar width** — `initialSize` changed 220 → 250 in App.tsx. Cosmetic, all platforms.
+
+7. **Clear Cache button** — `confirm()` dialog removed (blocks in Tauri WebView on macOS).
+   If Windows needs a confirmation prompt, use Tauri's `dialog::ask()` API instead.
+
+All macOS-specific Rust code is behind `#[cfg(target_os = "macos")]`. All frontend
+platform checks use `platformStore.platform === "mac"`. Low risk but verify builds pass.
+
+### Cache eviction — implemented
+
+**Automatic LRU eviction:**
+- Agent tracks hydration in `known_files` DB (is_hydrated, hydrated_size, last_accessed)
+- After each `ReadFile`, agent checks total cached bytes against `syncCacheLimitBytes`
+- If over budget, selects LRU victims and adds to `pending_evictions`
+- `getChanges` response includes `evict` list → extension calls `evictItem()` for each
+
+**Manual "Clear Cache" button:**
+- Frontend sends `ClearSyncCache` via mount IPC
+- Agent orchestrator posts `com.unionfiles.ufb.clear-cache.{domain}` notification
+- Extension receives, lists root files, calls `evictItem()` for each
+- Note: `confirm()` dialog in Tauri WebView was blocking the call — removed
+
+**macOS cache DB schema (final):**
+```sql
+CREATE TABLE known_files (
+    path TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    is_dir INTEGER NOT NULL DEFAULT 0,
+    nas_size INTEGER NOT NULL,
+    nas_mtime REAL NOT NULL,
+    nas_created REAL NOT NULL DEFAULT 0,
+    is_hydrated INTEGER NOT NULL DEFAULT 0,
+    hydrated_size INTEGER DEFAULT 0,
+    last_accessed REAL DEFAULT 0
+);
+```
 
 ---
 

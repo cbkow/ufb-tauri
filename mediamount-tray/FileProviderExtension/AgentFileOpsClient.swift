@@ -276,7 +276,8 @@ class AgentFileOpsClient {
         let deleted = response["deleted"] as? [String] ?? []
         let newAnchor = response["newAnchor"] as? String ?? ""
 
-        return ChangesResponse(updated: updated, deleted: deleted, newAnchor: newAnchor)
+        let evict = response["evict"] as? [String] ?? []
+        return ChangesResponse(updated: updated, deleted: deleted, evict: evict, newAnchor: newAnchor)
     }
 
     /// Tell the agent to record an enumeration in its cache DB.
@@ -520,6 +521,7 @@ struct FileStatResponse {
 struct ChangesResponse {
     let updated: [ChangedEntryResponse]
     let deleted: [String]
+    let evict: [String]
     let newAnchor: String
 }
 

@@ -68,6 +68,24 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
     subscriptionStore.bookmarks.filter((b) => !/^[A-Z]:\\?$/i.test(b.path))
   );
 
+  // Filter drives to exclude paths already shown as mount bookmarks
+  const filteredDrives = createMemo(() => {
+    const mountPaths = new Set(
+      mountStore.configs.map((cfg) => {
+        const p = mountStore.getMountPath(cfg);
+        // Also match the /Volumes/ path for sync mounts (headless SMB)
+        return p;
+      })
+    );
+    // Also collect /Volumes/{shareName} paths for sync mounts
+    const volumePaths = new Set(
+      mountStore.configs
+        .filter((cfg) => cfg.syncEnabled)
+        .map((cfg) => `/Volumes/${mountStore.getShareName(cfg)}`)
+    );
+    return systemDrives().filter((d) => !mountPaths.has(d.path) && !volumePaths.has(d.path));
+  });
+
   function navigate(path: string) {
     props.onNavigate?.(path);
     // Switch to the main browser tab so the user sees it
@@ -388,12 +406,12 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
         </div>
       </div>
 
-      {/* ── Drives ── */}
-      <Show when={systemDrives().length > 0}>
+      {/* ── Drives (filtered to exclude paths already shown as mounts) ── */}
+      <Show when={filteredDrives().length > 0}>
         <div class="panel-section">
           <div class="section-header">Drives</div>
           <div class="section-content">
-            <For each={systemDrives()}>
+            <For each={filteredDrives()}>
               {(drive) => (
                 <div
                   class="panel-item"

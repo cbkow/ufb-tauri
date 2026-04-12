@@ -146,6 +146,8 @@ function toggleMount(mountId: string) {
 async function saveConfig(config: MountsConfig) {
   try {
     await mountSaveConfig(config);
+    // Update local configs so bookmarks panel reflects changes immediately
+    setState("configs", (config.mounts ?? []).filter((m) => m.enabled));
   } catch (e) {
     console.error("Failed to save mount config:", e);
   }
@@ -180,6 +182,11 @@ function getMountPath(cfg: MountConfig): string {
   if (platformStore.platform === "mac") {
     if (cfg.mountPathMacos) return cfg.mountPathMacos;
     const shareName = getShareName(cfg);
+    if (cfg.syncEnabled) {
+      // Sync mounts use FileProvider — path is ~/Library/CloudStorage/UFB-{displayName}
+      const displayName = (cfg.displayName || shareName).replace(/\s+/g, "");
+      return `${platformStore.home}/Library/CloudStorage/UFB-${displayName}`;
+    }
     return `/opt/ufb/mounts/${shareName}`;
   }
   // Linux: explicit path or auto-derived from mount ID

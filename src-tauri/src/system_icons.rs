@@ -181,9 +181,70 @@ impl SystemIconCache {
     }
 
     #[cfg(target_os = "macos")]
-    fn extract_icon(_extension: &str, _size: u32) -> Result<Option<Vec<u8>>, String> {
-        // TODO: NSWorkspace.icon(forFileType:) → NSImage → PNG
-        Ok(None)
+    fn extract_icon(extension: &str, size: u32) -> Result<Option<Vec<u8>>, String> {
+        use objc2::rc::Retained;
+        use objc2_foundation::NSString;
+        use objc2_app_kit::{NSWorkspace, NSImage, NSBitmapImageRep};
+        use objc2::msg_send;
+
+        let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+
+        // Get the system icon for this file type
+        // iconForFileType: accepts extensions ("pdf") or UTI strings ("public.folder")
+        let type_str = if extension == "folder" || extension.is_empty() {
+            NSString::from_str("public.folder")
+        } else {
+            NSString::from_str(extension)
+        };
+
+        let icon: Retained<NSImage> = unsafe {
+            msg_send![&workspace, iconForFileType: &*type_str]
+        };
+
+        // Set the desired size
+        let sz = size as f64;
+        unsafe {
+            let ns_size = objc2_foundation::NSSize::new(sz, sz);
+            icon.setSize(ns_size);
+        }
+
+        // Convert NSImage to PNG via NSBitmapImageRep
+        let png_data: Option<Vec<u8>> = unsafe {
+            // Lock focus and draw into a bitmap
+            let tiff_data = icon.TIFFRepresentation();
+            let tiff = match tiff_data {
+                Some(d) => d,
+                None => return Ok(None),
+            };
+
+            let bitmap = NSBitmapImageRep::imageRepWithData(&tiff);
+            let bitmap = match bitmap {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+
+            // Get PNG representation
+            let png: Option<Retained<objc2_foundation::NSData>> = msg_send![
+                &bitmap,
+                representationUsingType: 4u64, // NSBitmapImageRepFileTypePNG = 4
+                properties: std::ptr::null::<objc2_foundation::NSDictionary>() as *const _
+            ];
+
+            match png {
+                Some(data) => {
+                    let len: usize = msg_send![&data, length];
+                    let ptr: *const u8 = msg_send![&data, bytes];
+                    if ptr.is_null() || len == 0 {
+                        None
+                    } else {
+                        Some(std::slice::from_raw_parts(ptr, len).to_vec())
+                    }
+                }
+                None => None,
+            }
+        };
+
+        Ok(png_data)
     }
 
     #[cfg(target_os = "linux")]

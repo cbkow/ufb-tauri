@@ -689,6 +689,7 @@ function defaultMountConfig(): MountConfig {
     mountDriveLetter: "",
     smbMountPath: "",
     mountPathLinux: "",
+    mountPathMacos: "",
     isJobsFolder: true,
     syncEnabled: false,
   };
@@ -942,10 +943,14 @@ function MountsSection(props: {
                   class="mount-enable-toggle"
                   checked={cfg.enabled}
                   onChange={(e) => {
-                    const updated = props.mountConfig().mounts.map((m) =>
-                      m.id === cfg.id ? { ...m, enabled: e.currentTarget.checked } : m
-                    );
-                    mountStore.saveConfig({ ...props.mountConfig(), mounts: updated });
+                    const newConfig = {
+                      ...props.mountConfig(),
+                      mounts: props.mountConfig().mounts.map((m) =>
+                        m.id === cfg.id ? { ...m, enabled: e.currentTarget.checked } : m
+                      ),
+                    };
+                    props.setMountConfig(newConfig);
+                    mountStore.saveConfig(newConfig);
                   }}
                   title={cfg.enabled ? "Auto-connects on agent start" : "Does not auto-connect"}
                 />
@@ -1043,6 +1048,11 @@ function MountsSection(props: {
                 <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)" }}>
                   Sync root: {mountStore.getMountPath(m()!) || "(auto)"}
                 </p>
+                <Show when={props.platform() === "mac"}>
+                  <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)", opacity: 0.7 }}>
+                    Appears in Finder sidebar under "UFB". Cache managed by macOS FileProvider.
+                  </p>
+                </Show>
 
                 <div class="settings-field">
                   <div class="settings-field-header">
@@ -1106,12 +1116,10 @@ function MountsSection(props: {
                   class="settings-btn"
                   style={{ "margin-top": "var(--spacing-sm)" }}
                   onClick={async () => {
-                    if (confirm("Clear all cached data for this mount? Files will re-download on next access.")) {
-                      try {
-                        await mountClearSyncCache(m().id);
-                      } catch (e) {
-                        console.error("Failed to clear cache:", e);
-                      }
+                    try {
+                      await mountClearSyncCache(m().id);
+                    } catch (e) {
+                      console.error("Failed to clear cache:", e);
                     }
                   }}
                 >Clear Cache</button>
@@ -1188,6 +1196,35 @@ function MountsSection(props: {
                   {`C:\\Volumes\\ufb\\${mountStore.getShareName(m())}`}
                 </div>
               </label>
+            </Show>
+
+            {/* macOS mount path — display for regular mounts, info for sync */}
+            <Show when={props.platform() === "mac"}>
+              <Show when={!m().syncEnabled}>
+                <h3>Mount Path</h3>
+                <label class="settings-field">
+                  <div class="settings-field-header">
+                    <span>Symlink Location</span>
+                    <span class="settings-help" title="Stable symlink path that points to the mounted SMB share. Drag to Finder Favorites for quick access.">?</span>
+                  </div>
+                  <div class="settings-value-display">
+                    {mountStore.getMountPath(m()!) || `/opt/ufb/mounts/${mountStore.getShareName(m())}`}
+                  </div>
+                </label>
+                <details style={{ "margin-top": "var(--spacing-sm)" }}>
+                  <summary class="settings-hint" style={{ cursor: "pointer" }}>
+                    Advanced: override mount path
+                  </summary>
+                  <label class="settings-field">
+                    <span>Custom Mount Path</span>
+                    <SettingsInput
+                      value={m().mountPathMacos ?? ""}
+                      placeholder="(auto)"
+                      onCommit={(v) => updateField("mountPathMacos", v)}
+                    />
+                  </label>
+                </details>
+              </Show>
             </Show>
 
             {/* Linux mount path overrides — collapsed by default */}

@@ -1,6 +1,6 @@
 [package]
 name = "ufb-tauri"
-version = "0.3.0"
+version = "0.3.1"
 description = "Union File Browser - Tauri Edition"
 authors = ["Chris"]
 edition = "2021"
@@ -116,6 +116,10 @@ objc2-app-kit = { version = "0.3", features = [
   "NSDragging",
   "NSDraggingItem",
   "NSWorkspace",
+  "NSImage",
+  "NSBitmapImageRep",
+  "NSGraphicsContext",
+  "NSGraphics",
 ] }
 
 # Windows APIs (OLE drag-drop)

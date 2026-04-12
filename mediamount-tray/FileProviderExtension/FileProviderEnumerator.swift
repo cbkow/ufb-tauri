@@ -5,10 +5,12 @@ import UniformTypeIdentifiers
 class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let enumeratedItemIdentifier: NSFileProviderItemIdentifier
     private let domainId: String
+    private let domain: NSFileProviderDomain
 
-    init(enumeratedItemIdentifier: NSFileProviderItemIdentifier, domainId: String) {
+    init(enumeratedItemIdentifier: NSFileProviderItemIdentifier, domainId: String, domain: NSFileProviderDomain) {
         self.enumeratedItemIdentifier = enumeratedItemIdentifier
         self.domainId = domainId
+        self.domain = domain
         super.init()
     }
 
@@ -145,6 +147,23 @@ class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             if !changes.deleted.isEmpty {
                 let deletedIds = changes.deleted.map { NSFileProviderItemIdentifier(rawValue: $0) }
                 observer.didDeleteItems(withIdentifiers: deletedIds)
+            }
+
+            // Evict items the agent flagged as over cache budget
+            if !changes.evict.isEmpty {
+                NSLog("[Enumerator] Evicting %d items", changes.evict.count)
+                if let manager = NSFileProviderManager(for: domain) {
+                    for path in changes.evict {
+                        let identifier = NSFileProviderItemIdentifier(rawValue: path)
+                        manager.evictItem(identifier: identifier) { error in
+                            if let error = error {
+                                NSLog("[Enumerator] evictItem error for %@: %@", path, error.localizedDescription)
+                            } else {
+                                NSLog("[Enumerator] Evicted: %@", path)
+                            }
+                        }
+                    }
+                }
             }
 
             let newAnchor = NSFileProviderSyncAnchor(rawValue: changes.newAnchor.data(using: .utf8) ?? Data())

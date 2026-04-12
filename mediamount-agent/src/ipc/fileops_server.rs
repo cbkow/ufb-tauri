@@ -32,7 +32,7 @@ fn temp_dir() -> PathBuf {
 /// Shared state for the file operations server.
 struct ServerState {
     /// Per-domain cache databases.
-    caches: HashMap<String, MacosCache>,
+    caches: std::sync::RwLock<HashMap<String, MacosCache>>,
 }
 
 /// File operations IPC server for the FileProvider extension.
@@ -78,7 +78,7 @@ impl FileOpsServer {
             if mount.enabled && mount.is_sync_mode() {
                 let domain = mount.share_name();
                 let nas_root = PathBuf::from("/Volumes").join(&domain);
-                match MacosCache::open(&domain, nas_root) {
+                match MacosCache::open(&domain, nas_root, mount.sync_cache_limit_bytes) {
                     Ok(cache) => {
                         log::info!("[FileOps] Cache opened for domain: {}", domain);
                         caches.insert(domain, cache);
@@ -90,7 +90,7 @@ impl FileOpsServer {
             }
         }
 
-        let state = Arc::new(ServerState { caches });
+        let state = Arc::new(ServerState { caches: std::sync::RwLock::new(caches) });
 
         loop {
             let (stream, _addr) = match tokio::task::spawn_blocking({
@@ -158,13 +158,44 @@ fn handle_request(req: FileOpsRequest, state: &ServerState) -> FileOpsResponse {
         FileOpsRequest::Ping => FileOpsResponse::Pong,
         FileOpsRequest::ListDir(r) => handle_list_dir(r, state),
         FileOpsRequest::Stat(r) => handle_stat(r),
-        FileOpsRequest::ReadFile(r) => handle_read_file(r),
+        FileOpsRequest::ReadFile(r) => handle_read_file(r, state),
         FileOpsRequest::WriteFile(r) => handle_write_file(r, state),
         FileOpsRequest::DeleteItem(r) => handle_delete_item(r, state),
         FileOpsRequest::RenameItem(r) => handle_rename_item(r, state),
         FileOpsRequest::RecordEnumeration(r) => handle_record_enumeration(r, state),
+        FileOpsRequest::ClearCache(r) => handle_clear_cache(r, state),
         FileOpsRequest::GetChanges(r) => handle_get_changes(r, state),
     }
+}
+
+/// Ensure a cache exists for a domain (opens on demand for mounts added at runtime).
+fn ensure_cache(state: &ServerState, domain: &str) {
+    // Quick check with read lock
+    if state.caches.read().unwrap().contains_key(domain) {
+        return;
+    }
+    // Need to open — use write lock
+    let config = config::load_config();
+    if let Some(mount) = config.mounts.iter().find(|m| m.share_name() == domain && m.enabled && m.is_sync_mode()) {
+        let nas_root = PathBuf::from("/Volumes").join(&mount.share_name());
+        match MacosCache::open(domain, nas_root, mount.sync_cache_limit_bytes) {
+            Ok(cache) => {
+                log::info!("[FileOps] Cache opened on demand for domain: {}", domain);
+                state.caches.write().unwrap().insert(domain.to_string(), cache);
+            }
+            Err(e) => {
+                log::error!("[FileOps] Failed to open cache for {}: {}", domain, e);
+            }
+        }
+    }
+}
+
+/// Helper to access cache with read lock.
+fn with_cache<F, R>(state: &ServerState, domain: &str, f: F) -> Option<R>
+where F: FnOnce(&MacosCache) -> R {
+    ensure_cache(state, domain);
+    let caches = state.caches.read().unwrap();
+    caches.get(domain).map(f)
 }
 
 // ── Path resolution ──
@@ -276,7 +307,7 @@ fn handle_list_dir(req: ListDirReq, state: &ServerState) -> FileOpsResponse {
     }
 
     // Record in cache if available
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         cache.record_enumeration(&req.relative_path, &result);
     }
 
@@ -325,7 +356,7 @@ fn handle_stat(req: StatReq) -> FileOpsResponse {
     })
 }
 
-fn handle_read_file(req: ReadFileReq) -> FileOpsResponse {
+fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
     let source_path = match resolve_path(&req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
@@ -371,6 +402,11 @@ fn handle_read_file(req: ReadFileReq) -> FileOpsResponse {
             request_id: req.request_id,
             message: format!("Failed to copy file: {}", e),
         });
+    }
+
+    // Record hydration for cache eviction tracking
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
+        cache.record_hydration(&req.relative_path, meta.len());
     }
 
     FileOpsResponse::FileReady(FileReadyResp {
@@ -425,7 +461,7 @@ fn handle_write_file(req: WriteFileReq, state: &ServerState) -> FileOpsResponse 
         .unwrap_or(0.0);
 
     // Update cache
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         let name = Path::new(&req.relative_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -483,7 +519,7 @@ fn handle_delete_item(req: DeleteItemReq, state: &ServerState) -> FileOpsRespons
     }
 
     // Update cache
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         cache.remove_known_file(&req.relative_path);
     }
 
@@ -523,7 +559,7 @@ fn handle_rename_item(req: RenameItemReq, state: &ServerState) -> FileOpsRespons
     }
 
     // Update cache
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         cache.remove_known_file(&req.old_path);
         let meta = std::fs::metadata(&new_path).ok();
         let name = new_path.file_name()
@@ -559,9 +595,20 @@ fn handle_rename_item(req: RenameItemReq, state: &ServerState) -> FileOpsRespons
 }
 
 fn handle_record_enumeration(req: RecordEnumerationReq, state: &ServerState) -> FileOpsResponse {
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         cache.record_enumeration(&req.relative_path, &req.entries);
     }
+    FileOpsResponse::RecordOk(RecordOkResp {
+        request_id: req.request_id,
+    })
+}
+
+fn handle_clear_cache(req: ClearCacheReq, state: &ServerState) -> FileOpsResponse {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
+        let (count, bytes) = cache.clear_all_hydrated();
+        log::info!("[FileOps] ClearCache {}: {} files, {:.1} MB", req.domain, count, bytes as f64 / 1_048_576.0);
+    }
+    // Evictions will be delivered in the next getChanges call
     FileOpsResponse::RecordOk(RecordOkResp {
         request_id: req.request_id,
     })
@@ -570,7 +617,7 @@ fn handle_record_enumeration(req: RecordEnumerationReq, state: &ServerState) -> 
 fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsResponse {
     let since: f64 = req.since_anchor.parse().unwrap_or(0.0);
 
-    if let Some(cache) = state.caches.get(&req.domain) {
+    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
         let result = cache.get_changes_since(since);
 
         let updated: Vec<ChangedEntry> = result.updated.into_iter().map(|e| {
@@ -584,10 +631,14 @@ fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsRespons
             }
         }).collect();
 
+        // Drain pending evictions
+        let evict = cache.drain_pending_evictions();
+
         FileOpsResponse::Changes(ChangesResp {
             request_id: req.request_id,
             updated,
             deleted: result.deleted,
+            evict,
             new_anchor: format!("{}", result.new_anchor),
         })
     } else {
@@ -631,6 +682,7 @@ fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsRespons
             request_id: req.request_id,
             updated,
             deleted: vec![],
+            evict: vec![],
             new_anchor: format!("{}", std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

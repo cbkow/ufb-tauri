@@ -1,27 +1,28 @@
-/// SQLite cache for macOS FileProvider change tracking.
+/// SQLite cache for macOS FileProvider change tracking + LRU eviction.
 ///
-/// Tracks known files and visited folders so the agent can compute deltas
-/// for the FileProvider extension's `enumerateChanges` calls.
-///
-/// Simplified vs Windows cache: no hydration/eviction tracking (FileProvider manages that).
-/// Only tracks NAS-side metadata for three-way diffing.
+/// Tracks known files, visited folders, and hydration state so the agent can:
+/// - Compute deltas for the extension's `enumerateChanges` calls
+/// - Enforce cache limits via LRU eviction (extension calls `evictItem`)
 
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+const EVICTION_TARGET_PERCENT: f64 = 0.8;
+
 /// Per-domain cache database.
 pub struct MacosCache {
     conn: Mutex<Connection>,
-    /// The NAS mount path (e.g., /Volumes/test1) for resolving filesystem reads.
     nas_root: PathBuf,
+    cache_limit: u64,
+    /// Paths pending eviction — consumed by getChanges response.
+    pending_evictions: Mutex<Vec<String>>,
 }
 
 impl MacosCache {
     /// Open or create the cache DB for a domain.
-    /// DB lives at ~/.local/share/ufb/cache/{domain}.db
-    pub fn open(domain: &str, nas_root: PathBuf) -> Result<Self, String> {
+    pub fn open(domain: &str, nas_root: PathBuf, cache_limit: u64) -> Result<Self, String> {
         let cache_dir = if let Some(home) = std::env::var_os("HOME") {
             PathBuf::from(home).join(".local/share/ufb/cache")
         } else {
@@ -41,6 +42,7 @@ impl MacosCache {
             PRAGMA synchronous=NORMAL;
         ").map_err(|e| format!("Failed to set pragmas: {}", e))?;
 
+        // Create tables (without hydration columns — migration adds them)
         conn.execute_batch("
             CREATE TABLE IF NOT EXISTS known_files (
                 path TEXT PRIMARY KEY,
@@ -62,9 +64,29 @@ impl MacosCache {
             );
         ").map_err(|e| format!("Failed to create schema: {}", e))?;
 
+        // Migrate: add hydration columns if missing
+        let has_hydrated: bool = conn.prepare("SELECT is_hydrated FROM known_files LIMIT 0")
+            .is_ok();
+        if !has_hydrated {
+            log::info!("[macos-cache] Migrating: adding hydration columns");
+            let _ = conn.execute_batch("
+                ALTER TABLE known_files ADD COLUMN is_hydrated INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE known_files ADD COLUMN hydrated_size INTEGER DEFAULT 0;
+                ALTER TABLE known_files ADD COLUMN last_accessed REAL DEFAULT 0;
+            ");
+        }
+
+        // Create indexes (after migration ensures columns exist)
+        let _ = conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
+            CREATE INDEX IF NOT EXISTS idx_accessed ON known_files(last_accessed);
+        ");
+
         Ok(Self {
             conn: Mutex::new(conn),
             nas_root,
+            cache_limit,
+            pending_evictions: Mutex::new(Vec::new()),
         })
     }
 
@@ -316,6 +338,142 @@ impl MacosCache {
             "INSERT OR REPLACE INTO known_files (path, name, is_dir, nas_size, nas_mtime, nas_created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![relative_path, entry.name, entry.is_dir as i32, entry.size, entry.modified, entry.created],
         ).ok();
+    }
+
+    // ── Hydration tracking + LRU eviction ──
+
+    /// Record that a file was downloaded (materialized). Triggers eviction check.
+    pub fn record_hydration(&self, relative_path: &str, size: u64) {
+        if size == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE known_files SET is_hydrated=1, hydrated_size=?1, last_accessed=?2 WHERE path=?3",
+            params![size as i64, now, relative_path],
+        ).ok();
+        drop(conn);
+
+        self.evict_if_over_budget();
+    }
+
+    /// Update last_accessed time (called on each file read).
+    pub fn touch(&self, relative_path: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE known_files SET last_accessed=?1 WHERE path=?2",
+            params![now, relative_path],
+        ).ok();
+    }
+
+    /// Total bytes of hydrated (locally cached) files.
+    pub fn total_cached_bytes(&self) -> u64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(hydrated_size), 0) FROM known_files WHERE is_hydrated=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as u64
+    }
+
+    /// Check if over budget and compute eviction candidates.
+    fn evict_if_over_budget(&self) {
+        if self.cache_limit == 0 {
+            return;
+        }
+
+        let total = self.total_cached_bytes();
+        if total <= self.cache_limit {
+            return;
+        }
+
+        let target = (self.cache_limit as f64 * EVICTION_TARGET_PERCENT) as u64;
+        let mut remaining = total;
+
+        // Get LRU candidates (hydrated files, oldest accessed first)
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, hydrated_size FROM known_files WHERE is_hydrated=1 AND is_dir=0 ORDER BY last_accessed ASC"
+        ).unwrap();
+        let victims: Vec<(String, i64)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        let mut evict_paths = Vec::new();
+        for (path, size) in &victims {
+            if remaining <= target {
+                break;
+            }
+            evict_paths.push(path.clone());
+            // Mark as not hydrated in DB
+            conn.execute(
+                "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path=?1",
+                params![path],
+            ).ok();
+            remaining -= *size as u64;
+        }
+        drop(conn);
+
+        if !evict_paths.is_empty() {
+            let evicted_bytes = total - remaining;
+            log::info!(
+                "[macos-cache] Eviction: {} files ({:.1} MB) — cache {:.1}/{:.1} MB",
+                evict_paths.len(),
+                evicted_bytes as f64 / 1_048_576.0,
+                remaining as f64 / 1_048_576.0,
+                self.cache_limit as f64 / 1_048_576.0,
+            );
+            self.pending_evictions.lock().unwrap().extend(evict_paths);
+        }
+    }
+
+    /// Mark ALL hydrated files for eviction. Used by "Clear Cache" button.
+    pub fn clear_all_hydrated(&self) -> (u32, u64) {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, hydrated_size FROM known_files WHERE is_hydrated=1 AND is_dir=0"
+        ).unwrap();
+        let files: Vec<(String, i64)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).unwrap().filter_map(|r| r.ok()).collect();
+        drop(stmt);
+
+        let mut count = 0u32;
+        let mut bytes = 0u64;
+        let mut evict_paths = Vec::new();
+
+        for (path, size) in &files {
+            conn.execute(
+                "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path=?1",
+                params![path],
+            ).ok();
+            evict_paths.push(path.clone());
+            count += 1;
+            bytes += *size as u64;
+        }
+        drop(conn);
+
+        if !evict_paths.is_empty() {
+            log::info!("[macos-cache] Clear cache: {} files, {:.1} MB", count, bytes as f64 / 1_048_576.0);
+            self.pending_evictions.lock().unwrap().extend(evict_paths);
+        }
+
+        (count, bytes)
+    }
+
+    /// Drain pending eviction candidates (consumed by getChanges response).
+    pub fn drain_pending_evictions(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_evictions.lock().unwrap())
     }
 
     /// Get the NAS folder mtime for a relative path.

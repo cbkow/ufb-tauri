@@ -46,6 +46,40 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             object: nil,
             suspensionBehavior: .deliverImmediately
         )
+
+        // Listen for "clear cache" — evict all materialized files
+        let clearName = "com.unionfiles.ufb.clear-cache.\(domainId)"
+        NSLog("[FileProvider] Registering for clear-cache: \(clearName)")
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(clearCacheRequested(_:)),
+            name: NSNotification.Name(clearName),
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
+    }
+
+    @objc private func clearCacheRequested(_ notification: Notification) {
+        NSLog("[FileProvider] Clear cache requested for \(domainId)")
+        guard let manager = NSFileProviderManager(for: domain) else { return }
+
+        // Get all items via a fresh listing and evict each one
+        do {
+            let entries = try AgentFileOpsClient.shared.listDir(domain: domainId, relativePath: "")
+            var evictCount = 0
+            for entry in entries where !entry.isDir {
+                let identifier = NSFileProviderItemIdentifier(rawValue: entry.name)
+                manager.evictItem(identifier: identifier) { error in
+                    if let error = error {
+                        NSLog("[FileProvider] evict error: \(error.localizedDescription)")
+                    }
+                }
+                evictCount += 1
+            }
+            NSLog("[FileProvider] Evicting \(evictCount) files for \(domainId)")
+        } catch {
+            NSLog("[FileProvider] Clear cache listing failed: \(error.localizedDescription)")
+        }
     }
 
     @objc private func nasDidChange(_ notification: Notification) {
@@ -112,7 +146,8 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         NSLog("[FileProvider] enumerator(for: \(containerItemIdentifier.rawValue))")
         return FileProviderEnumerator(
             enumeratedItemIdentifier: containerItemIdentifier,
-            domainId: domainId
+            domainId: domainId,
+            domain: domain
         )
     }
 
