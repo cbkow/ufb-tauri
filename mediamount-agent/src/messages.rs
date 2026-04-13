@@ -9,6 +9,22 @@ pub enum AgentToUfb {
     Ack(AckMsg),
     Error(ErrorMsg),
     Pong,
+    ConflictDetected(ConflictDetectedMsg),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetectedMsg {
+    /// Domain or share name where the conflict occurred.
+    pub domain: String,
+    /// Path the user was writing to (canonical relative path inside the share).
+    pub original_path: String,
+    /// Path where the conflicting write was preserved (sidecar file name).
+    pub conflict_path: String,
+    /// Hostname of this machine — included in the sidecar name for traceability.
+    pub host: String,
+    /// Unix epoch seconds when the conflict was detected.
+    pub detected_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +71,21 @@ pub enum UfbToAgent {
     GetStates,
     Ping,
     Quit,
+    /// Tell the agent that something user-facing happened (window focus,
+    /// refresh button, tab switch). Agent routes the signal to the platform's
+    /// freshness mechanism — Darwin notification on macOS (extension picks it
+    /// up and signals .workingSet), watcher hint on Windows.
+    FreshnessSweep(FreshnessSweepMsg),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshnessSweepMsg {
+    /// Optional domain / share name to scope the sweep. `None` = all enabled mounts.
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub command_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

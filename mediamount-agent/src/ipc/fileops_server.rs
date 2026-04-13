@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[cfg(target_os = "macos")]
 use crate::sync::MacosCache;
@@ -33,21 +34,23 @@ fn temp_dir() -> PathBuf {
 struct ServerState {
     /// Per-domain cache databases.
     caches: std::sync::RwLock<HashMap<String, MacosCache>>,
+    /// Channel back to UFB for out-of-band events (conflict notifications, etc.).
+    ipc_tx: mpsc::Sender<AgentToUfb>,
 }
 
 /// File operations IPC server for the FileProvider extension.
 pub struct FileOpsServer;
 
 impl FileOpsServer {
-    pub fn start() {
+    pub fn start(ipc_tx: mpsc::Sender<AgentToUfb>) {
         tokio::spawn(async move {
-            if let Err(e) = Self::run().await {
+            if let Err(e) = Self::run(ipc_tx).await {
                 log::error!("[FileOps] Server failed: {}", e);
             }
         });
     }
 
-    async fn run() -> Result<(), String> {
+    async fn run(ipc_tx: mpsc::Sender<AgentToUfb>) -> Result<(), String> {
         let sock_path = socket_path();
         let container = app_group_container();
 
@@ -90,7 +93,10 @@ impl FileOpsServer {
             }
         }
 
-        let state = Arc::new(ServerState { caches: std::sync::RwLock::new(caches) });
+        let state = Arc::new(ServerState {
+            caches: std::sync::RwLock::new(caches),
+            ipc_tx,
+        });
 
         loop {
             let (stream, _addr) = match tokio::task::spawn_blocking({
@@ -157,7 +163,7 @@ fn handle_request(req: FileOpsRequest, state: &ServerState) -> FileOpsResponse {
     match req {
         FileOpsRequest::Ping => FileOpsResponse::Pong,
         FileOpsRequest::ListDir(r) => handle_list_dir(r, state),
-        FileOpsRequest::Stat(r) => handle_stat(r),
+        FileOpsRequest::Stat(r) => handle_stat(r, state),
         FileOpsRequest::ReadFile(r) => handle_read_file(r, state),
         FileOpsRequest::WriteFile(r) => handle_write_file(r, state),
         FileOpsRequest::DeleteItem(r) => handle_delete_item(r, state),
@@ -317,7 +323,7 @@ fn handle_list_dir(req: ListDirReq, state: &ServerState) -> FileOpsResponse {
     })
 }
 
-fn handle_stat(req: StatReq) -> FileOpsResponse {
+fn handle_stat(req: StatReq, state: &ServerState) -> FileOpsResponse {
     let file_path = match resolve_path(&req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
@@ -341,18 +347,50 @@ fn handle_stat(req: StatReq) -> FileOpsResponse {
     let name = file_path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
+    let nas_size = meta.len();
+    let nas_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let nas_created = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    // Opportunistic freshness for file stats (directories don't drift content).
+    // `item(for:)` on the Swift side routes here; updating the cache DB on drift
+    // ensures the next enumeration vends a fresh contentVersion.
+    if !meta.is_dir() {
+        ensure_cache(state, &req.domain);
+        if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
+            match cache.compare_nas_metadata(&req.relative_path, nas_size, nas_mtime) {
+                Some(true) => {
+                    log::info!(
+                        "[FileOps] Stat drift {}: nas=({}, {:.3}) — updating cache + queueing evict",
+                        req.relative_path, nas_size, nas_mtime
+                    );
+                    cache.update_nas_metadata(&req.relative_path, nas_size, nas_mtime);
+                    cache.queue_eviction_if_hydrated(&req.relative_path);
+                }
+                Some(false) => {
+                    cache.record_verification(&req.relative_path);
+                }
+                None => {}
+            }
+        }
+    }
 
     FileOpsResponse::FileStat(FileStatResp {
         request_id: req.request_id,
         name,
         is_dir: meta.is_dir(),
-        size: meta.len(),
-        modified: meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0),
-        created: meta.created().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        size: nas_size,
+        modified: nas_mtime,
+        created: nas_created,
     })
 }
 
@@ -384,6 +422,35 @@ fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
         });
     }
 
+    // Opportunistic freshness: compare the just-stat'd NAS metadata against
+    // our cache. On drift, update DB so future enumerations vend a fresh
+    // `NSFileProviderItemVersion` (which the Swift extension derives from
+    // {mtime, size} — see FileProviderItem.swift).
+    let nas_size = meta.len();
+    let nas_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    ensure_cache(state, &req.domain);
+    if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
+        match cache.compare_nas_metadata(&req.relative_path, nas_size, nas_mtime) {
+            Some(true) => {
+                log::info!(
+                    "[FileOps] Stat-on-read drift {}: nas=({}, {:.3}) — updating cache",
+                    req.relative_path, nas_size, nas_mtime
+                );
+                cache.update_nas_metadata(&req.relative_path, nas_size, nas_mtime);
+            }
+            Some(false) => {
+                cache.record_verification(&req.relative_path);
+            }
+            // Not tracked yet — record_hydration below creates the row.
+            None => {}
+        }
+    }
+
     let temp = temp_dir();
     let temp_name = format!(
         "{}-{:x}.tmp",
@@ -395,7 +462,7 @@ fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
     );
     let temp_path = temp.join(&temp_name);
 
-    log::info!("[FileOps] ReadFile: {} → {} ({} bytes)", source_path.display(), temp_path.display(), meta.len());
+    log::info!("[FileOps] ReadFile: {} → {} ({} bytes)", source_path.display(), temp_path.display(), nas_size);
 
     if let Err(e) = std::fs::copy(&source_path, &temp_path) {
         return FileOpsResponse::Error(FileOpsErrorResp {
@@ -404,18 +471,16 @@ fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
         });
     }
 
-    // Record hydration for cache eviction tracking
-    ensure_cache(state, &req.domain); if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
-        cache.record_hydration(&req.relative_path, meta.len());
+    // Record hydration for cache eviction tracking.
+    if let Some(cache) = state.caches.read().unwrap().get(&req.domain) {
+        cache.record_hydration(&req.relative_path, nas_size);
     }
 
     FileOpsResponse::FileReady(FileReadyResp {
         request_id: req.request_id,
         temp_path: temp_path.to_string_lossy().to_string(),
-        size: meta.len(),
-        modified: meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        size: nas_size,
+        modified: nas_mtime,
     })
 }
 
@@ -443,12 +508,62 @@ fn handle_write_file(req: WriteFileReq, state: &ServerState) -> FileOpsResponse 
         if let Some(parent) = dest_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+
+        // Conflict detection: capture pre-write NAS state. If the destination
+        // changes during our upload (concurrent writer), divert our write to a
+        // sidecar so we don't silently overwrite their changes.
+        let pre_stat: Option<(u64, std::time::SystemTime)> = std::fs::metadata(&dest_path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
+
         if let Err(e) = std::fs::copy(&req.source_path, &dest_path) {
             return FileOpsResponse::Error(FileOpsErrorResp {
                 request_id: req.request_id,
                 message: format!("Failed to write file: {}", e),
             });
         }
+
+        // Post-copy: did anyone else touch the destination between our pre-stat
+        // and the start of our copy? Compare pre-stat to the same fields read
+        // back from the source-of-truth NAS file *before* our copy completed.
+        // We can't observe that gap directly, so we use the next-best signal:
+        // the destination's mtime now should be ≈ our write time. If the NAS
+        // mtime jumped in a way inconsistent with a single writer (large delta
+        // between pre and post), assume a concurrent writer landed in between.
+        if let Some((pre_size, pre_mtime)) = pre_stat {
+            if let Ok(post_meta) = std::fs::metadata(&dest_path) {
+                let post_mtime = post_meta.modified().ok();
+                let mtime_jumped = match post_mtime {
+                    Some(post) => post
+                        .duration_since(pre_mtime)
+                        .map(|d| d.as_secs() > 2) // Synology mtime granularity tolerance
+                        .unwrap_or(false),
+                    None => false,
+                };
+                let size_changed_unexpectedly = pre_size != post_meta.len()
+                    && post_meta.len() == std::fs::metadata(&req.source_path)
+                        .map(|m| m.len())
+                        .unwrap_or(post_meta.len());
+
+                // Only flag if the post-stat doesn't look like our own write.
+                // If our copy was the only thing that landed, this branch is benign.
+                if mtime_jumped && size_changed_unexpectedly {
+                    let conflict_path = make_conflict_path(&dest_path);
+                    log::warn!(
+                        "[FileOps] Conflict detected on write to {}: rename → {}",
+                        dest_path.display(),
+                        conflict_path.display()
+                    );
+                    // Move our just-written file aside.
+                    if let Err(e) = std::fs::rename(&dest_path, &conflict_path) {
+                        log::error!("[FileOps] Failed to rename to conflict path: {}", e);
+                    } else {
+                        emit_conflict_event(state, &req.domain, &req.relative_path, &conflict_path);
+                    }
+                }
+            }
+        }
+
         let _ = std::fs::remove_file(&req.source_path);
     }
 
@@ -480,6 +595,98 @@ fn handle_write_file(req: WriteFileReq, state: &ServerState) -> FileOpsResponse 
         size,
         modified,
     })
+}
+
+/// Construct the conflict sidecar path for a write that collided with a
+/// concurrent NAS edit: `{base}.conflict-{host}-{YYYYMMDD-HHMMSS}.{ext}`.
+fn make_conflict_path(dest_path: &Path) -> PathBuf {
+    let stem = dest_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let ext = dest_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let host = hostname_short();
+    let ts = format_timestamp_compact();
+    let name = format!("{}.conflict-{}-{}{}", stem, host, ts, ext);
+    dest_path.with_file_name(name)
+}
+
+fn hostname_short() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".into())
+        })
+        .split('.')
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn format_timestamp_compact() -> String {
+    // YYYYMMDD-HHMMSS in UTC, formatted manually to avoid pulling in chrono.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = epoch_to_ymdhms(secs);
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, mo, d, h, mi, s)
+}
+
+/// Convert a unix timestamp to civil date components (UTC).
+/// Uses Howard Hinnant's days_from_civil algorithm.
+fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let h = (sod / 3_600) as u32;
+    let mi = ((sod % 3_600) / 60) as u32;
+    let s = (sod % 60) as u32;
+
+    // 1970-01-01 is day 0. Shift so day 0 == 0000-03-01 (era basis).
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y_civil = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = (y_civil + if mo <= 2 { 1 } else { 0 }) as u32;
+    (y, mo, d, h, mi, s)
+}
+
+fn emit_conflict_event(
+    state: &ServerState,
+    domain: &str,
+    original_path: &str,
+    conflict_path: &Path,
+) {
+    let conflict_name = conflict_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let detected_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let msg = AgentToUfb::ConflictDetected(ConflictDetectedMsg {
+        domain: domain.to_string(),
+        original_path: original_path.to_string(),
+        conflict_path: conflict_name,
+        host: hostname_short(),
+        detected_at,
+    });
+    // Best-effort send — UFB might not be listening (agent-only run).
+    let _ = state.ipc_tx.try_send(msg);
 }
 
 fn handle_delete_item(req: DeleteItemReq, state: &ServerState) -> FileOpsResponse {

@@ -2206,3 +2206,643 @@ not `ping`.
 0.3.1 → 0.3.2 in `package.json`, `src-tauri/Cargo.toml`,
 `mediamount-agent/Cargo.toml`, `src-tauri/tauri.conf.json`,
 `installer/ufb_tauri_installer.iss`.
+
+---
+
+## 2026-04-13 — Architecture review: LucidLink-for-SMB at scale
+
+Review of the mount sync layer against the stated goal: local cache for very large,
+deep SMB shares (millions of files) with multi-user concurrent writes. LucidLink-like
+UX but backed by SMB, which means no server-push invalidation and no strong
+consistency guarantees.
+
+Concerns ordered by impact. Correctness + hard-to-retrofit items first.
+
+### 1. Change detection at scale
+
+**Problem:** FSEvents + 30s poll fallback (macOS, `macos_watcher.rs:85-117`) and CF
+callbacks (Windows) work for single-user / single-machine. At millions of files
+with multiple machines writing to the same share, polling or watching mount roots
+does not scale, and neither platform has a way to learn about a peer machine's
+writes without re-statting.
+
+**Direction:**
+- Use the existing mesh sync as a cache-invalidation bus. When machine A writes
+  `/foo/bar.mov`, publish "bar.mov stale" to peers; receivers mark cached entry
+  dirty and re-stat on next open.
+- Treat local cache as advisory regardless of push: on file open, stat the NAS
+  and compare mtime/size before serving cached bytes. A single stat is cheap;
+  a stale hydrated file is a correctness bug.
+
+### 2. Conflict handling absent
+
+**Problem:** No conflict detection on write. Multi-user SMB will produce concurrent
+writes; current behaviour is silent last-write-wins via the write-through pipeline
+on Windows and extension-dependent on macOS. Data loss is the failure mode.
+
+**Direction:**
+- On write, compare the pre-open NAS mtime with current NAS mtime. If changed
+  under us, rename local edit to `{name}.conflict-{host}-{ts}.ext` and surface
+  to the user.
+- Minimum viable — doesn't solve the general case but prevents silent loss.
+
+### 3. Strict LRU is wrong for project workflows
+
+**Problem:** Project access is bursty — open a job, hit 10K files once, cold for
+weeks. Windows eviction at 80% of limit (`cache.rs:323-387`) and macOS equivalent
+(`macos_cache.rs`) will evict the working project mid-render because last-access
+is 20 minutes old. Only protection today is open-handle refcount.
+
+**Direction:**
+- First-class pinning tied to subscriptions. The subscription system already
+  defines the user's working set — lean on it: subscribed job paths should not
+  be evicted under pressure.
+- Tiered scoring: pinned > subscribed > recent > cold. Only evict cold until
+  pressure clears; never evict pinned.
+
+### 4. No per-file progress surfaced
+
+**Problem:** `MountStateUpdateMsg` (`mount_client.rs:26-34`) is mount-level only.
+At scale users will ask "is this 300GB file done pulling" constantly. Retrofit
+requires plumbing through agent IPC — cheap now, painful later.
+
+**Direction:** Add a per-file status/progress channel from agent to frontend.
+Scope: active hydrations, active evictions, queued NAS writes.
+
+### 5. Spotlight/Finder/Explorer indexer storms
+
+**Problem:** Deep hierarchies with millions of files invite Spotlight, Finder,
+Explorer, antivirus, backup software. All of these will enumerate and stat
+aggressively, triggering hydration we don't want.
+
+**Direction:**
+- Explicit Spotlight exclusion on macOS sync roots (via `mdutil` or
+  `.metadata_never_index` sentinel file).
+- Windows: evaluate attrib hints (`FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`) and CF
+  flags that discourage indexer participation.
+
+### 6. Cache DB lifecycle
+
+**Problem:** Millions of rows in SQLite is fine but needs planning. Current
+schemas (Windows `cache.rs:78-103`, macOS `macos_cache.rs:47-76`) need:
+- Indexes verified for hot query paths (path lookup, LRU scan, folder enum).
+- WAL checkpoint strategy.
+- Vacuum strategy.
+- Agent restart should not require re-walking the NAS — cache must be durable
+  and trustworthy across restarts.
+
+**Direction:** Audit schemas + query plans before first million-file load.
+
+### 7. FileProvider `workingSet` at scale
+
+**Problem:** Apple's FileProvider has undocumented soft limits on domain size
+and eviction behaviour. Our memory already notes `.workingSet` must be
+maintained carefully; at 100K+ items per domain that maintenance cost is the
+unknown.
+
+**Direction:** Stress-test macOS with realistic item counts (100K, 500K, 1M)
+in one domain before committing to the architecture for large shares.
+
+### 8. Cross-root copy/move hydrates fully
+
+**Problem:** `sync_aware.rs:51-121` handles only same-root move (`fs::rename`)
+and Windows-only sync_copy (placeholder creation). Delete, rename, and
+cross-root move fall through to `fs_extra`, which hydrates.
+
+**Direction:** Extend sync-aware to cover delete and cross-root placeholder
+creation. Predictable perf cliff otherwise.
+
+### Not architectural concerns but flagged
+
+- **Mesh sync gaps** (separate from mount sync): follower can't pull snapshot
+  on demand, no drift detection. Noted for later — see mesh sync discussion
+  from 2026-04-13.
+- **Edit queue persistence** on mesh side: in-memory only, lost on restart.
+  Already known.
+
+### Plan
+
+Tackle 1 → 8 in order unless symptom-driven edge-case hunting points elsewhere.
+Concerns 1–3 are correctness issues that drive data loss or broken UX and
+are structurally hard to retrofit. 4–8 are fixable without architectural
+change but cheaper if addressed early.
+
+---
+
+## 2026-04-13 — Reframe: manifest layer is the missing primitive
+
+Follow-on discussion after item 1 surfaced a deeper issue. We were treating
+cache invalidation as the primitive problem; it isn't — it's a symptom.
+
+### The observation
+
+The original plan (`nas-sync-plan.md`) explicitly said: "no local database, no
+sync, no reconciliation, no staleness model." Every operation a pass-through
+to SMB. Elegant in principle, but in practice we kept reaching for ad-hoc
+mechanisms to fill the gap:
+
+- Mesh invalidation broadcasts (only works for online UFB peers)
+- FSEvents on the SMB mount (demonstrably unreliable on macOS → 30s poll fallback)
+- Stat-on-open (cheap but only answers "is this file I already have stale")
+- CHANGE_NOTIFY watches (scoped to currently-browsed folders only)
+
+None of these tell us what actually exists on the NAS. They all answer
+narrower questions. Without a persistent local index, questions like:
+
+- What files are in my subscribed tree that I haven't seen?
+- What was deleted upstream that I still have cached?
+- Which files in my working set are cold vs never-indexed?
+- Is this directory listing complete?
+
+...have no source of truth on this machine. We can only ask the NAS, every
+time, uncached — which defeats the local-cache premise.
+
+### What's missing
+
+A **per-subscription manifest**: persistent local SQLite index of NAS state
+for subscribed subtrees. This is how Synology Drive, Dropbox, and OneDrive
+all work internally. It is NOT sync — NAS remains source of truth — it's
+"this machine's best-known picture of the NAS."
+
+Current code already has half of it: `cache.rs::known_files` tracks what
+we've touched locally. Promoting that to an authoritative manifest (covering
+everything in the subscribed tree, not just what's been opened) is the
+foundation step that makes everything else cheap.
+
+### What the manifest reshapes
+
+- **Stat-on-open (Tier A)** becomes stat-against-manifest, with the manifest
+  refreshed via CHANGE_NOTIFY + reconcile. Still a correctness net, but the
+  expensive path is rare.
+- **CHANGE_NOTIFY (Tier B)** stops being a cache-invalidation signal and
+  becomes a manifest-update signal. Cache invalidation falls out for free.
+- **Mesh (Tier C)** stops being "invalidate this file" and becomes "here's
+  my manifest delta." Peers can bootstrap from each other's manifests instead
+  of rescanning the NAS — a new machine joining a farm pulls a peer's
+  manifest, then stat-verifies. Huge win on initial subscribe.
+- **Pinning + tiered eviction (concern #3)** becomes trivial queries:
+  "list all files belonging to subscription X, sorted by access tier."
+- **Progress reporting (concern #4)** gets real semantics: "subscription X
+  manifest scan: 420K / 1.2M files indexed, 60GB / 180GB hydrated."
+- **Cache DB audit (concern #6)** merges with manifest schema design.
+
+### Cost
+
+Initial full scan of a subscribed tree over SMB is the honest cost — hours
+for millions of files, one-time per subscription. Mitigations:
+
+- Only eager-index subscribed/pinned subtrees. Unsubscribed areas stay
+  lazy like today (on-demand via CHANGE_NOTIFY when visited).
+- Background walker, surfaces progress as a first-class subscription state.
+- Steady-state cost is cheap: CHANGE_NOTIFY watches on subscribed subtrees
+  plus a periodic full reconcile (daily? weekly?).
+- Mesh peers share manifests → second machine skips most of the scan.
+
+### What this does NOT introduce
+
+This is not a reconcile/sync model. We are not introducing conflict
+resolution at the manifest layer. NAS remains the only writer-of-record;
+the manifest is read-only-of-NAS from this machine's perspective. Writes
+still go straight through to the NAS as before. Conflict detection on
+write (concern #2) remains a separate problem.
+
+### Revised concern priority
+
+Original concerns 1, 3, 4, and 6 all collapse into the manifest work.
+Remaining list:
+
+1. **Design manifest layer** — schema, scan strategy, CHANGE_NOTIFY wiring,
+   reconciliation, peer sharing via mesh. Cross-platform (Windows + macOS).
+2. **Implement manifest** — background scan, incremental updates, peer
+   bootstrap.
+3. **Tier A/B/C invalidation on top of manifest** — small plumbing once
+   manifest exists.
+4. **Pinning + tiered eviction via manifest queries** (was #3).
+5. **Per-subscription + per-file progress reporting** (was #4).
+6. **Conflict detection on write** (was #2, unchanged, independent).
+7. **Indexer exclusion** (was #5, unchanged, independent).
+8. **Cross-root sync-aware ops** (was #8, unchanged, independent).
+9. **FileProvider workingSet stress test** (was #7, unchanged, independent).
+
+Cache DB audit (old #6) merges into #1/#2 of the new list.
+
+Next step: design the manifest layer before writing any code.
+
+---
+
+## 2026-04-13 — Sync Server role separation
+
+Follow-on after the manifest reframe. The initial proposal was to put the
+manifest behind the mesh leader role — leader owns it, followers pull deltas.
+Discussion surfaced why that conflates two different kinds of state.
+
+### The problem with leader-owned manifest
+
+Mesh leader election today is designed for small, fast-changing state:
+subscriptions, column defs, metadata edits. The heartbeat cadence (3s) and
+failover timeout (15s) work because the state is tiny and snapshot-to-NAS is
+a kilobyte-scale operation every 30s.
+
+None of that holds for a million-file manifest:
+
+- Snapshotting a multi-GB SQLite every 30s would saturate the NAS and corrupt
+  under concurrent SMB writes
+- Automatic failover on a WiFi blip means either rebuilding the manifest from
+  scratch on the new leader (hours) or syncing a large DB mid-crisis
+- Election sort (`leader` tag → `noleader` tag → alphabetical node_id) has no
+  relationship to "which machine should actually host the index" — the best
+  index host is usually the always-on workstation with good NAS access, not
+  whoever sorts first
+
+This is the same reason database primaries, DNS primaries, and Synology HA
+pairs use deliberate failover instead of auto-election: the cost of a bad
+swap dwarfs the cost of manual designation.
+
+### Two orthogonal roles
+
+Keep mesh leader as-is. Add a separate **Sync Server** role:
+
+| | Mesh Leader | Sync Server |
+|---|---|---|
+| Assignment | Elected (heartbeat, tags, node_id sort) | Designated by admin in settings |
+| State owned | Subscriptions, columns, metadata edits | Per-subscription manifest (file index) |
+| State size | Kilobytes | Gigabytes possible |
+| Storage | Snapshotted to shared NAS every 30s | Local disk on Sync Server; optional nightly cold-restore export |
+| Failover | Automatic on heartbeat loss | Manual, deliberate; admin promotes another node |
+| Graceful transfer | N/A (stateless re-election) | Pause writes → stream DB → new node takes CHANGE_NOTIFY watches → old demotes |
+| Multiple per farm | One | One (validated at promote time) |
+
+Sync Server and Mesh Leader can be the same machine (usually will be). They
+don't have to be. They are separate concerns with separate failure models.
+
+### What the Sync Server does
+
+- Runs the SMB crawl on subscribe for subscribed subtrees
+- Maintains CHANGE_NOTIFY watches on subscribed subtrees
+- Owns the manifest SQLite (local disk)
+- Mints a monotonic revision counter per subscription
+- Serves `GET /api/manifest/*` delta endpoints to follower clients
+- Accepts write notifications from followers ("I just wrote `/foo/bar.mov`, please re-stat") to keep manifest current across the farm
+
+### What clients (followers) do
+
+- Pull initial manifest from Sync Server when subscribing (fast, LAN)
+- Poll or subscribe to deltas thereafter ("give me changes since rev N for
+  subscription X")
+- Use manifest as their authoritative view of NAS state
+- Fall back to stat-on-open when manifest is stale or Sync Server unreachable
+  (correctness floor)
+- On direct write, notify Sync Server to refresh that path
+
+### Failure modes
+
+| Scenario | Behavior |
+|---|---|
+| Sync Server briefly offline | Clients serve cached manifest; stat-on-open catches drift; resume delta pulls on reconnect |
+| Sync Server hard dies | Admin promotes another node → re-crawl (hours reduced sync speed, not broken) |
+| Planned transfer | Graceful stream + cutover, minutes, visible UI state |
+| New farm member, no Sync Server yet | Falls back to client-side crawl of subscribed subtree (degraded, matches old plan) |
+| Sync Server configured but app not running on that node | UI flags "Sync Server unavailable," clients fall back to stat-on-open, admin can start app or reassign |
+| Split brain (network partition) | Both sides serve their cached manifests; on heal, accept latest revision per path (manifest is read-only-of-NAS, not a source of writes) |
+| Two nodes accidentally promoted | Validate at promote time: refuse if another active Sync Server is visible in farm; require explicit demote-first |
+
+### Why this solves the prior concerns
+
+- Only one machine crawls the NAS → N×millions-of-files collapses to 1×millions
+- Single CHANGE_NOTIFY watcher per subscription → macOS FSEvents flakiness is
+  centralized, not N-ways reproduced
+- Fast onboarding → new farm member pulls manifest over LAN, doesn't crawl SMB
+- No NAS-side agent → stays SMB-agnostic (any NAS, not just Synology)
+- Index-to-index delta sync (Dropbox-style) becomes structurally possible on
+  top of revision-less SMB, because the Sync Server mints its own revisions
+
+### Revised concern priority
+
+1. **Design Sync Server role** — designation/config storage, discovery, promote/demote, offline behavior, separation from mesh leader
+2. **Design manifest schema + delta protocol** — what Sync Server serves, how clients consume, client cache layer
+3. **Implement** — crawler, watches, HTTP endpoints, client pull, failover UX
+4. **Tier A/B/C invalidation** — Tier A stat-on-open against manifest (correctness floor), Tier B CHANGE_NOTIFY updates manifest, Tier C delta pulls
+5. **Pinning + tiered eviction** (unchanged, via manifest queries)
+6. **Per-subscription + per-file progress** (unchanged)
+7. **Conflict detection on write** (unchanged, independent)
+8. **Indexer exclusion** (unchanged, independent)
+9. **Cross-root sync-aware ops** (unchanged, independent)
+10. **FileProvider workingSet stress test** (unchanged, independent)
+
+Next step: enter plan mode and design the Sync Server + manifest together.
+They are co-dependent — neither is designable without the other.
+
+---
+
+## 2026-04-13 — Gut check reversal: v1 is organic + smart, manifest deferred
+
+Before committing to the Sync Server + manifest design, a gut check: what do
+we actually get that organic SMB discovery + stat-on-open doesn't already
+give us?
+
+### What organic + targeted fixes covers
+
+Browse-as-you-go + stat-on-open + CHANGE_NOTIFY on visited folders handles:
+
+- **Correctness of cached reads** → stat-on-open catches stale, regardless of
+  writer (UFB peer, non-UFB user, NAS admin, automated tool)
+- **Live updates for folders the user is actively looking at** →
+  CHANGE_NOTIFY already works on Windows, adequate on macOS
+- **Subscription-aware eviction** → "is this path under a subscription?" is a
+  cheap prefix check at eviction time; no index needed
+- **Subscription-based prefetch** (if we want it later) → opportunistic stat
+  and hydrate on subscribe without a full index
+- **Lazy growth** → cache DB only tracks files touched; no million-row crawl
+
+### What manifest uniquely provides
+
+1. Knowledge of files in unvisited folders — do users ask this? Not in
+   editorial workflows.
+2. Fast local search across a whole subscription — nice, not critical; OS
+   tools handle discovery.
+3. Accurate file-count progress — polish, not correctness.
+4. Farm-wide consistent view — stat-on-open gives correctness; consistency
+   is optics.
+5. Peer bootstrap speed — real, but rare event.
+6. Foundation for prefetch / offline browse — features we haven't asked for.
+
+### The honest read
+
+Manifest is a lot of infrastructure (Sync Server role, designation,
+promote/demote, crawler, delta pulls, replicas, graceful transfer, failover)
+for benefits that — for UFB's editorial use case today — are mostly polish,
+not correctness.
+
+The concerns that actually hurt (stale cache, project evicted mid-render,
+silent data loss on concurrent writes) can be closed with three surgical
+additions:
+
+1. **Stat-on-open correctness floor** — local cache advisory, NAS authority
+2. **Subscription-aware eviction** — protect subscribed paths, evict
+   unsubscribed first
+3. **Conflict detection on write** — pre/post stat comparison, conflict
+   sidecar on mismatch
+
+That's shippable, testable, and fixes the real edge cases without a new
+infrastructure role.
+
+### Decision
+
+**v1 = Organic + Smart.** Three items above. Ship and evaluate.
+
+**Manifest + Sync Server = on the shelf.** Full design captured above for
+when/if real product needs (fast search across subscriptions, offline
+browse, prefetch, frequent new-member bootstrapping) make the cost/benefit
+flip.
+
+### v1 scope (tasked)
+
+1. Stat-on-open correctness floor — agent-level, hooks read paths on Windows
+   (CF filter) and macOS (FileProvider ReadFile). New `last_verified_at`
+   column with short TTL to avoid stat-storms on bursty opens.
+2. Subscription-aware eviction — new IPC `UpdateSubscriptions` pushes
+   canonical subscription paths from src-tauri to agent; eviction tiers
+   unsubscribed (free first) → subscribed cold (free if needed) → open
+   handles (protected, existing).
+3. Conflict detection on write — pre-open stat captures mtime; post-write
+   stat compares; on mismatch write to `{name}.conflict-{host}-{ts}.ext`
+   sidecar and emit Tauri event.
+
+Independent concerns (#5 indexer exclusion, #7 FileProvider stress test,
+#8 cross-root sync-aware ops) remain open and can run in parallel or after
+v1 in any order.
+
+Plan captured at `~/.claude/plans/abundant-churning-wadler.md`.
+
+---
+
+## 2026-04-13 — Freshness deep-dive: contentVersion loophole + signal layering
+
+The "organic + smart" plan was partially implemented (cache schema + helpers +
+Windows `opened` hook + macOS stat-on-read), then reverted to re-examine the
+macOS FileProvider cache-hit problem. That problem kept pulling the design
+toward heavier infrastructure (manifest / Sync Server / mesh changelog); the
+reason it felt heavy was that we were designing around a gap that turned out
+to have a proper API-level answer we hadn't fully understood.
+
+### Research findings that reframed the problem
+
+Three parallel investigations:
+
+1. **Apple FileProvider freshness APIs** — `NSFileProviderItemVersion.contentVersion`
+   is Apple's ETag. When the extension vends a different contentVersion for a
+   materialized item via `item(for:)` or enumeration, the OS invalidates its
+   cached local copy and calls `fetchContents` on next open. This is the hook
+   we thought didn't exist. `evictItem` is available as a harder lever; the
+   `materializedItemsEnumerator` API lets us enumerate what the OS has
+   cached. Apple's metadata cache TTL is undocumented but observed to be
+   seconds-to-minutes; `signalEnumerator` invalidates it.
+
+2. **Swift extension audit** — `FileProviderItem.swift:50-51` already
+   computes contentVersion from `{mtime}:{size}` of whatever the agent's DB
+   knows. The chain works end-to-end when the agent DB is fresh. When the
+   watcher misses a change, DB goes stale, we vend stale contentVersion, the
+   OS happily serves cached bytes. **The gap is not the API; it's DB
+   freshness.** `FileProviderExtension.swift:156 fetchContents` currently
+   ignores `requestedVersion` and calls `readFile` blindly — this is the
+   natural hook to return a fresh version stamp after reading from NAS.
+
+3. **cloud-filter crate cross-platform** — Windows-only by design, not a
+   cross-platform abstraction. `objc2-file-provider` crate exists but is raw
+   FFI bindings, no higher-level wrapper. Rust-on-mac FileProvider pattern is
+   "Swift extension bundle + IPC to Rust agent" — what UFB does today. No
+   architectural mistake, no shortcut.
+
+### App-signal layer insight
+
+UFB's Tauri frontend already has the right plumbing: `src/App.tsx:88-114`
+dispatches a `ufb:refresh` event on F5, Ctrl+R, window focus (500ms
+debounced), and tab switches. Navigation bar refresh buttons, folder refresh,
+tracker refresh all exist and listen to this event. Wiring these through to a
+new `trigger_freshness_sweep` Tauri command gives us a third freshness layer
+Finder can't provide — **every UFB user action becomes a freshness signal**.
+
+Browsing in UFB's internal browser triggers `list_directory` which hits the
+FileProvider path on macOS → `handle_list_dir` in the agent → already
+enumerates NAS → gives us the signal opportunity.
+
+### Final framing: layered opportunistic freshening
+
+Three layers, no background work:
+
+1. **OS hooks** (existing): CF callbacks, FileProvider delegate methods.
+2. **Agent opportunistic freshening**: inside each OS hook, TTL-gated stat
+   against NAS, update DB on drift. Piggybacks on work already being done.
+3. **UFB app signals**: frontend events → `trigger_freshness_sweep` IPC →
+   agent issues `signalEnumerator` (mac) or ambient stat refresh (both).
+
+Plus conflict detection on write (v1.3) as the correctness floor for the
+narrow residual (rapid-repeat opens via saved paths within OS metadata-cache
+TTL with no intervening UFB or Finder contact).
+
+**Abandoned during this pass:**
+- Client-side manifest
+- Sync Server / designated node role
+- Mesh changelog / cross-node cache invalidation protocol
+- Startup / rolling / periodic sweeps
+- FUSE (LucidLink's recent retreat from it is a negative signal)
+- Symlink interposition tricks (don't work; resolved above FileProvider)
+
+**Preserved from prior pass:**
+- Agent `stat_and_refresh` primitive (implemented, then reverted; comes back)
+- Windows `opened` hook stat-on-open (implemented, reverted; comes back)
+- `refresh_placeholder` shared helper (extracted, reverted; comes back)
+- Subscription-aware eviction (v1.2, unchanged)
+- Conflict detection on write (v1.3, unchanged)
+
+### Plan file
+
+`~/.claude/plans/abundant-churning-wadler.md` — "Mount Sync Freshness —
+Layered Signaling Plan".
+
+### Build order (from plan)
+
+1. Agent `stat_and_refresh` primitive + cache schema
+2. Windows `refresh_placeholder` extraction
+3. Windows `opened` hook
+4. Windows `fetch_placeholders` drift detection
+5. macOS agent `handle_read_file` refresh + version return
+6. macOS agent `handle_list_dir` + `handle_file_stat` refresh
+7. macOS Swift `fetchContents` version passthrough
+8. macOS Swift `materializedItemsDidChange` override
+9. IPC `FreshnessSweep` + Tauri `trigger_freshness_sweep` bridge
+10. Frontend `ufb:refresh` augmentation + refresh button wiring
+11. Conflict detection on write (v1.3, parallelizable after step 5)
+
+---
+
+## 2026-04-13 — v0.3.3 macOS build, signed + notarized
+
+All 11 plan steps implemented and shipped as `Union File Browser_0.3.3_aarch64.dmg`.
+Notarization Apple ID: `ca564dcb-51f4-4d69-bcd6-8bb7ff094dd2` (Accepted, ticket
+stapled).
+
+### What landed
+
+**Cache layer (both platforms)**
+- `last_verified_at` column + idempotent migration on first launch
+- `needs_verification` / `record_verification` / `update_nas_metadata` /
+  `compare_nas_metadata` / `is_known` helpers
+- Module-level `stat_and_refresh` primitive returning `StatResult`
+  (Skipped / Fresh / Drifted / Unknown / Error) — TTL 30s
+
+**Windows (cfg-gated, NOT yet built — see Windows hints below)**
+- `sync/placeholder.rs` extracted from `sync/watcher.rs::update_placeholder`,
+  renamed `refresh_placeholder` to reflect the actual delete+recreate
+- `sync/filter.rs::opened` calls `stat_and_refresh` + `refresh_placeholder` on
+  drift (skipped if refcount > 1)
+- `sync/filter.rs::fetch_placeholders` drift-checks existing local placeholders
+  during enumeration; refreshes drifted entries instead of pushing duplicates
+- Existing `write_through/worker.rs` already does conflict detection (pre/post
+  stat compare) — emits sidecar but NOT IPC event yet (follow-up below)
+
+**macOS**
+- `ipc/fileops_server.rs::handle_read_file` — drift compare against cache,
+  updates DB on drift, response carries fresh `(size, mtime)`
+- `ipc/fileops_server.rs::handle_list_dir` — `record_enumeration` extended
+  with per-entry drift detection; drifted hydrated files queued in
+  `pending_evictions`; extension drains via `getChanges` and calls `evictItem`
+- `ipc/fileops_server.rs::handle_stat` — drift compare + `update_nas_metadata`
+  + `queue_eviction_if_hydrated` (new helper)
+- `FileProviderItem.swift:50-51` already builds contentVersion from
+  `{mtime}:{size}` — flows automatically once agent DB is fresh
+- `FileProviderExtension.swift::fetchContents` — added diagnostic log
+  comparing `requestedVersion` to freshly-vended version
+- `FileProviderExtension.swift::materializedItemsDidChange` override added —
+  triggers `signalEnumerator(.workingSet)` to drain drift detected by other hooks
+
+**IPC + Tauri command (cross-platform message types, mac-active behavior)**
+- `messages.rs` (agent) + `mount_client.rs` (src-tauri) —
+  `UfbToAgent::FreshnessSweep(FreshnessSweepMsg)`
+- `messages.rs` + `mount_client.rs` — `AgentToUfb::ConflictDetected(ConflictDetectedMsg)`
+- `mediamount-agent/src/main.rs` — `FileOpsServer::start(state_tx.clone())`
+  so handlers can emit `ConflictDetected` through the existing IPC channel
+- `mount_service.rs::handle_freshness_sweep` — fans out to all enabled
+  domains; macOS posts Darwin notification (logs only on Windows)
+- `commands.rs::trigger_freshness_sweep` — Tauri command; registered in `lib.rs`
+- `mount_client.rs` (both Win and Unix dispatch loops) — handle
+  `ConflictDetected` → emit Tauri `file:conflict` event
+
+**Frontend**
+- `App.tsx::onMount` — `ufb:refresh` listener calls `trigger_freshness_sweep`
+  (1.5s leading-edge throttle). Sweep fires from F5/Ctrl+R, focus,
+  tab-switch, all existing refresh buttons — no per-component changes needed.
+- `App.tsx::onMount` — `file:conflict` listener logs + dispatches `ufb:refresh`
+  so sidecar files appear immediately. No toast UI yet (deferred polish).
+
+**Conflict naming format** standardized across platforms:
+`{stem}.conflict-{host}-{YYYYMMDD-HHMMSS}{ext}` (UTC time, no chrono dep —
+manual `epoch_to_ymdhms` using Howard Hinnant's algorithm).
+
+### Windows-side hints (for next build session)
+
+Everything compiles cross-platform under `cargo check`. The Windows-specific
+hooks were written per the plan but never built locally — verify on Windows
+before considering complete:
+
+1. **Cache schema migration** (`sync/cache.rs`) runs automatically on agent
+   startup against existing `%LOCALAPPDATA%/ufb/cache/{mount_id}.db`. Adds
+   `last_verified_at INTEGER DEFAULT 0` column. Existing rows get default 0,
+   so first opens after upgrade will all trigger drift checks. Expected — no
+   harmful side effects, just first-touch stat NAS for every previously-known
+   file.
+
+2. **`refresh_placeholder` extraction** is pure refactor — call site in
+   `sync/watcher.rs:323` updated. If watcher's MODIFIED handling regresses,
+   that's the place to look.
+
+3. **`opened` hook** in `sync/filter.rs:355` is the new Windows freshness
+   trigger. If you see frequent `[sync] Stat-on-open drift` log lines that
+   shouldn't be drift, the TTL constant `STAT_VERIFY_TTL_SECS = 30` is the
+   knob.
+
+4. **`fetch_placeholders` drift detection** changes the ticket push semantics
+   — entries with existing-and-matching local placeholders are NOT pushed
+   anymore (CF would skip them anyway, but worth knowing). New log line shows
+   `refreshed_count` alongside `placeholders` and `skipped`.
+
+5. **`FreshnessSweep` IPC handler is a no-op on Windows** (`cfg(not(target_os = "macos"))`).
+   The frontend will still call `trigger_freshness_sweep` on every refresh —
+   the agent receives it, logs `[freshness-sweep] domains=[...]`, then does
+   nothing. This is intentional: CF's `opened` and `fetch_placeholders` hooks
+   already cover most cases. If real workloads show gaps, add a Windows-side
+   sweep that walks `known_files WHERE is_hydrated = 1` for the in-scope
+   domains and stats each.
+
+6. **Conflict detection on write** already exists in
+   `sync/write_through/worker.rs:198-237` — pre/post NAS stat compare,
+   sidecar file written. **Naming format is OLD** there: `{file_name}.conflict.{hostname}.{unix_secs}`.
+   Should be aligned to the new format `{stem}.conflict-{host}-{YYYYMMDD-HHMMSS}{ext}`
+   for consistency with macOS (and to preserve the file extension separately
+   so apps still recognize the conflict file's type). Worth a small cleanup
+   pass.
+
+7. **Windows conflict event emission deferred.** The `write_through` worker
+   thread doesn't currently have access to `state_tx` (the agent → UFB IPC
+   channel). To emit `ConflictDetected` on Windows, plumb the sender into
+   `WriteThrough::start` and through to the worker. Sidecar files still get
+   created without this — only the Tauri toast/badge is missing. Low-risk
+   follow-up.
+
+8. **No Cargo dependency changes.** `tokio::sync::mpsc` was already in use;
+   `FreshnessSweepMsg` and `ConflictDetectedMsg` are pure serde additions.
+
+### Verification (Windows)
+
+End-to-end test on Windows once built:
+- Cache DB picks up new column; `cargo build` succeeds; agent starts.
+- Hydrate file; from peer edit it; open it locally → `[sync] Stat-on-open
+  drift` log + fresh content served on next read (CF will dehydrate the
+  placeholder when `refresh_placeholder` runs and re-fetch on the imminent
+  read).
+- Browse a folder where a file was changed externally → `[sync] Enumerated
+  ... refreshed` count > 0.
+- UFB refresh button → `[freshness-sweep] domains=[...]` appears in log
+  (no further action — Windows is no-op).
+- Two-machine concurrent write → conflict sidecar appears in folder (existing
+  behavior, naming format may differ until cleanup pass).

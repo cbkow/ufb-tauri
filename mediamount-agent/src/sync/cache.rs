@@ -87,7 +87,8 @@ impl CacheIndex {
                  nas_mtime INTEGER NOT NULL,
                  is_hydrated INTEGER NOT NULL DEFAULT 0,
                  hydrated_size INTEGER DEFAULT 0,
-                 last_accessed INTEGER DEFAULT 0
+                 last_accessed INTEGER DEFAULT 0,
+                 last_verified_at INTEGER DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
              CREATE INDEX IF NOT EXISTS idx_accessed ON known_files(last_accessed);
@@ -123,6 +124,18 @@ impl CacheIndex {
                  DROP TABLE cache_index;",
             )?;
         }
+
+        // Migrate: add last_verified_at if missing (v0.3.2+ freshness tracking)
+        let has_verified: bool = conn
+            .prepare("SELECT last_verified_at FROM known_files LIMIT 0")
+            .is_ok();
+        if !has_verified {
+            log::info!("[cache] Migrating: adding last_verified_at column");
+            let _ = conn.execute_batch(
+                "ALTER TABLE known_files ADD COLUMN last_verified_at INTEGER DEFAULT 0;",
+            );
+        }
+
         Ok(())
     }
 
@@ -173,6 +186,96 @@ impl CacheIndex {
             "UPDATE known_files SET last_accessed = ?1 WHERE path = ?2",
             params![now, path_str.as_ref()],
         );
+    }
+
+    /// Stamp last_verified_at = now. Called after a successful NAS stat confirms
+    /// cached metadata matches reality.
+    pub fn record_verification(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        let now = Self::unix_now();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE known_files SET last_verified_at = ?1 WHERE path = ?2",
+            params![now, path_str.as_ref()],
+        );
+    }
+
+    /// Update NAS metadata to fresh stat values and stamp last_verified_at.
+    /// Preserves hydration state and last_accessed via targeted UPDATE.
+    pub fn update_nas_metadata(&self, path: &Path, nas_size: u64, nas_mtime: i64) {
+        let path_str = path.to_string_lossy();
+        let now = Self::unix_now();
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE known_files SET nas_size = ?1, nas_mtime = ?2, last_verified_at = ?3 WHERE path = ?4",
+            params![nas_size as i64, nas_mtime, now, path_str.as_ref()],
+        );
+    }
+
+    /// Compare provided NAS metadata against the cached row.
+    ///
+    /// Returns `Some(true)` if drift (cached differs), `Some(false)` if match,
+    /// `None` if the path is not tracked. Used by hooks that already have
+    /// fresh stat values (e.g. directory enumeration) and want to avoid a
+    /// second NAS round-trip via `stat_and_refresh`.
+    pub fn compare_nas_metadata(&self, path: &Path, nas_size: u64, nas_mtime: i64) -> Option<bool> {
+        let path_str = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT nas_size, nas_mtime FROM known_files WHERE path = ?1",
+            params![path_str.as_ref()],
+            |row| {
+                let size: i64 = row.get(0)?;
+                let mtime: i64 = row.get(1)?;
+                Ok((size, mtime))
+            },
+        )
+        .ok()
+        .map(|(cached_size, cached_mtime)| {
+            nas_size != cached_size as u64 || nas_mtime != cached_mtime
+        })
+    }
+
+    /// Check if a path has any row in known_files.
+    /// Used by `stat_and_refresh` to disambiguate "within TTL" from "unknown".
+    pub fn is_known(&self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM known_files WHERE path = ?1",
+            params![path_str.as_ref()],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    }
+
+    /// Returns cached `(nas_size, nas_mtime)` if the entry warrants re-verification,
+    /// or `None` if we should skip the NAS stat.
+    ///
+    /// Skips when: entry was verified within `ttl_secs`, OR the path is unknown
+    /// (no baseline to compare against — let the normal hydration path populate it).
+    pub fn needs_verification(&self, path: &Path, ttl_secs: i64) -> Option<(u64, i64)> {
+        let path_str = path.to_string_lossy();
+        let now = Self::unix_now();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT nas_size, nas_mtime, last_verified_at FROM known_files WHERE path = ?1",
+            params![path_str.as_ref()],
+            |row| {
+                let size: i64 = row.get(0)?;
+                let mtime: i64 = row.get(1)?;
+                let verified: i64 = row.get(2)?;
+                Ok((size, mtime, verified))
+            },
+        )
+        .ok()
+        .and_then(|(size, mtime, verified)| {
+            if now - verified < ttl_secs {
+                None
+            } else {
+                Some((size as u64, mtime))
+            }
+        })
     }
 
     /// Update path after a rename.
@@ -549,4 +652,84 @@ fn is_hydrated(path: &Path) -> bool {
     let needs_recall = (attrs & 0x00400000) != 0; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
     // Hydrated = is a placeholder AND data is locally present (no recall needed)
     is_placeholder && !needs_recall
+}
+
+/// Result of a stat-and-refresh call against the NAS.
+#[derive(Debug)]
+pub enum StatResult {
+    /// Within TTL — no stat was performed. Caller can serve cached data.
+    Skipped,
+    /// NAS was stat'd; matched cached metadata. `last_verified_at` was refreshed.
+    Fresh { size: u64, mtime: i64 },
+    /// NAS was stat'd; drifted from cache. DB updated with new values.
+    /// Caller may want to invalidate OS-side cached content.
+    Drifted { size: u64, mtime: i64 },
+    /// Path unknown to cache — caller should let the normal hydration path
+    /// populate a baseline. Fresh stat values provided for convenience.
+    Unknown { size: u64, mtime: i64 },
+    /// NAS stat failed (network error, not found, permission). Caller should
+    /// log + continue; freshness check is optional, never block the open.
+    Error(std::io::Error),
+}
+
+/// Lazy freshness primitive: TTL-gated NAS stat against the cache.
+///
+/// If the entry was verified within `ttl_secs`, returns `Skipped` without any
+/// NAS traffic. Otherwise stats `nas_path` and either stamps verification
+/// (match) or updates cached metadata (drift). On stat failure, returns
+/// `Error` — callers should log and fall through to their normal path.
+pub fn stat_and_refresh(
+    cache: &CacheIndex,
+    client_path: &Path,
+    nas_path: &Path,
+    ttl_secs: i64,
+) -> StatResult {
+    let (cached_size, cached_mtime) = match cache.needs_verification(client_path, ttl_secs) {
+        Some(v) => v,
+        None => {
+            // Either within TTL or unknown path. Disambiguate.
+            if cache.is_known(client_path) {
+                return StatResult::Skipped;
+            }
+            // Unknown — stat NAS anyway so caller has fresh values to work with,
+            // but don't write to the DB (no row to update).
+            return match std::fs::metadata(nas_path) {
+                Ok(m) => StatResult::Unknown {
+                    size: m.len(),
+                    mtime: mtime_secs(&m),
+                },
+                Err(e) => StatResult::Error(e),
+            };
+        }
+    };
+
+    let meta = match std::fs::metadata(nas_path) {
+        Ok(m) => m,
+        Err(e) => return StatResult::Error(e),
+    };
+
+    let nas_size = meta.len();
+    let nas_mtime = mtime_secs(&meta);
+
+    if nas_size == cached_size && nas_mtime == cached_mtime {
+        cache.record_verification(client_path);
+        StatResult::Fresh {
+            size: nas_size,
+            mtime: nas_mtime,
+        }
+    } else {
+        cache.update_nas_metadata(client_path, nas_size, nas_mtime);
+        StatResult::Drifted {
+            size: nas_size,
+            mtime: nas_mtime,
+        }
+    }
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

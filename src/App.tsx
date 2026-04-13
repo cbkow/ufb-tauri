@@ -16,6 +16,7 @@ import { FileOpsProgress } from "./components/FileOpsProgress/FileOpsProgress";
 import { SettingsDialog } from "./components/Settings/SettingsDialog";
 import { initDeepLinkListener, setDeepLinkNavigate } from "./lib/deepLink";
 import { listDirectory } from "./lib/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import "./styles/theme.css";
 import "./App.css";
 
@@ -106,6 +107,42 @@ export default function App() {
     };
     window.addEventListener("focus", handleWindowFocus);
     onCleanup(() => window.removeEventListener("focus", handleWindowFocus));
+
+    // ── ufb:refresh → also notify agent so platform-native freshness signals
+    // fire (Darwin notification on macOS → extension signals .workingSet,
+    // surfacing any drift opportunistic hooks have already detected). Best-
+    // effort; throttled to coalesce rapid bursts (focus + tab-switch storms).
+    let lastSweepAt = 0;
+    const handleRefreshSweep = () => {
+      const now = Date.now();
+      if (now - lastSweepAt < 1500) return;
+      lastSweepAt = now;
+      invoke("trigger_freshness_sweep", { domain: null }).catch((err) => {
+        console.debug("[ufb:refresh] freshness sweep failed:", err);
+      });
+    };
+    window.addEventListener("ufb:refresh", handleRefreshSweep);
+    onCleanup(() => window.removeEventListener("ufb:refresh", handleRefreshSweep));
+
+    // ── file:conflict → log + dispatch a custom event so views can refresh.
+    // No toast UI yet; sidecar file appears in the folder where the user can
+    // see it. Future: persistent badge or notification component.
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen<{
+        domain: string;
+        originalPath: string;
+        conflictPath: string;
+        host: string;
+        detectedAt: number;
+      }>("file:conflict", (event) => {
+        const c = event.payload;
+        console.warn(
+          `[file:conflict] ${c.domain}/${c.originalPath} — concurrent write detected, saved as ${c.conflictPath}`
+        );
+        // Trigger a refresh so the new sidecar file appears in browsers immediately.
+        window.dispatchEvent(new CustomEvent("ufb:refresh"));
+      });
+    });
   });
 
   // ── Tab switch → refresh browsers ──

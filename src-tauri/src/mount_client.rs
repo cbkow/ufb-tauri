@@ -19,6 +19,17 @@ pub enum AgentToUfb {
     Ack(AckMsg),
     Error(ErrorMsg),
     Pong,
+    ConflictDetected(ConflictDetectedMsg),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetectedMsg {
+    pub domain: String,
+    pub original_path: String,
+    pub conflict_path: String,
+    pub host: String,
+    pub detected_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,12 +68,27 @@ pub enum UfbToAgent {
     ReloadConfig,
     GetStates,
     Ping,
+    /// User-driven freshness signal (window focus, refresh button, tab switch).
+    /// Agent posts a Darwin notification on macOS so the FileProvider extension
+    /// signals .workingSet → drains pending evictions for any drift the agent
+    /// has already detected via opportunistic hooks.
+    FreshnessSweep(FreshnessSweepMsg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MountIdMsg {
     pub mount_id: String,
+    #[serde(default)]
+    pub command_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshnessSweepMsg {
+    /// Optional domain / share name. `None` = sweep all enabled mounts.
+    #[serde(default)]
+    pub domain: Option<String>,
     #[serde(default)]
     pub command_id: String,
 }
@@ -368,6 +394,13 @@ impl MountClient {
                                     Some(AgentToUfb::Error(err)) => {
                                         let _ = app_handle.emit("mount:error", &err);
                                     }
+                                    Some(AgentToUfb::ConflictDetected(conflict)) => {
+                                        log::warn!(
+                                            "[mount] Conflict on {}/{} → {}",
+                                            conflict.domain, conflict.original_path, conflict.conflict_path
+                                        );
+                                        let _ = app_handle.emit("file:conflict", &conflict);
+                                    }
                                     None => {
                                         // I/O thread exited — agent disconnected
                                         break;
@@ -456,6 +489,13 @@ impl MountClient {
                                     }
                                     Some(AgentToUfb::Error(err)) => {
                                         let _ = app_handle.emit("mount:error", &err);
+                                    }
+                                    Some(AgentToUfb::ConflictDetected(conflict)) => {
+                                        log::warn!(
+                                            "[mount] Conflict on {}/{} → {}",
+                                            conflict.domain, conflict.original_path, conflict.conflict_path
+                                        );
+                                        let _ = app_handle.emit("file:conflict", &conflict);
                                     }
                                     None => {
                                         break;

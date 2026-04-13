@@ -1,5 +1,5 @@
 use crate::config::{self, MountConfig, MountsConfig};
-use crate::messages::{AgentToUfb, AckMsg, ErrorMsg, UfbToAgent};
+use crate::messages::{AgentToUfb, AckMsg, ErrorMsg, FreshnessSweepMsg, UfbToAgent};
 use crate::orchestrator::Orchestrator;
 use crate::state::MountEvent;
 use std::collections::{HashMap, HashSet};
@@ -246,6 +246,61 @@ impl MountService {
                 self.shutdown().await;
                 std::process::exit(0);
             }
+            UfbToAgent::FreshnessSweep(msg) => {
+                self.handle_freshness_sweep(msg).await;
+            }
+        }
+    }
+
+    /// Trigger a cross-platform freshness sweep — user-driven hint that "now
+    /// would be a good time to invalidate stale caches." Runs platform-native
+    /// signaling rather than crawling.
+    ///
+    /// macOS: post the same Darwin notification the watcher uses; the
+    /// extension responds with `signalEnumerator(.workingSet)` → `getChanges`
+    /// drains any drift the agent has already detected.
+    ///
+    /// Windows: log only for now. The CF filter's `opened` and
+    /// `fetch_placeholders` hooks do per-access freshness; a broader sweep
+    /// would walk known-hydrated paths and stat them, which we'll add when
+    /// it earns its keep against real workloads.
+    async fn handle_freshness_sweep(&self, msg: FreshnessSweepMsg) {
+        let domains: Vec<String> = if let Some(d) = msg.domain.clone() {
+            vec![d]
+        } else {
+            // All currently-enabled mount share names.
+            self.mounts
+                .values()
+                .map(|m| m.config.share_name())
+                .collect()
+        };
+
+        log::info!(
+            "[freshness-sweep] domains={:?} (from cmd {})",
+            domains,
+            msg.command_id
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            for d in &domains {
+                crate::sync::macos_watcher::post_darwin_notification(d);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows / Linux: no per-platform sweep wired yet. The opportunistic
+            // hooks (CF `opened`, `fetch_placeholders`) cover most cases.
+            let _ = &domains;
+        }
+
+        if !msg.command_id.is_empty() {
+            let _ = self
+                .ipc_tx
+                .send(AgentToUfb::Ack(AckMsg {
+                    command_id: msg.command_id,
+                }))
+                .await;
         }
     }
 

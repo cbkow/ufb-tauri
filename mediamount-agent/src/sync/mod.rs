@@ -14,6 +14,8 @@ mod filter;
 #[cfg(windows)]
 mod watcher;
 #[cfg(windows)]
+mod placeholder;
+#[cfg(windows)]
 pub mod write_through;
 #[cfg(windows)]
 pub mod cache;

@@ -15,11 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::watcher::NasWatcher;
-use super::cache::CacheIndex;
+use super::cache::{stat_and_refresh, CacheIndex, StatResult};
 use super::connectivity::{is_network_error, NasConnectivity};
+use super::placeholder::refresh_placeholder;
 use super::write_through::EchoSuppressor;
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB hydration chunks
+
+/// Stat-on-open TTL. An entry verified against NAS within this window is
+/// trusted without re-statting — prevents stat-storms on bursty opens
+/// (timeline load, project scan).
+const STAT_VERIFY_TTL_SECS: i64 = 30;
 
 /// CF API sync filter. Handles all OS callbacks for a single sync root.
 pub struct NasSyncFilter {
@@ -110,6 +116,7 @@ impl SyncFilter for NasSyncFilter {
 
         let mut placeholders = Vec::new();
         let mut skip_count = 0;
+        let mut refreshed_count = 0;
         for entry in fs::read_dir(&nas_dir).into_iter().flatten() {
             let entry = match entry {
                 Ok(e) => e,
@@ -136,7 +143,7 @@ impl SyncFilter for NasSyncFilter {
                 Metadata::file().size(meta.len())
             };
 
-            // Record known file in DB for reconciliation (files only, not dirs)
+            // File-only: drift check + cache bookkeeping.
             if !meta.is_dir() {
                 let entry_mtime = meta
                     .modified()
@@ -147,6 +154,41 @@ impl SyncFilter for NasSyncFilter {
                     })
                     .unwrap_or(0);
                 let client_path = request_path.join(&name_str);
+
+                // If the placeholder already exists locally, check for drift
+                // against our cached metadata. CF leaves existing placeholders
+                // alone when we push new ones via `pass_with_placeholder`, so
+                // drift here would otherwise be latent until the watcher fires
+                // or the user opens the file.
+                if client_path.exists() {
+                    match self.cache.compare_nas_metadata(&client_path, meta.len(), entry_mtime) {
+                        Some(true) => {
+                            // Drift — rebuild placeholder from NAS state.
+                            let display = client_path.to_string_lossy().to_string();
+                            refresh_placeholder(
+                                &entry.path(),
+                                &request_path,
+                                &name_str,
+                                &display,
+                                &*self.cache,
+                            );
+                            refreshed_count += 1;
+                            // refresh_placeholder recreated the placeholder + DB row;
+                            // don't push a duplicate in the ticket list.
+                            continue;
+                        }
+                        Some(false) => {
+                            // Match — stamp verified and skip push (already present).
+                            self.cache.record_verification(&client_path);
+                            continue;
+                        }
+                        None => {
+                            // Known path but no row (shouldn't happen) — fall through.
+                        }
+                    }
+                }
+
+                // New placeholder path: record metadata, push to ticket.
                 self.cache
                     .record_known_file(&client_path, meta.len(), entry_mtime);
             }
@@ -161,9 +203,10 @@ impl SyncFilter for NasSyncFilter {
 
         let elapsed = start.elapsed();
         log::info!(
-            "[sync] Enumerated {:?}: {} placeholders, {} skipped, {:.1}ms",
+            "[sync] Enumerated {:?}: {} placeholders, {} refreshed, {} skipped, {:.1}ms",
             relative,
             placeholders.len(),
+            refreshed_count,
             skip_count,
             elapsed.as_secs_f64() * 1000.0
         );
@@ -352,13 +395,64 @@ impl SyncFilter for NasSyncFilter {
     }
 
     /// Track file opens for deferred NAS update handling.
+    /// Track file opens for deferred NAS update handling.
+    ///
+    /// Also performs opportunistic stat-on-open: when we're the first opener
+    /// and the entry's cached metadata hasn't been verified recently, stat
+    /// NAS and refresh the placeholder if it has diverged.
     fn opened(&self, request: Request, _info: info::Opened) {
         let path = request.path();
-        let mut handles = self.open_handles.lock().unwrap();
-        *handles.entry(path.clone()).or_insert(0) += 1;
-        drop(handles);
-        // LRU refresh
+
+        // Increment handle count; capture pre-increment value to know if we
+        // raced in ahead of an existing opener.
+        let count_before = {
+            let mut handles = self.open_handles.lock().unwrap();
+            let entry = handles.entry(path.clone()).or_insert(0);
+            let before = *entry;
+            *entry += 1;
+            before
+        };
+
+        // LRU refresh.
         self.cache.touch(&path);
+
+        // Skip freshness check if someone else already has the file open —
+        // refreshing the placeholder under an exclusive handle would fail and
+        // could race with in-flight I/O.
+        if count_before > 0 {
+            return;
+        }
+
+        // Resolve NAS path using the same blob-or-derive pattern as fetch_data.
+        let blob = request.file_blob();
+        let nas_path = if !blob.is_empty() {
+            PathBuf::from(String::from_utf8_lossy(blob).to_string())
+        } else {
+            let relative = self.relative_path(&path);
+            self.nas_path(&relative)
+        };
+
+        match stat_and_refresh(&self.cache, &path, &nas_path, STAT_VERIFY_TTL_SECS) {
+            StatResult::Drifted { size, mtime } => {
+                log::info!(
+                    "[sync] Stat-on-open drift {:?}: nas=({}, {}) — refreshing placeholder",
+                    path, size, mtime
+                );
+                if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                    let file_name = name.to_string_lossy().to_string();
+                    let display = path.to_string_lossy().to_string();
+                    refresh_placeholder(&nas_path, parent, &file_name, &display, &*self.cache);
+                }
+            }
+            StatResult::Error(e) => {
+                if is_network_error(&e) {
+                    self.connectivity.report_network_error();
+                }
+                log::debug!("[sync] Stat-on-open skipped {:?}: {}", path, e);
+            }
+            // Skipped (within TTL), Fresh (match), Unknown (no baseline) — nothing to do.
+            _ => {}
+        }
     }
 
     /// Track file closes. When refcount hits 0, apply any deferred NAS updates.

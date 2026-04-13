@@ -1065,6 +1065,30 @@ pub async fn mount_create_symlinks(state: State<'_, AppState>) -> Result<(), Str
         .await
 }
 
+/// User-driven freshness signal — fired on window focus, F5/Ctrl+R, refresh
+/// buttons, project tab activation. Forwards to the agent, which posts the
+/// platform's freshness signal (Darwin notification on macOS so the
+/// FileProvider extension signals .workingSet, surfacing any drift the
+/// agent's opportunistic hooks have detected).
+///
+/// `domain` optionally narrows the sweep to a single share; `None` sweeps
+/// all enabled mounts.
+#[tauri::command]
+pub async fn trigger_freshness_sweep(
+    state: State<'_, AppState>,
+    domain: Option<String>,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::FreshnessSweep(
+            crate::mount_client::FreshnessSweepMsg {
+                domain,
+                command_id: String::new(),
+            },
+        ))
+        .await
+}
+
 // ── System Icons ──
 
 /// Get the OS-native file type icon as a base64-encoded PNG data URL.

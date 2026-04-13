@@ -291,7 +291,7 @@ fn snapshot_folder(path: &Path) -> Option<FolderSnapshot> {
 
 /// Post a distributed notification that the FileProvider extension listens for.
 /// Uses CFNotificationCenter with the distributed center (cross-process, works in sandboxed extensions).
-fn post_darwin_notification(domain: &str) {
+pub(crate) fn post_darwin_notification(domain: &str) {
     let name = format!("com.unionfiles.ufb.nas-changed.{}", domain);
     log::info!("[macos-watcher] Posting notification: {}", name);
 

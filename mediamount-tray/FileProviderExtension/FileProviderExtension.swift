@@ -94,6 +94,23 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         }
     }
 
+    /// Called by the OS when the set of locally-materialized items changes
+    /// (new materialization, eviction by OS, etc.). Used as a backstop: if
+    /// items were materialized via paths that didn't route through us, our
+    /// agent's ambient drift detection never saw them. Signaling .workingSet
+    /// triggers `enumerateWorkingSetChanges`, which routes through our agent's
+    /// `get_changes` → drains `pending_evictions` → evicts any drift the agent
+    /// has detected since last round.
+    func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+        NSLog("[FileProvider] materializedItemsDidChange for \(domainId)")
+        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { error in
+            if let error = error {
+                NSLog("[FileProvider] materializedItemsDidChange signal error: \(error)")
+            }
+            completionHandler()
+        }
+    }
+
     // MARK: - NSFileProviderReplicatedExtension
 
     func item(
@@ -152,7 +169,13 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     }
 
     /// Called when a user opens/accesses a file.
-    /// Agent copies the file to a temp path in the app group container.
+    /// Agent reads the file fresh from NAS (with drift detection on the agent
+    /// side — see `handle_read_file` in Rust). The FileProviderItem returned
+    /// here carries `itemVersion` derived from the just-observed `{mtime, size}`
+    /// (see FileProviderItem.swift). When the OS stamps the materialized copy
+    /// with this version, a future NAS-side change — surfaced via an
+    /// enumeration vending a different contentVersion — causes the OS to
+    /// invalidate its cache and re-trigger fetchContents.
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
         version requestedVersion: NSFileProviderItemVersion?,
@@ -167,8 +190,6 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 domain: domainId,
                 relativePath: relativePath
             )
-
-            NSLog("[FileProvider] File ready at \(tempURL.path) (\(stat.size) bytes)")
 
             let name = (relativePath as NSString).lastPathComponent
             let parentPath = (relativePath as NSString).deletingLastPathComponent
@@ -185,6 +206,15 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 modified: Date(timeIntervalSince1970: stat.modified),
                 created: Date(timeIntervalSince1970: stat.created),
                 smbPath: ""
+            )
+
+            // Diagnostic: compare freshly-observed version to what the OS asked
+            // for. Different → we're serving an update the system hadn't seen.
+            // Same → cache was already in sync; this was a normal re-fetch.
+            let freshContentVersion = item.itemVersion.contentVersion
+            let versionChanged = requestedVersion?.contentVersion != freshContentVersion
+            NSLog(
+                "[FileProvider] File ready \(relativePath) (\(stat.size) bytes, version \(versionChanged ? "updated" : "unchanged"))"
             )
 
             completionHandler(tempURL, item, nil)

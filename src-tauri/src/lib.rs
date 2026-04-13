@@ -254,6 +254,7 @@ pub fn run() {
             commands::mount_unhide_drives,
             commands::mount_clear_sync_cache,
             commands::mount_create_symlinks,
+            commands::trigger_freshness_sweep,
             // App lifecycle
             commands::relaunch_app,
             // Platform

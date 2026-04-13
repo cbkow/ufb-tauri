@@ -76,6 +76,17 @@ impl MacosCache {
             ");
         }
 
+        // Migrate: add last_verified_at if missing (v0.3.2+ freshness tracking)
+        let has_verified: bool = conn
+            .prepare("SELECT last_verified_at FROM known_files LIMIT 0")
+            .is_ok();
+        if !has_verified {
+            log::info!("[macos-cache] Migrating: adding last_verified_at column");
+            let _ = conn.execute_batch(
+                "ALTER TABLE known_files ADD COLUMN last_verified_at REAL DEFAULT 0;",
+            );
+        }
+
         // Create indexes (after migration ensures columns exist)
         let _ = conn.execute_batch("
             CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
@@ -92,6 +103,11 @@ impl MacosCache {
 
     /// Record a directory listing from an enumeration.
     /// Updates known_files for all entries and marks the folder as visited.
+    ///
+    /// Drift detection: any entry whose cached (nas_size, nas_mtime) differs
+    /// from the enumerated values is queued for eviction. The extension drains
+    /// this queue via `getChanges` and calls `evictItem`, dropping cached bytes
+    /// so the next open triggers a fresh `fetchContents`.
     pub fn record_enumeration(&self, relative_path: &str, entries: &[crate::messages::DirEntry]) {
         let conn = self.conn.lock().unwrap();
 
@@ -104,6 +120,8 @@ impl MacosCache {
 
         // Build set of current entry paths for deletion detection
         let mut current_paths: HashSet<String> = HashSet::new();
+        // Files whose NAS metadata drifted from our cached values — need eviction.
+        let mut drifted: Vec<String> = Vec::new();
 
         for entry in entries {
             let entry_path = if relative_path.is_empty() {
@@ -112,6 +130,24 @@ impl MacosCache {
                 format!("{}/{}", relative_path, entry.name)
             };
             current_paths.insert(entry_path.clone());
+
+            // Pre-update drift check: file-only, only if already tracked + hydrated.
+            if !entry.is_dir {
+                let existing: Option<(i64, f64, i64)> = conn
+                    .query_row(
+                        "SELECT nas_size, nas_mtime, is_hydrated FROM known_files WHERE path = ?1",
+                        params![entry_path],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok();
+                if let Some((cached_size, cached_mtime, is_hydrated)) = existing {
+                    let drift = entry.size != cached_size as u64
+                        || (entry.modified - cached_mtime).abs() > 0.001;
+                    if drift && is_hydrated != 0 {
+                        drifted.push(entry_path.clone());
+                    }
+                }
+            }
 
             conn.execute(
                 "INSERT OR REPLACE INTO known_files (path, name, is_dir, nas_size, nas_mtime, nas_created)
@@ -157,6 +193,17 @@ impl MacosCache {
             if !current_paths.contains(db_path) {
                 conn.execute("DELETE FROM known_files WHERE path = ?1", params![db_path]).ok();
             }
+        }
+        drop(stmt);
+        drop(conn);
+
+        if !drifted.is_empty() {
+            log::info!(
+                "[macos-cache] Enumeration drift: {} entries under {:?} — queued for eviction",
+                drifted.len(),
+                relative_path
+            );
+            self.pending_evictions.lock().unwrap().extend(drifted);
         }
     }
 
@@ -375,6 +422,95 @@ impl MacosCache {
         ).ok();
     }
 
+    /// Stamp last_verified_at = now. Called after a successful NAS stat confirms
+    /// cached metadata matches reality.
+    pub fn record_verification(&self, relative_path: &str) {
+        let now = unix_now_f64();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE known_files SET last_verified_at=?1 WHERE path=?2",
+            params![now, relative_path],
+        ).ok();
+    }
+
+    /// Update NAS metadata to fresh stat values and stamp last_verified_at.
+    /// Preserves hydration state and last_accessed via targeted UPDATE.
+    pub fn update_nas_metadata(&self, relative_path: &str, nas_size: u64, nas_mtime: f64) {
+        let now = unix_now_f64();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE known_files SET nas_size=?1, nas_mtime=?2, last_verified_at=?3 WHERE path=?4",
+            params![nas_size as i64, nas_mtime, now, relative_path],
+        ).ok();
+    }
+
+    /// Returns cached `(nas_size, nas_mtime)` if the entry warrants re-verification,
+    /// or `None` if we should skip the NAS stat.
+    ///
+    /// Skips when: entry was verified within `ttl_secs`, OR the path is unknown
+    /// (no baseline to compare against — let the normal read path populate it).
+    pub fn needs_verification(&self, relative_path: &str, ttl_secs: f64) -> Option<(u64, f64)> {
+        let now = unix_now_f64();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT nas_size, nas_mtime, last_verified_at FROM known_files WHERE path=?1",
+            params![relative_path],
+            |row| {
+                let size: i64 = row.get(0)?;
+                let mtime: f64 = row.get(1)?;
+                let verified: f64 = row.get(2)?;
+                Ok((size, mtime, verified))
+            },
+        )
+        .ok()
+        .and_then(|(size, mtime, verified)| {
+            if now - verified < ttl_secs {
+                None
+            } else {
+                Some((size as u64, mtime))
+            }
+        })
+    }
+
+    /// Compare provided NAS metadata against the cached row.
+    ///
+    /// Returns `Some(true)` if drift (cached differs), `Some(false)` if match,
+    /// `None` if the path is not tracked. Used by hooks that already have
+    /// fresh stat values and want to avoid a second NAS round-trip.
+    pub fn compare_nas_metadata(
+        &self,
+        relative_path: &str,
+        nas_size: u64,
+        nas_mtime: f64,
+    ) -> Option<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT nas_size, nas_mtime FROM known_files WHERE path=?1",
+            params![relative_path],
+            |row| {
+                let size: i64 = row.get(0)?;
+                let mtime: f64 = row.get(1)?;
+                Ok((size, mtime))
+            },
+        )
+        .ok()
+        .map(|(cached_size, cached_mtime)| {
+            nas_size != cached_size as u64 || (nas_mtime - cached_mtime).abs() > 0.001
+        })
+    }
+
+    /// Check if a path is tracked in known_files (has any row).
+    /// Used by `stat_and_refresh` to disambiguate "within TTL" from "unknown".
+    pub fn is_known(&self, relative_path: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM known_files WHERE path=?1",
+            params![relative_path],
+            |_| Ok(true),
+        )
+        .unwrap_or(false)
+    }
+
     /// Total bytes of hydrated (locally cached) files.
     pub fn total_cached_bytes(&self) -> u64 {
         let conn = self.conn.lock().unwrap();
@@ -476,6 +612,30 @@ impl MacosCache {
         std::mem::take(&mut *self.pending_evictions.lock().unwrap())
     }
 
+    /// If this path is currently materialized (hydrated), queue it for eviction.
+    /// No-op otherwise. Used by stat-drift detection so the next FileProvider
+    /// `getChanges` call will tell the extension to drop cached bytes.
+    pub fn queue_eviction_if_hydrated(&self, relative_path: &str) {
+        let conn = self.conn.lock().unwrap();
+        let hydrated: bool = conn
+            .query_row(
+                "SELECT is_hydrated FROM known_files WHERE path = ?1",
+                params![relative_path],
+                |row| {
+                    let v: i64 = row.get(0)?;
+                    Ok(v != 0)
+                },
+            )
+            .unwrap_or(false);
+        drop(conn);
+        if hydrated {
+            self.pending_evictions
+                .lock()
+                .unwrap()
+                .push(relative_path.to_string());
+        }
+    }
+
     /// Get the NAS folder mtime for a relative path.
     fn get_folder_mtime(&self, relative_path: &str) -> f64 {
         let nas_folder = if relative_path.is_empty() {
@@ -508,4 +668,92 @@ pub struct ChangedEntry {
     pub size: u64,
     pub modified: f64,
     pub created: f64,
+}
+
+/// Result of a stat-and-refresh call against the NAS.
+#[derive(Debug)]
+pub enum StatResult {
+    /// Within TTL — no stat was performed. Caller can serve cached data.
+    Skipped,
+    /// NAS was stat'd; matched cached metadata. `last_verified_at` was refreshed.
+    Fresh { size: u64, mtime: f64 },
+    /// NAS was stat'd; drifted from cache. DB updated with new values.
+    /// Caller may want to invalidate OS-side cached content.
+    Drifted { size: u64, mtime: f64 },
+    /// Path unknown to cache — caller should let the normal read path populate
+    /// a baseline. Fresh stat values provided for convenience.
+    Unknown { size: u64, mtime: f64 },
+    /// NAS stat failed. Caller should log + fall through — freshness is
+    /// an optimization hint, never a blocker.
+    Error(std::io::Error),
+}
+
+/// Lazy freshness primitive: TTL-gated NAS stat against the cache.
+///
+/// If the entry was verified within `ttl_secs`, returns `Skipped` with no NAS
+/// traffic. Otherwise stats `nas_path` and either stamps verification (match)
+/// or updates cached metadata (drift). On stat failure returns `Error`; callers
+/// should log and fall through to their normal path.
+pub fn stat_and_refresh(
+    cache: &MacosCache,
+    relative_path: &str,
+    nas_path: &Path,
+    ttl_secs: f64,
+) -> StatResult {
+    let (cached_size, cached_mtime) = match cache.needs_verification(relative_path, ttl_secs) {
+        Some(v) => v,
+        None => {
+            // Either within TTL or unknown. Disambiguate.
+            if cache.is_known(relative_path) {
+                return StatResult::Skipped;
+            }
+            return match std::fs::metadata(nas_path) {
+                Ok(m) => StatResult::Unknown {
+                    size: m.len(),
+                    mtime: mtime_secs_f64(&m),
+                },
+                Err(e) => StatResult::Error(e),
+            };
+        }
+    };
+
+    let meta = match std::fs::metadata(nas_path) {
+        Ok(m) => m,
+        Err(e) => return StatResult::Error(e),
+    };
+
+    let nas_size = meta.len();
+    let nas_mtime = mtime_secs_f64(&meta);
+
+    // f64 equality is fine here — both values come from the same SystemTime
+    // → Duration → f64 path. If a future platform introduces sub-nanosecond
+    // jitter we'll want a tolerance, but mtime resolution on SMB is second-grained.
+    if nas_size == cached_size && (nas_mtime - cached_mtime).abs() < 0.001 {
+        cache.record_verification(relative_path);
+        StatResult::Fresh {
+            size: nas_size,
+            mtime: nas_mtime,
+        }
+    } else {
+        cache.update_nas_metadata(relative_path, nas_size, nas_mtime);
+        StatResult::Drifted {
+            size: nas_size,
+            mtime: nas_mtime,
+        }
+    }
+}
+
+fn unix_now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn mtime_secs_f64(meta: &std::fs::Metadata) -> f64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }

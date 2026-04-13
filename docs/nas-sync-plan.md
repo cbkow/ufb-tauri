@@ -7,7 +7,92 @@ Writes go directly to the NAS — the local machine is a cache, not a replica.
 
 ---
 
-## Core Principle
+## ✅ Amendment 2026-04-13 — Layered freshness signaling shipped (v0.3.3 macOS)
+
+The two earlier amendments below (manifest layer, then Sync Server role) were
+ultimately rejected in favor of a smaller, lazier design — see
+`nas-sync-log.md` 2026-04-13 entries for the reasoning trail.
+
+**Final design — three-layer freshness, no manifest, no server role:**
+
+1. **OS hooks** (existing): CF callbacks on Windows, FileProvider delegate
+   methods on macOS.
+2. **Agent opportunistic freshening** inside each hook — TTL-gated NAS stat,
+   updates DB on drift. Cost amortized against existing work.
+3. **UFB app signals** — Tauri frontend's `ufb:refresh` event forwards to
+   agent via `trigger_freshness_sweep` Tauri command; agent posts the
+   platform's freshness signal (Darwin notification on macOS).
+
+Plus conflict detection on write as a correctness floor for the residual
+gap (rapid-repeat opens within OS metadata-cache TTL).
+
+Shipped in v0.3.3 macOS DMG (Apple notarized 2026-04-13). Windows code
+written cfg-gated but not yet built — see Windows hints in
+`nas-sync-log.md` 2026-04-13 v0.3.3 entry.
+
+The placeholder/hydration model, write-through semantics, and CHANGE_NOTIFY
+strategy from the original plan below remain as stated.
+
+---
+
+## ⚠️ Amendment 2026-04-13 — Manifest layer + Sync Server role
+
+The original premise below (**"no local database"**) was reconsidered during the
+scale review on 2026-04-13. Rationale in `nas-sync-log.md` under that date
+(three entries — initial review, manifest reframe, Sync Server role
+separation).
+
+### The gap
+
+Without a persistent index of NAS state, every correctness question ("is this
+file stale? what exists in this folder? has it been deleted upstream?") becomes
+a guess resolved by ad-hoc mechanisms (polling, mesh broadcast, FSEvents
+fallback). We kept running into edge cases because the primitive was missing.
+
+Dropbox, Synology Drive, and LucidLink all solve this the same way: authoritative
+metadata index on the server side; clients do index-to-index delta sync, never
+walk the filesystem. On plain SMB we have no server-side index to query.
+
+### The model we're adopting
+
+Two orthogonal roles in a farm:
+
+- **Mesh Leader (existing, elected):** coordinates small fast-changing state —
+  subscriptions, column defs, metadata edits. Snapshot-based catch-up. Quick
+  election on heartbeat.
+- **Sync Server (new, designated):** owns the authoritative per-subscription
+  manifest — the index of NAS state. Runs the SMB crawl + CHANGE_NOTIFY watches.
+  Serves delta queries to followers over mesh HTTP. Manifest DB is local to the
+  Sync Server.
+
+The mesh itself becomes the "self-hosted metadata service" — the role Dropbox
+plays for its clients — without requiring a NAS-side agent.
+
+### Why Sync Server is designated, not elected
+
+A million-file manifest is too large to transfer on a heartbeat blip. This is
+the same reason database primaries, DNS primaries, and Synology HA use
+deliberate failover instead of auto-election. Admin picks the Sync Server
+(usually the always-on edit-bay machine). Stays that way until manually
+reassigned. If the Sync Server goes offline, followers serve cached manifest
+plus stat-on-open for correctness — there is no automatic role swap.
+
+### What changes vs original plan
+
+- "No local database" → superseded. Sync Server has a local manifest SQLite.
+- "Every operation a pass-through to NAS" → softened. Reads still hit the OS
+  cache layer over hydrated placeholders; metadata queries consult the
+  manifest first.
+- CHANGE_NOTIFY strategy below → moves from every-client to Sync-Server-only.
+  Clients get changes via delta pulls, not by running their own watches.
+- Placeholder/hydration model, write-through semantics → unchanged.
+
+Full design to follow; sections below describe the original client-only model
+for historical context.
+
+---
+
+## Core Principle (original — see Amendment above)
 
 **The NAS is the only source of truth. The local machine is a smart cache.**
 

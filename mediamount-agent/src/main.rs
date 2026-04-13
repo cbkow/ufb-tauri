@@ -212,9 +212,6 @@ async fn run_event_loop() {
     #[cfg(unix)]
     let mut ipc_server = ipc::unix_server::IpcServer::start();
 
-    // Start file operations server for FileProvider extension (macOS only)
-    #[cfg(target_os = "macos")]
-    ipc::fileops_server::FileOpsServer::start();
 
     #[cfg(not(any(windows, unix)))]
     {
@@ -226,6 +223,12 @@ async fn run_event_loop() {
     {
         // Channel for agent→UFB messages from mount orchestrators
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(128);
+
+        // Start file operations server for FileProvider extension (macOS only).
+        // It uses the same agent→UFB channel to emit out-of-band events such
+        // as conflict-detected notifications.
+        #[cfg(target_os = "macos")]
+        ipc::fileops_server::FileOpsServer::start(state_tx.clone());
 
         // Tray receives a copy of state updates
         let (tray_state_tx, tray_state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(64);
