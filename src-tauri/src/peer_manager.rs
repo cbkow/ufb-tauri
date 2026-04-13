@@ -137,8 +137,22 @@ impl PeerManager {
 
         let json = serde_json::to_string_pretty(&endpoint)
             .map_err(|e| format!("Failed to serialize endpoint: {}", e))?;
-        std::fs::write(dir.join("endpoint.json"), &json)
-            .map_err(|e| format!("Failed to write endpoint: {}", e))
+
+        // Atomic write: stage to .tmp then rename. Plain std::fs::write
+        // truncates-then-streams, which leaves a partial/corrupt file on SMB
+        // over high-latency or flaky links (e.g. VPN) if any packets are lost
+        // mid-write. The rename is a single metadata op, so peers either see
+        // the previous valid content or the new valid content — never a torn
+        // intermediate state.
+        let final_path = dir.join("endpoint.json");
+        let tmp_path = dir.join("endpoint.json.tmp");
+        std::fs::write(&tmp_path, &json)
+            .map_err(|e| format!("Failed to write endpoint tmp: {}", e))?;
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Failed to rename endpoint: {}", e));
+        }
+        Ok(())
     }
 
     /// Remove this node's endpoint from the phonebook.

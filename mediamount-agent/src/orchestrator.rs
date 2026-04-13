@@ -288,40 +288,40 @@ impl Orchestrator {
                 }
             }
 
-            // Step 2: Establish SMB session in background (don't block mount state)
-            // Windows will use cached sessions if available; this ensures credentials
-            // are set up for when the user accesses the symlink.
+            // Step 2: Establish SMB session before transitioning to Mounted.
+            // Previously this was fire-and-forget under the assumption Windows
+            // would have a cached session — true on warm relaunches, false on
+            // cold first launch. The UI reported "Connected" while the symlink
+            // it pointed at had no live SMB session behind it, so the first
+            // click-through silently failed in listDirectory. Blocking here
+            // keeps the Mounting → Mounted transition honest.
             {
                 let share = self.config.nas_share_path.clone();
                 let u = username.clone();
                 let p = password.clone();
-                let mid = self.mount_id.clone();
-                let servers = self.connected_servers.clone();
-                tokio::spawn(async move {
-                    let share2 = share.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::platform::windows::fallback::establish_smb_session(&share2, &u, &p)
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("SMB session task panicked: {}", e)));
+                let share2 = share.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::platform::windows::fallback::establish_smb_session(&share2, &u, &p)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("SMB session task panicked: {}", e)));
 
-                    match result {
-                        Ok(()) => {
-                            let host = share
-                                .trim_start_matches('\\')
-                                .split('\\')
-                                .next()
-                                .unwrap_or("")
-                                .to_lowercase();
-                            if !host.is_empty() {
-                                servers.lock().unwrap().insert(host);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("[{}] Background SMB session failed: {}", mid, e);
+                match result {
+                    Ok(()) => {
+                        let host = share
+                            .trim_start_matches('\\')
+                            .split('\\')
+                            .next()
+                            .unwrap_or("")
+                            .to_lowercase();
+                        if !host.is_empty() {
+                            self.connected_servers.lock().unwrap().insert(host);
                         }
                     }
-                });
+                    Err(e) => {
+                        log::warn!("[{}] SMB session failed: {}", self.mount_id, e);
+                    }
+                }
             }
         }
 

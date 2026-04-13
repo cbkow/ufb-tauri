@@ -57,21 +57,33 @@ const [state, setState] = createStore<MountStoreState>({
 });
 
 let listenersSetUp = false;
+let listenerSetupPromise: Promise<void> | null = null;
 
-function setupListeners() {
-  if (listenersSetUp) return;
-  listenersSetUp = true;
+function setupListeners(): Promise<void> {
+  if (listenersSetUp) return Promise.resolve();
+  if (listenerSetupPromise) return listenerSetupPromise;
 
-  listen<MountStateUpdate>("mount:state-update", (e) => {
-    const update = e.payload;
-    console.log("[mountStore] state-update:", update.mountId, update.state, update);
-    setState("states", update.mountId, reconcile(update));
-  });
+  // `listen()` returns a Promise — the subscription isn't live until that
+  // resolves. On a cold first launch the agent can emit early state-update
+  // events (especially the "mounted" transition) before registration completes,
+  // silently dropping them and leaving the UI stuck at "mounting". Await both
+  // registrations before anyone asks for a snapshot.
+  listenerSetupPromise = (async () => {
+    await listen<MountStateUpdate>("mount:state-update", (e) => {
+      const update = e.payload;
+      console.log("[mountStore] state-update:", update.mountId, update.state, update);
+      setState("states", update.mountId, reconcile(update));
+    });
 
-  listen<boolean>("mount:connection", (e) => {
-    console.log("[mountStore] connection:", e.payload);
-    setState("connected", e.payload);
-  });
+    await listen<boolean>("mount:connection", (e) => {
+      console.log("[mountStore] connection:", e.payload);
+      setState("connected", e.payload);
+    });
+
+    listenersSetUp = true;
+  })();
+
+  return listenerSetupPromise;
 }
 
 /** Get the mount state for a given path via prefix matching against mount paths. */
@@ -92,7 +104,7 @@ function getMountForPath(path: string): MountStateUpdate | undefined {
 
 async function loadStates() {
   console.log("[mountStore] loadStates called");
-  setupListeners();
+  await setupListeners();
   try {
     const states = await mountGetStates();
     console.log("[mountStore] initial states:", states);

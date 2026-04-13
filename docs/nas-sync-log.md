@@ -2165,3 +2165,44 @@ dead references remain. Not urgent — safe to defer.
   Will disappear on next `cargo clean`.
 - `LICENSES/WinFSP-LICENSE.txt` and the corresponding `THIRD_PARTY_NOTICES.txt` entry
   were removed in this session.
+
+---
+
+## 2026-04-12 — v0.3.2
+
+### Phonebook `endpoint.json` atomic write
+
+`peer_manager.rs::register_endpoint` previously used plain `std::fs::write`, which
+does create + truncate + stream. On high-latency SMB (observed over a WireGuard
+tunnel) a mid-write interruption left the file partial/corrupt, and LAN peers
+silently dropped the entry during `serde_json::from_str` in `discover_peers`.
+
+Changed to tmp-file write + `std::fs::rename`. Matches the pattern already used by
+`mesh_sync.rs::snapshot_to_db`.
+
+Cross-platform: `peer_manager.rs` is shared code, applies to macOS automatically.
+
+### Windows agent: SMB session awaited before Mounted
+
+`orchestrator.rs::mount_drive` (Windows, regular/non-sync mounts) previously spawned
+`establish_smb_session` as `tokio::spawn` fire-and-forget, so the `Mounted` state
+fired before the SMB session was live. First-launch click on a mount bookmark
+followed the symlink to a UNC with no session behind it; `listDirectory` failed
+and `fileStore.ts::navigateTo` swallowed the error.
+
+Changed to await the `spawn_blocking` session call before returning from
+`mount_drive`.
+
+macOS path already awaits `macos_smb_mount` synchronously — no change needed.
+
+### Cross-VPN reachability observation
+
+Ping from LAN to the VPN-pool client IP times out. TCP on port 49200 (mesh HTTP)
+succeeds. Future debug should probe with `curl` / `Test-NetConnection -Port 49200`,
+not `ping`.
+
+### Version bump
+
+0.3.1 → 0.3.2 in `package.json`, `src-tauri/Cargo.toml`,
+`mediamount-agent/Cargo.toml`, `src-tauri/tauri.conf.json`,
+`installer/ufb_tauri_installer.iss`.
