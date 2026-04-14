@@ -441,35 +441,28 @@ fn create_symlinks_and_exit() {
     );
 }
 
-/// macOS: ensure the stable symlink directory exists at /opt/ufb/mounts/.
-/// This is a one-time operation that requires admin privileges.
-/// Uses osascript to prompt the user for their password.
+/// macOS: ensure the user-facing mount directories exist.
+///
+/// Both live under user-owned paths (no admin required):
+/// - `~/ufb/mounts/` — user-facing symlinks to actual mount points
+/// - `~/.local/share/ufb/smb-mounts/` — private mountpoints for `mount_smbfs` targets
+///
+/// Legacy `/opt/ufb/mounts/` is left in place if present (harmless on upgrade);
+/// future installs will never need admin privileges again.
 #[cfg(target_os = "macos")]
 fn ensure_macos_mount_dir() {
-    let mount_dir = std::path::Path::new("/opt/ufb/mounts");
-    if mount_dir.exists() {
-        return;
+    let volumes_base = crate::config::MountConfig::volumes_base();
+    if let Err(e) = std::fs::create_dir_all(&volumes_base) {
+        log::error!(
+            "Failed to create {}: {}",
+            volumes_base.display(),
+            e
+        );
     }
 
-    log::info!("First run: creating /opt/ufb/mounts/ (requires admin)");
-
-    let script = r#"do shell script "mkdir -p /opt/ufb/mounts && chown root:staff /opt/ufb/mounts && chmod 775 /opt/ufb/mounts" with administrator privileges"#;
-
-    let result = std::process::Command::new("osascript")
-        .args(["-e", script])
-        .output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            log::info!("Created /opt/ufb/mounts/ successfully");
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::error!("Failed to create /opt/ufb/mounts/: {}", stderr.trim());
-        }
-        Err(e) => {
-            log::error!("Failed to run osascript: {}", e);
-        }
+    let smb_base = crate::config::MountConfig::smb_mount_base();
+    if let Err(e) = std::fs::create_dir_all(&smb_base) {
+        log::error!("Failed to create {}: {}", smb_base.display(), e);
     }
 }
 

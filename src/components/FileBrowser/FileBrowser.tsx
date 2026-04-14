@@ -16,7 +16,9 @@ import {
   buildUfbUri,
   buildUnionUri,
   createJobFromTemplate,
+  quicklookPreview,
 } from "../../lib/tauri";
+import { platformStore } from "../../stores/platformStore";
 import { transcodeStore } from "../../stores/transcodeStore";
 import { workspaceStore } from "../../stores/workspaceStore";
 import { adjustMenuPosition } from "../../lib/contextMenuPosition";
@@ -543,6 +545,16 @@ export function FileBrowser(props: FileBrowserProps) {
     } else if (modKey && e.shiftKey && e.key === "N") {
       e.preventDefault();
       openNewFolderModal();
+    } else if (e.key === " " && !modKey && !e.shiftKey && !e.altKey && platformStore.platform === "mac") {
+      // macOS Quick Look — same as spacebar in Finder. The panel is owned by
+      // macOS, not us; second spacebar / ESC dismisses it natively.
+      const paths = getSelectedPaths();
+      if (paths.length > 0) {
+        e.preventDefault();
+        quicklookPreview(paths).catch((err) => {
+          console.debug("[quicklook] preview failed:", err);
+        });
+      }
     }
   }
 

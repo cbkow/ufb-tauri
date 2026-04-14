@@ -255,6 +255,7 @@ pub fn run() {
             commands::mount_clear_sync_cache,
             commands::mount_create_symlinks,
             commands::trigger_freshness_sweep,
+            commands::quicklook_preview,
             // App lifecycle
             commands::relaunch_app,
             // Platform

@@ -2846,3 +2846,87 @@ End-to-end test on Windows once built:
   (no further action — Windows is no-op).
 - Two-machine concurrent write → conflict sidecar appears in folder (existing
   behavior, naming format may differ until cleanup pass).
+
+---
+
+## 2026-04-14 — v0.3.3 macOS mount cleanup + percent-encoding fix + Quick Look
+
+Incremental polish on top of v0.3.3 freshness work. Three landed changes:
+
+### 1. `mount_smbfs` silent-first with `open smb://` fallback
+
+`macos_smb_mount` now tries `mount_smbfs -N smb://host/share {user-owned-path}`
+first. Login Keychain handles credentials silently. On failure (no Keychain
+entry, auth rejected, etc.) falls back to `open smb://` which triggers
+macOS's native Connect-to-Server dialog with "Remember in my keychain"
+pre-checked. After the one-time authentication, future launches are silent.
+
+- SMB mountpoint: `~/.local/share/ufb/smb-mounts/{share}/` (user-owned)
+- User-facing symlink: `~/ufb/mounts/{share}/` (unchanged pattern, new base path)
+- Removed the `osascript ... with administrator privileges` call that
+  previously created `/opt/ufb/mounts/` on first launch — no more admin
+  prompt
+- Password field in `MountConfig` still accepted but unused on macOS;
+  credential management delegated to the Keychain entirely
+
+### 2. Percent-encoding fix for usernames with spaces
+
+`unc_to_smb_url` now percent-encodes the userinfo component per RFC 3986.
+Previously a username like `"first last"` produced the URL
+`smb://first last@host/share`, which `mount_smbfs` rejects with
+"URL parsing failed: Invalid argument". Finder's `open smb://` tolerates
+unencoded spaces but mount_smbfs is strict.
+
+Encoded version `smb://first%20last@host/share` works in both.
+
+### 3. Spacebar Quick Look in file browsers (macOS only)
+
+New Tauri command `quicklook_preview(paths: Vec<String>)` shells out to
+`qlmanage -p` — Apple's standard way for third-party apps to invoke Quick
+Look. File browser's keyboard handler gains a space-key branch that fires
+on mac when at least one entry is selected and no input is focused.
+Multi-select, folders, directories all handled by Quick Look natively.
+
+Known cosmetic limitation: `qlmanage -p` shows "[Debug]" in the panel title
+bar because qlmanage is technically Apple's Quick Look debug tool. The
+preview itself is the real panel. Proper title bar would require a Swift
+helper in `mediamount-tray` exposing `QLPreviewPanel` directly; filed as
+future polish.
+
+### What we tried and reverted — "share root + subpath symlink"
+
+A deeper iteration attempted to fix silent-mount for SMB shares with
+subpath UNCs (e.g. `\\host\FlameServer\Flame\FLAME_JOBS`). The theory:
+Apple's Keychain stores path-scoped entries for subpath mounts but
+mount_smbfs only looks up host-scoped entries, so deep-path URLs always
+fail Keychain lookup.
+
+**Attempted fix**: parse UNC into `(host, share_root, subpath)`. Mount
+only the share root via mount_smbfs at a new nested path
+`{smb_base}/{host}/{share_root}/`. Symlink the subpath for user-facing
+access. Reference-counted physical mounts so multiple UFB configs sharing
+the same share reuse one physical mount.
+
+**Why reverted:**
+- The on-disk layout change from flat `{smb_base}/{share}/` to nested
+  `{smb_base}/{host}/{share_root}/` tripped over stale mounts from the
+  previous version → `mount_smbfs` returned "File exists" errors every
+  launch
+- `poll_for_new_volume` fallback timed out 60s per already-mounted share
+  because `open smb://` becomes a no-op when the target /Volumes/ path
+  exists
+- Retry + legacy-path checks patched symptoms but the architecture felt
+  fragile
+- Cold-start "Authentication error" from Apple's SMB framework added
+  diagnostic noise that masked the real bugs
+
+**Better shape for next attempt** (filed as task #28):
+- Don't change on-disk layout — keep `{smb_base}/{share_name}/`
+- Just change the URL passed to mount_smbfs from the full subpath form
+  to the share-root form, and symlink into the mount for user-facing
+  subpath access
+- Migration is a no-op because paths stay the same
+- Existing find-existing-mount logic keeps working
+
+One Finder dialog per affected share per launch is the current-build
+limitation. Works, ugly. Fix when there's time.

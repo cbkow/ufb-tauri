@@ -1065,6 +1065,38 @@ pub async fn mount_create_symlinks(state: State<'_, AppState>) -> Result<(), Str
         .await
 }
 
+/// Invoke macOS Quick Look on one or more absolute file paths. Same preview
+/// panel Finder shows when you press spacebar. Fire-and-forget: the panel is
+/// owned by Apple's QuickLook daemon, not us, so it survives UFB navigation
+/// and is dismissed natively by spacebar/ESC.
+///
+/// Returns an error on non-macOS platforms (command stays registered cross-
+/// platform so the frontend can invoke it unconditionally; platform gating
+/// lives in the UI layer).
+#[tauri::command]
+pub fn quicklook_preview(paths: Vec<String>) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        Command::new("qlmanage")
+            .arg("-p")
+            .args(&paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn qlmanage: {}", e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = paths;
+        Err("quicklook_preview is macOS-only".to_string())
+    }
+}
+
 /// User-driven freshness signal — fired on window focus, F5/Ctrl+R, refresh
 /// buttons, project tab activation. Forwards to the agent, which posts the
 /// platform's freshness signal (Darwin notification on macOS so the

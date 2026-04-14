@@ -326,7 +326,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                         <SettingsInput
                           class="pm-cell pm-input"
                           value={mapping.mac}
-                          placeholder="/opt/ufb/mounts/nas"
+                          placeholder="~/ufb/mounts/nas"
                           onCommit={(v) => {
                             settingsStore.setSettings("pathMappings", i(), "mac", v);
                             settingsStore.save();
@@ -816,61 +816,73 @@ function MountsSection(props: {
         </div>
       </div>
 
-      {/* ── Saved Credentials ── */}
-      <details open={credSectionOpen()} onToggle={(e) => setCredSectionOpen((e.target as HTMLDetailsElement).open)}>
-        <summary><h3 style={{ display: "inline", cursor: "pointer" }}>Saved Credentials</h3></summary>
-        <div style={{ "margin-top": "var(--spacing-sm)" }}>
-          <Show when={savedCreds().length > 0}>
-            <For each={savedCreds()}>
-              {(cred) => (
-                <div class="mount-config-item">
-                  <div class="mount-config-header">
-                    <span class="mount-config-name">{cred.key}</span>
-                    <span class="mount-config-detail">{cred.username}</span>
-                  </div>
-                  <div class="mount-config-actions">
-                    <button class="settings-btn" onClick={() => {
-                      setCredFormMode("edit");
-                      setEditingCredKey(cred.key);
-                      setEditingCredUsername(cred.username);
-                    }}>Edit</button>
-                    <button class="settings-btn" onClick={() => setConfirmDeleteCred(cred.key)}>Delete</button>
-                  </div>
-                </div>
-              )}
-            </For>
-          </Show>
-          <Show when={savedCreds().length === 0 && credFormMode() === null}>
-            <p class="settings-hint">No saved credentials. Credentials are stored securely and referenced by name in mount configs.</p>
-          </Show>
+      {/* ── Saved Credentials ── (hidden on macOS — Keychain handles it) */}
+      <Show when={props.platform() === "mac"}>
+        <h3>Credentials</h3>
+        <p class="settings-hint" style={{ "margin-bottom": "var(--spacing-sm)" }}>
+          UFB uses the macOS login Keychain for SMB credentials. On first connection
+          to each share, macOS shows a dialog — check "Remember this password in my
+          keychain" and subsequent mounts are silent. Manage saved SMB credentials in
+          the built-in <strong>Keychain Access</strong> app (search for <em>smb:</em>).
+        </p>
+      </Show>
 
-          <Show when={credFormMode() === null}>
-            <button
-              class="settings-btn"
-              style={{ "margin-top": "var(--spacing-sm)" }}
-              onClick={() => { setCredFormMode("add"); setEditingCredKey(""); setEditingCredUsername(""); }}
-            >+ Add Credential</button>
-          </Show>
+      <Show when={props.platform() !== "mac"}>
+        <details open={credSectionOpen()} onToggle={(e) => setCredSectionOpen((e.target as HTMLDetailsElement).open)}>
+          <summary><h3 style={{ display: "inline", cursor: "pointer" }}>Saved Credentials</h3></summary>
+          <div style={{ "margin-top": "var(--spacing-sm)" }}>
+            <Show when={savedCreds().length > 0}>
+              <For each={savedCreds()}>
+                {(cred) => (
+                  <div class="mount-config-item">
+                    <div class="mount-config-header">
+                      <span class="mount-config-name">{cred.key}</span>
+                      <span class="mount-config-detail">{cred.username}</span>
+                    </div>
+                    <div class="mount-config-actions">
+                      <button class="settings-btn" onClick={() => {
+                        setCredFormMode("edit");
+                        setEditingCredKey(cred.key);
+                        setEditingCredUsername(cred.username);
+                      }}>Edit</button>
+                      <button class="settings-btn" onClick={() => setConfirmDeleteCred(cred.key)}>Delete</button>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </Show>
+            <Show when={savedCreds().length === 0 && credFormMode() === null}>
+              <p class="settings-hint">No saved credentials. Credentials are stored securely and referenced by name in mount configs.</p>
+            </Show>
 
-          <Show when={credFormMode() !== null}>
-            <InlineCredentialForm
-              initialName={credFormMode() === "edit" ? editingCredKey() : ""}
-              initialUsername={credFormMode() === "edit" ? editingCredUsername() : ""}
-              nameReadOnly={credFormMode() === "edit"}
-              onSave={async (name, username, password) => {
-                try {
-                  await mountStoreCredentials(name, username, password);
-                  await refreshCreds();
-                  setCredFormMode(null);
-                } catch (e) {
-                  console.error("Failed to save credential:", e);
-                }
-              }}
-              onCancel={() => setCredFormMode(null)}
-            />
-          </Show>
-        </div>
-      </details>
+            <Show when={credFormMode() === null}>
+              <button
+                class="settings-btn"
+                style={{ "margin-top": "var(--spacing-sm)" }}
+                onClick={() => { setCredFormMode("add"); setEditingCredKey(""); setEditingCredUsername(""); }}
+              >+ Add Credential</button>
+            </Show>
+
+            <Show when={credFormMode() !== null}>
+              <InlineCredentialForm
+                initialName={credFormMode() === "edit" ? editingCredKey() : ""}
+                initialUsername={credFormMode() === "edit" ? editingCredUsername() : ""}
+                nameReadOnly={credFormMode() === "edit"}
+                onSave={async (name, username, password) => {
+                  try {
+                    await mountStoreCredentials(name, username, password);
+                    await refreshCreds();
+                    setCredFormMode(null);
+                  } catch (e) {
+                    console.error("Failed to save credential:", e);
+                  }
+                }}
+                onCancel={() => setCredFormMode(null)}
+              />
+            </Show>
+          </div>
+        </details>
+      </Show>
 
       {/* Confirm delete credential */}
       <Show when={confirmDeleteCred()}>
@@ -1140,6 +1152,8 @@ function MountsSection(props: {
               />
             </div>
 
+            {/* Credential dropdown — hidden on macOS (Keychain handles auth) */}
+            <Show when={props.platform() !== "mac"}>
             <div class="settings-field">
               <div class="settings-field-header">
                 <span>Credential</span>
@@ -1182,6 +1196,7 @@ function MountsSection(props: {
                 />
               </Show>
             </div>
+            </Show>
 
             {/* Drive letter — Windows only, hidden when sync enabled */}
             <Show when={props.platform() === "win" && !m().syncEnabled}>
@@ -1208,7 +1223,7 @@ function MountsSection(props: {
                     <span class="settings-help" title="Stable symlink path that points to the mounted SMB share. Drag to Finder Favorites for quick access.">?</span>
                   </div>
                   <div class="settings-value-display">
-                    {mountStore.getMountPath(m()!) || `/opt/ufb/mounts/${mountStore.getShareName(m())}`}
+                    {mountStore.getMountPath(m()!) || mountStore.getMountPath(m())}
                   </div>
                 </label>
                 <details style={{ "margin-top": "var(--spacing-sm)" }}>

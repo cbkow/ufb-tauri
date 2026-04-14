@@ -45,7 +45,7 @@ pub struct MountConfig {
 
     // ── macOS mount path ──
 
-    /// User-facing mount path on macOS — symlink in /opt/ufb/mounts/ (e.g. "/opt/ufb/mounts/nas-main")
+    /// User-facing mount path on macOS — symlink in ~/ufb/mounts/ (e.g. "~/ufb/mounts/nas-main")
     #[serde(default)]
     pub mount_path_macos: Option<String>,
 
@@ -230,7 +230,11 @@ impl MountConfig {
         }
         #[cfg(target_os = "macos")]
         {
-            PathBuf::from("/opt/ufb/mounts")
+            // User-owned path — no admin required. ~/ufb/mounts/
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join("ufb/mounts");
+            }
+            PathBuf::from("/tmp/ufb-mounts")
         }
         #[cfg(target_os = "linux")]
         {
@@ -239,6 +243,17 @@ impl MountConfig {
             }
             PathBuf::from("/tmp/ufb-mnt")
         }
+    }
+
+    /// Private base directory where SMB shares are actually mounted on macOS
+    /// (via `mount_smbfs`). User-facing symlinks in `volumes_base()` point
+    /// here for non-sync mounts. Not a user-facing path.
+    #[cfg(target_os = "macos")]
+    pub fn smb_mount_base() -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".local/share/ufb/smb-mounts");
+        }
+        PathBuf::from("/tmp/ufb-smb-mounts")
     }
 
     /// Default cache root for sync data.
@@ -274,7 +289,7 @@ impl MountConfig {
 
     /// The user-facing path for this mount (where the user navigates).
     /// Windows: C:\Volumes\ufb\{shareName} (symlink)
-    /// macOS: /opt/ufb/mounts/{shareName} or explicit override
+    /// macOS: ~/ufb/mounts/{shareName} or explicit override
     /// Linux: ~/.local/share/ufb/mnt/{id} or explicit override
     pub fn mount_path(&self) -> String {
         #[cfg(windows)]
@@ -454,7 +469,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_mount_path() {
         let m = test_mount("test", r"\\nas\test");
-        assert_eq!(m.mount_path(), "/opt/ufb/mounts/test");
+        let path = m.mount_path();
+        assert!(path.ends_with("ufb/mounts/test"), "expected path ending with ufb/mounts/test, got: {}", path);
     }
 
     #[test]
@@ -582,7 +598,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn test_mount_path_macos() {
         let m = test_mount("primary-nas", r"\\192.168.40.100\Jobs_Live");
-        assert_eq!(m.mount_path(), "/opt/ufb/mounts/Jobs_Live");
+        let path = m.mount_path();
+        assert!(path.ends_with("ufb/mounts/Jobs_Live"), "expected path ending with ufb/mounts/Jobs_Live, got: {}", path);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
@@ -10,16 +10,20 @@ fn mount_mutex() -> &'static Mutex<()> {
     MOUNT_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Mount an SMB share on macOS using `open smb://`.
+/// Mount an SMB share on macOS.
 ///
-/// Flow:
-/// 1. Record current /Volumes/ contents
-/// 2. Run `open smb://user@server/share`
-/// 3. Poll /Volumes/ to discover the new mount point
-/// 4. Return the actual mount path (handles -1/-2 suffix variance)
+/// Strategy (silent-first, native-fallback):
+/// 1. Check if already mounted (user-owned location or `/Volumes/`). Reuse if so.
+/// 2. Try `mount_smbfs -N smb://host/share ~/.local/share/ufb/smb-mounts/{share}`
+///    — silent, uses credentials stored in the macOS login Keychain.
+/// 3. If that fails, fall back to `open smb://user@host/share` — macOS's
+///    native Connect to Server dialog appears with "Remember in my keychain"
+///    pre-checked. User enters credentials once; future sessions satisfy
+///    step 2 silently.
 ///
 /// `nas_share_path` is UNC format: `\\server\share`
-/// `username` may be empty for guest access.
+/// `username` may be empty for guest access. Password is intentionally unused
+/// — credential management is delegated to the macOS login Keychain.
 pub fn macos_smb_mount(
     nas_share_path: &str,
     username: &str,
@@ -36,19 +40,35 @@ pub fn macos_smb_mount(
         .unwrap_or("")
         .to_string();
 
-    // Check if already mounted (e.g. from a previous session or manual Finder mount)
-    let already_mounted = find_existing_volume(&expected_name, nas_share_path);
-    if let Some(existing) = already_mounted {
+    // Check if already mounted (user-owned location first, then /Volumes/ fallback
+    // for shares a user may have mounted manually via Finder).
+    if let Some(existing) = find_existing_user_mount(&expected_name) {
+        log::info!("macOS: share already mounted at {}", existing);
+        return Ok(existing);
+    }
+    if let Some(existing) = find_existing_volume(&expected_name, nas_share_path) {
         log::info!("macOS: share already mounted at {}", existing);
         return Ok(existing);
     }
 
-    // Snapshot /Volumes/ before mount
-    let before = list_volumes();
+    // ── Silent path via Keychain ───────────────────────────────────────────
+    match try_mount_smbfs(&expected_name, nas_share_path, username) {
+        Ok(path) => {
+            log::info!("macOS: silently mounted at {} via mount_smbfs", path);
+            return Ok(path);
+        }
+        Err(e) => {
+            log::info!(
+                "macOS: mount_smbfs silent mount unavailable ({}), falling back to native dialog",
+                e
+            );
+        }
+    }
 
-    // Convert UNC path to smb:// URL
+    // ── Fallback: native Finder dialog (one-time, Keychain fills in after) ──
+    let before = list_volumes();
     let smb_url = unc_to_smb_url(nas_share_path, username);
-    log::info!("macOS: mounting via `open {}`", smb_url);
+    log::info!("macOS: mounting via `open {}` (Finder will prompt if first time)", smb_url);
 
     let output = Command::new("open")
         .arg(&smb_url)
@@ -60,11 +80,79 @@ pub fn macos_smb_mount(
         return Err(format!("open smb:// failed: {}", stderr.trim()));
     }
 
-    // Poll /Volumes/ for the new mount point (macOS mounts asynchronously)
+    // Poll /Volumes/ for the new mount point (macOS mounts asynchronously).
     let mount_point = poll_for_new_volume(&before, nas_share_path)?;
     log::info!("macOS: mounted at {}", mount_point);
 
     Ok(mount_point)
+}
+
+/// Attempt a silent `mount_smbfs -N` using credentials from the login Keychain.
+/// Returns the mount path on success. Returns Err with stderr on any failure.
+fn try_mount_smbfs(
+    share_name: &str,
+    nas_share_path: &str,
+    username: &str,
+) -> Result<String, String> {
+    let smb_base = crate::config::MountConfig::smb_mount_base();
+    std::fs::create_dir_all(&smb_base)
+        .map_err(|e| format!("Failed to create SMB mount base: {}", e))?;
+    let mountpoint = smb_base.join(share_name);
+
+    if mountpoint.exists() {
+        if is_mountpoint(&mountpoint) {
+            return Ok(mountpoint.to_string_lossy().to_string());
+        }
+        let _ = std::fs::remove_dir(&mountpoint);
+    }
+    std::fs::create_dir_all(&mountpoint)
+        .map_err(|e| format!("Failed to create mountpoint {}: {}", mountpoint.display(), e))?;
+
+    let smb_url = unc_to_smb_url(nas_share_path, username);
+
+    let output = Command::new("mount_smbfs")
+        .arg("-N")
+        .arg(&smb_url)
+        .arg(&mountpoint)
+        .output()
+        .map_err(|e| format!("Failed to run mount_smbfs: {}", e))?;
+
+    if output.status.success() {
+        Ok(mountpoint.to_string_lossy().to_string())
+    } else {
+        let _ = std::fs::remove_dir(&mountpoint);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(stderr.trim().to_string())
+    }
+}
+
+/// Check if a path is a mountpoint by comparing device IDs of path and parent.
+fn is_mountpoint(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let parent_meta = match std::fs::metadata(parent) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    path_meta.dev() != parent_meta.dev()
+}
+
+/// Check if a matching share is already mounted at our user-owned base.
+fn find_existing_user_mount(share_name: &str) -> Option<String> {
+    let smb_base = crate::config::MountConfig::smb_mount_base();
+    let candidate = smb_base.join(share_name);
+    if is_mountpoint(&candidate) {
+        Some(candidate.to_string_lossy().to_string())
+    } else {
+        None
+    }
 }
 
 /// Unmount an SMB share on macOS.
@@ -104,16 +192,35 @@ pub fn macos_smb_unmount(volumes_path: &str) -> Result<(), String> {
 
 /// Convert a UNC path to an smb:// URL.
 /// `\\server\share` → `smb://user@server/share` (or `smb://server/share` if no user)
+///
+/// Usernames are percent-encoded per RFC 3986 userinfo rules so that names
+/// containing spaces or other reserved characters produce a URL that
+/// `mount_smbfs` accepts. Finder's `open smb://` tolerates unencoded
+/// usernames; percent-encoded ones work in both.
 fn unc_to_smb_url(unc_path: &str, username: &str) -> String {
-    // Strip leading backslashes and normalize
     let stripped = unc_path.trim_start_matches('\\').replace('\\', "/");
-
     if username.is_empty() {
         format!("smb://{}", stripped)
     } else {
-        // Insert user@ before the server
-        format!("smb://{}@{}", username, stripped)
+        format!("smb://{}@{}", percent_encode_userinfo(username), stripped)
     }
+}
+
+/// Percent-encode a string for use in the userinfo component of a URL.
+/// Preserves unreserved characters and userinfo-safe sub-delims (RFC 3986 §3.2.1).
+/// Encodes everything else — critically including ` `, `@`, `:`, `/`.
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'.' | b'_' | b'~'
+            | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+            | b'*' | b'+' | b',' | b';' | b'=' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 /// Check if a volume matching the expected name is already mounted from the correct server.
@@ -266,6 +373,24 @@ mod tests {
             unc_to_smb_url(r"\\server.local\share\subfolder", "admin"),
             "smb://admin@server.local/share/subfolder"
         );
+    }
+
+    #[test]
+    fn test_unc_to_smb_url_username_with_space() {
+        // Regression: mount_smbfs rejects unencoded spaces in usernames.
+        assert_eq!(
+            unc_to_smb_url(r"\\nas\share", "first last"),
+            "smb://first%20last@nas/share"
+        );
+    }
+
+    #[test]
+    fn test_percent_encode_userinfo_common_chars() {
+        assert_eq!(percent_encode_userinfo("alice"), "alice");
+        assert_eq!(percent_encode_userinfo("first last"), "first%20last");
+        assert_eq!(percent_encode_userinfo("user:pass"), "user%3Apass");
+        assert_eq!(percent_encode_userinfo("a@b"), "a%40b");
+        assert_eq!(percent_encode_userinfo("a.b-c_d"), "a.b-c_d");
     }
 
     #[test]

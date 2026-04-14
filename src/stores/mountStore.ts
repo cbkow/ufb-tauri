@@ -199,7 +199,7 @@ function getMountPath(cfg: MountConfig): string {
       const displayName = (cfg.displayName || shareName).replace(/\s+/g, "");
       return `${platformStore.home}/Library/CloudStorage/UFB-${displayName}`;
     }
-    return `/opt/ufb/mounts/${shareName}`;
+    return `${platformStore.home}/ufb/mounts/${shareName}`;
   }
   // Linux: explicit path or auto-derived from mount ID
   if (cfg.mountPathLinux) return cfg.mountPathLinux;

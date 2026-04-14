@@ -317,6 +317,11 @@ export const getPlatform = () => invoke<string>("get_platform");
 export const mountSmbShare = (host: string, share: string, username: string, password: string) =>
   invoke<string>("mount_smb_share", { host, share, username, password });
 
+/** macOS Quick Look preview. Accepts multiple absolute paths (multi-select).
+ *  Returns an error on non-macOS platforms — callers should platform-gate. */
+export const quicklookPreview = (paths: string[]) =>
+  invoke<void>("quicklook_preview", { paths });
+
 // ── App lifecycle ──
 
 export const relaunchApp = () => invoke<void>("relaunch_app");

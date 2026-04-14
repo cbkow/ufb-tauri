@@ -183,7 +183,8 @@ fn ensure_cache(state: &ServerState, domain: &str) {
     // Need to open — use write lock
     let config = config::load_config();
     if let Some(mount) = config.mounts.iter().find(|m| m.share_name() == domain && m.enabled && m.is_sync_mode()) {
-        let nas_root = PathBuf::from("/Volumes").join(&mount.share_name());
+        let nas_root = resolve_smb_mount_path(&mount.share_name())
+            .unwrap_or_else(|| PathBuf::from("/Volumes").join(&mount.share_name()));
         match MacosCache::open(domain, nas_root, mount.sync_cache_limit_bytes) {
             Ok(cache) => {
                 log::info!("[FileOps] Cache opened on demand for domain: {}", domain);
@@ -204,6 +205,37 @@ where F: FnOnce(&MacosCache) -> R {
     caches.get(domain).map(f)
 }
 
+/// Locate the actual filesystem path where a share is mounted on macOS.
+/// Checks the user-owned `mount_smbfs` target first, then falls back to
+/// `/Volumes/{share}` (populated by `open smb://` or manual Finder mounts).
+#[cfg(target_os = "macos")]
+fn resolve_smb_mount_path(share_name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let candidates = [
+        config::MountConfig::smb_mount_base().join(share_name),
+        PathBuf::from("/Volumes").join(share_name),
+    ];
+    for candidate in &candidates {
+        let path_meta = match std::fs::metadata(candidate) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let parent_meta = match candidate.parent().and_then(|p| std::fs::metadata(p).ok()) {
+            Some(m) => m,
+            None => continue,
+        };
+        if path_meta.dev() != parent_meta.dev() {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_smb_mount_path(_share_name: &str) -> Option<PathBuf> {
+    None
+}
+
 // ── Path resolution ──
 
 fn resolve_path(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
@@ -214,16 +246,12 @@ fn resolve_path(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
         .find(|m| m.share_name() == domain && m.enabled)
         .ok_or_else(|| format!("No enabled mount found for domain '{}'", domain))?;
 
-    // macOS: all mounts go through FileProvider, resolve to /Volumes/{share} directly
-    // (not through the symlink which points to CloudStorage — circular)
+    // macOS: resolve to the actual SMB mount path (user-owned or /Volumes/
+    // fallback). Don't resolve via mount.mount_path() — that's the user-facing
+    // symlink, which for sync mode points to CloudStorage (circular).
     #[cfg(target_os = "macos")]
-    let base = {
-        let volumes_path = PathBuf::from("/Volumes").join(&mount.share_name());
-        if !volumes_path.exists() {
-            return Err(format!("SMB mount not found at {}", volumes_path.display()));
-        }
-        volumes_path
-    };
+    let base = resolve_smb_mount_path(&mount.share_name())
+        .ok_or_else(|| format!("SMB mount not found for share '{}'", mount.share_name()))?;
     #[cfg(not(target_os = "macos"))]
     let base = PathBuf::from(mount.mount_path());
 
@@ -258,7 +286,8 @@ fn resolve_path_for_write(domain: &str, relative_path: &str) -> Result<PathBuf, 
                 .find(|m| m.share_name() == domain && m.enabled)
                 .ok_or_else(|| format!("No mount for domain '{}'", domain))?;
             #[cfg(target_os = "macos")]
-            let base = PathBuf::from("/Volumes").join(&mount.share_name());
+            let base = resolve_smb_mount_path(&mount.share_name())
+                .unwrap_or_else(|| PathBuf::from("/Volumes").join(&mount.share_name()));
             #[cfg(not(target_os = "macos"))]
             let base = PathBuf::from(mount.mount_path());
             Ok(base.join(relative_path))
@@ -856,7 +885,8 @@ fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsRespons
             .find(|m| m.share_name() == req.domain && m.enabled);
 
         let updated = if let Some(mount) = mount {
-            let nas_root = PathBuf::from("/Volumes").join(&mount.share_name());
+            let nas_root = resolve_smb_mount_path(&mount.share_name())
+                .unwrap_or_else(|| PathBuf::from("/Volumes").join(&mount.share_name()));
             std::fs::read_dir(&nas_root)
                 .into_iter()
                 .flatten()
