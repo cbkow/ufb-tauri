@@ -74,7 +74,19 @@ impl PassthroughFs {
     }
 
     fn rel_path(&self, fh: fileid3) -> Result<String, nfsstat3> {
-        self.cache.path_for_fh(fh).ok_or(nfsstat3::NFS3ERR_STALE)
+        match self.cache.path_for_fh(fh) {
+            Some(p) => Ok(p),
+            None => {
+                let total = self.cache.nfs_handles_count();
+                log::warn!(
+                    "[nfs-server] {}: STALE — no nfs_handles row for fh={} (table has {} rows total)",
+                    self.domain,
+                    fh,
+                    total
+                );
+                Err(nfsstat3::NFS3ERR_STALE)
+            }
+        }
     }
 
     /// Cold-path populate: do a single `fs::read_dir` on `parent_rel` and
@@ -115,6 +127,60 @@ impl PassthroughFs {
     fn root_attr(&self) -> Result<fattr3, nfsstat3> {
         let meta = std::fs::metadata(&self.nas_root).map_err(io_to_nfsstat)?;
         Ok(nfsserve::fs_util::metadata_to_fattr3(1, &meta))
+    }
+
+    /// Common tail for CREATE / MKDIR: stat the freshly-made entry, register
+    /// it in `known_files` (trigger assigns an `fh`), return `(fh, attr)`.
+    fn register_new_entry(
+        &self,
+        child_rel: &str,
+        name: &str,
+        abs: &std::path::Path,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let meta = std::fs::metadata(abs).map_err(io_to_nfsstat)?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let created = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(mtime);
+
+        self.cache.record_new_entry(
+            child_rel,
+            name,
+            meta.is_dir(),
+            meta.len(),
+            mtime,
+            created,
+        );
+
+        let fh = self
+            .cache
+            .fh_for_path(child_rel)
+            .ok_or(nfsstat3::NFS3ERR_IO)?;
+
+        log::debug!(
+            "[nfs-server] {}: registered new entry {} → fh={}",
+            self.domain,
+            child_rel,
+            fh
+        );
+
+        let attr = CachedAttr {
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            mtime,
+            created,
+            is_hydrated: false,
+            hydrated_size: 0,
+        };
+        Ok((fh, attr_from_cache(fh, &attr)))
     }
 
     /// Serve a read from the local cache file (fully-hydrated fast path).
@@ -346,15 +412,33 @@ impl NFSFileSystem for PassthroughFs {
             // Still verify it's a known child of the parent (defence against
             // a stale handle lingering for a different folder).
             if self.cache.cached_attr(&child_rel).is_some() {
+                log::debug!(
+                    "[nfs-server] {}: lookup(warm) {} → fh={}",
+                    self.domain, child_rel, fh
+                );
                 return Ok(fh);
             }
         }
 
         // Cold-path: populate the parent folder, then retry.
         self.populate_folder(&parent_rel)?;
-        self.cache
-            .fh_for_path(&child_rel)
-            .ok_or(nfsstat3::NFS3ERR_NOENT)
+        let result = self.cache.fh_for_path(&child_rel);
+        match result {
+            Some(fh) => {
+                log::debug!(
+                    "[nfs-server] {}: lookup(cold) {} → fh={}",
+                    self.domain, child_rel, fh
+                );
+                Ok(fh)
+            }
+            None => {
+                log::debug!(
+                    "[nfs-server] {}: lookup {} → NOENT",
+                    self.domain, child_rel
+                );
+                Err(nfsstat3::NFS3ERR_NOENT)
+            }
+        }
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -501,27 +585,75 @@ impl NFSFileSystem for PassthroughFs {
 
     async fn create(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
-        _attr: sattr3,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let parent_rel = self.rel_path(dirid)?;
+        let name = filename_to_string(filename)?;
+        let child_rel = join_rel(&parent_rel, &name);
+        let abs = self.absolute(&child_rel);
+
+        // CREATE (UNCHECKED) — overwrite is fine. `create(true)+truncate(true)`
+        // matches NFS semantics: if the file exists, the content is wiped.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&abs)
+            .map_err(io_to_nfsstat)?;
+        // Honor `sattr3.size` if the client requested a non-zero initial size
+        // (rare but the protocol allows it).
+        if let set_size3::size(new_size) = attr.size {
+            if new_size > 0 {
+                f.set_len(new_size).map_err(io_to_nfsstat)?;
+            }
+        }
+        drop(f);
+
+        self.register_new_entry(&child_rel, &name, &abs)
     }
 
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let parent_rel = self.rel_path(dirid)?;
+        let name = filename_to_string(filename)?;
+        let child_rel = join_rel(&parent_rel, &name);
+        let abs = self.absolute(&child_rel);
+
+        // EXCLUSIVE — fail if exists. `create_new` surfaces `EEXIST` which
+        // maps to `NFS3ERR_EXIST` via io_to_nfsstat.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs)
+            .map_err(io_to_nfsstat)?;
+
+        let (fh, _attr) = self.register_new_entry(&child_rel, &name, &abs)?;
+        Ok(fh)
     }
 
     async fn mkdir(
         &self,
-        _dirid: fileid3,
-        _dirname: &filename3,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name_preview = filename_to_string(dirname).unwrap_or_default();
+        log::debug!(
+            "[nfs-server] {}: mkdir(dirid={}, name={:?})",
+            self.domain, dirid, name_preview
+        );
+        let parent_rel = self.rel_path(dirid)?;
+        let name = filename_to_string(dirname)?;
+        let child_rel = join_rel(&parent_rel, &name);
+        let abs = self.absolute(&child_rel);
+
+        std::fs::create_dir(&abs).map_err(io_to_nfsstat)?;
+
+        self.register_new_entry(&child_rel, &name, &abs)
     }
 
     async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
@@ -602,6 +734,29 @@ impl NFSFileSystem for PassthroughFs {
     /// components via lookup(), so `localhost:/anything` would ENOENT.
     async fn path_to_id(&self, _path: &[u8]) -> Result<fileid3, nfsstat3> {
         Ok(self.root_dir())
+    }
+
+    /// Persistent NFS file handle encoding. The default `nfsserve` impl
+    /// prefixes with a generation number derived from server startup time,
+    /// which invalidates every client-cached handle on agent restart. Our
+    /// `fh` comes from `nfs_handles.fh` (SQLite AUTOINCREMENT — never reused)
+    /// and persists across restarts, so we use a fixed zero generation:
+    /// handles survive agent bounces without `umount`/`mount`.
+    fn id_to_fh(&self, id: fileid3) -> nfsserve::nfs::nfs_fh3 {
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&[0u8; 8]);
+        data.extend_from_slice(&id.to_le_bytes());
+        nfsserve::nfs::nfs_fh3 { data }
+    }
+
+    fn fh_to_id(&self, fh: &nfsserve::nfs::nfs_fh3) -> Result<fileid3, nfsstat3> {
+        if fh.data.len() != 16 {
+            return Err(nfsstat3::NFS3ERR_BADHANDLE);
+        }
+        let bytes: [u8; 8] = fh.data[8..16]
+            .try_into()
+            .map_err(|_| nfsstat3::NFS3ERR_BADHANDLE)?;
+        Ok(u64::from_le_bytes(bytes))
     }
 }
 

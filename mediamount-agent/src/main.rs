@@ -125,7 +125,20 @@ fn log_file_path() -> Option<std::path::PathBuf> {
 fn init_logging() {
     use simplelog::*;
 
-    let level = LevelFilter::Info;
+    // Honor RUST_LOG=debug (or UFB_DEBUG=1) for verbose diagnostics during
+    // development. Default is Info.
+    let level = match std::env::var("RUST_LOG")
+        .ok()
+        .as_deref()
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some(s) if s.contains("debug") => LevelFilter::Debug,
+        Some(s) if s.contains("trace") => LevelFilter::Trace,
+        Some(s) if s.contains("warn") => LevelFilter::Warn,
+        _ if std::env::var("UFB_DEBUG").ok().as_deref() == Some("1") => LevelFilter::Debug,
+        _ => LevelFilter::Info,
+    };
     let config = ConfigBuilder::new().set_time_format_rfc3339().build();
 
     let mut loggers: Vec<Box<dyn SharedLogger>> = vec![TermLogger::new(

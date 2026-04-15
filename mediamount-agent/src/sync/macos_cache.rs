@@ -393,6 +393,13 @@ impl MacosCache {
         }
         // Conn lock released here.
 
+        log::debug!(
+            "[macos-cache] record_enumeration parent={:?} entries={} → nfs_handles rows={}",
+            relative_path,
+            entries.len(),
+            self.nfs_handles_count()
+        );
+
         if !drifted.is_empty() {
             log::info!(
                 "[macos-cache] Enumeration drift: {} entries under {:?} — queued for eviction",
@@ -848,6 +855,41 @@ impl MacosCache {
             .map(|mut stmt| stmt.execute(params![bitmap, now, path]));
     }
 
+    /// Insert (or replace) a single entry into `known_files`. The AFTER
+    /// INSERT trigger mirrors the new path into `nfs_handles` and assigns
+    /// an `fh`. Used by NFS CREATE / MKDIR to register a freshly-created
+    /// file or folder without running `record_enumeration`'s orphan-scan
+    /// against the parent (which would erase sibling rows).
+    pub fn record_new_entry(
+        &self,
+        relative_path: &str,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+        mtime: f64,
+        created: f64,
+    ) {
+        let parent = parent_of(relative_path).to_string();
+        let conn = self.conn();
+        let _ = conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO known_files
+                     (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map(|mut stmt| {
+                stmt.execute(params![
+                    relative_path,
+                    name,
+                    is_dir as i32,
+                    size as i64,
+                    mtime,
+                    created,
+                    parent,
+                ])
+            });
+    }
+
     /// Invalidate the content cache for a file — clears `is_hydrated`, drops
     /// the chunk bitmap, and deletes the on-disk cache file. Metadata rows
     /// (size, mtime, fh) are left untouched; callers should follow up with
@@ -915,6 +957,15 @@ impl MacosCache {
         stmt.query_row(params![path], |row| row.get::<_, i64>(0))
             .ok()
             .map(|v| v as u64)
+    }
+
+    /// Diagnostic: total number of nfs_handles rows.
+    pub fn nfs_handles_count(&self) -> i64 {
+        let conn = self.conn();
+        conn.prepare_cached("SELECT COUNT(*) FROM nfs_handles")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
+            .unwrap_or(-1)
     }
 
     /// Reverse lookup: path for an NFS file handle.
