@@ -237,6 +237,13 @@ async fn run_event_loop() {
             std::sync::RwLock<std::collections::HashMap<String, std::path::PathBuf>>,
         > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
+        // Shared per-domain cache map — used by both the FileOps IPC server
+        // and the NFS loopback server (one MacosCache instance per DB file).
+        #[cfg(target_os = "macos")]
+        let shared_caches: ipc::fileops_server::SharedCaches = std::sync::Arc::new(
+            std::sync::RwLock::new(std::collections::HashMap::new()),
+        );
+
         // Start file operations server for FileProvider extension (macOS only).
         // It uses the same agent→UFB channel to emit out-of-band events such
         // as conflict-detected notifications.
@@ -245,6 +252,7 @@ async fn run_event_loop() {
             state_tx.clone(),
             std::sync::Arc::clone(&config_cache),
             std::sync::Arc::clone(&canonical_bases),
+            std::sync::Arc::clone(&shared_caches),
         );
 
         // Tray receives a copy of state updates
@@ -264,6 +272,7 @@ async fn run_event_loop() {
         #[cfg(target_os = "macos")]
         if std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1") {
             let config_for_nfs = std::sync::Arc::clone(&config_cache);
+            let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
             tokio::spawn(async move {
                 // Brief delay so mount_service has time to finish initial mounts
                 // before we try to canonicalize the SMB mount paths. Lifecycle
@@ -287,19 +296,39 @@ async fn run_event_loop() {
                         continue;
                     };
                     let share = mount.share_name();
-                    let cache = match sync::MacosCache::open(
-                        &share,
-                        root.clone(),
-                        mount.sync_cache_limit_bytes,
-                    ) {
-                        Ok(c) => std::sync::Arc::new(c),
-                        Err(e) => {
-                            log::error!(
-                                "[nfs-server] {}: failed to open cache: {}",
-                                share,
-                                e
-                            );
-                            continue;
+
+                    // Share a single MacosCache instance per domain with the
+                    // FileOps IPC server. Open on-demand and insert into the
+                    // shared map (fileops_server::ensure_cache uses the same
+                    // map, so either server populates and both see it).
+                    let cache = {
+                        let mut caches = caches_for_nfs.write().unwrap();
+                        if let Some(existing) = caches.get(&share).cloned() {
+                            existing
+                        } else {
+                            match sync::MacosCache::open(
+                                &share,
+                                root.clone(),
+                                mount.sync_cache_limit_bytes,
+                            ) {
+                                Ok(c) => {
+                                    let arc = std::sync::Arc::new(c);
+                                    caches.insert(share.clone(), std::sync::Arc::clone(&arc));
+                                    log::info!(
+                                        "[nfs-server] Cache opened (shared) for domain: {}",
+                                        share
+                                    );
+                                    arc
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "[nfs-server] {}: failed to open cache: {}",
+                                        share,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     };
                     sync::nfs_server::start(share, root, port, cache);

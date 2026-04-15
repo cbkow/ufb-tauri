@@ -848,6 +848,26 @@ impl MacosCache {
             .map(|mut stmt| stmt.execute(params![bitmap, now, path]));
     }
 
+    /// Invalidate the content cache for a file — clears `is_hydrated`, drops
+    /// the chunk bitmap, and deletes the on-disk cache file. Metadata rows
+    /// (size, mtime, fh) are left untouched; callers should follow up with
+    /// `update_nas_metadata` after the authoritative NAS state is known.
+    /// Called on every write path so subsequent reads re-hydrate from SMB.
+    pub fn invalidate_cache(&self, path: &str, fh: u64) {
+        {
+            let conn = self.conn();
+            let _ = conn
+                .prepare_cached(
+                    "UPDATE known_files
+                     SET is_hydrated = 0, hydrated_size = 0, chunk_bitmap = NULL
+                     WHERE path = ?1",
+                )
+                .map(|mut stmt| stmt.execute(params![path]));
+        }
+        let cache_path = self.cache_file_path(fh);
+        let _ = std::fs::remove_file(&cache_path);
+    }
+
     /// Mark a file as fully hydrated (all chunks cached). Nulls the bitmap
     /// since `is_hydrated=1` is the fast-path shortcut.
     pub fn mark_fully_hydrated(&self, path: &str, size: u64) {

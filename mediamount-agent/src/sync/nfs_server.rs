@@ -20,7 +20,10 @@
 use crate::sync::macos_cache::{self, CachedAttr, MacosCache, CHUNK_SIZE};
 use async_trait::async_trait;
 use nfsserve::{
-    nfs::{fattr3, fileid3, filename3, ftype3, mode3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3},
+    nfs::{
+        fattr3, fileid3, filename3, ftype3, mode3, nfspath3, nfsstat3, nfstime3, sattr3,
+        set_size3, specdata3,
+    },
     tcp::{NFSTcp, NFSTcpListener},
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
@@ -322,7 +325,7 @@ fn io_to_nfsstat(e: std::io::Error) -> nfsstat3 {
 #[async_trait]
 impl NFSFileSystem for PassthroughFs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        VFSCapabilities::ReadWrite
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -372,8 +375,40 @@ impl NFSFileSystem for PassthroughFs {
         Ok(attr_from_cache(id, &attr))
     }
 
-    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let rel = self.rel_path(id)?;
+        if rel.is_empty() {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        let abs = self.absolute(&rel);
+
+        // We honour truncate (editors do save-as-truncate-then-write). Mode,
+        // uid, gid, atime, mtime are passthrough no-ops — SMB doesn't expose
+        // fine-grained control we could proxy here, and NFS clients treat
+        // them as advisory.
+        if let set_size3::size(new_size) = setattr.size {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&abs)
+                .map_err(io_to_nfsstat)?;
+            f.set_len(new_size).map_err(io_to_nfsstat)?;
+            f.sync_all().map_err(io_to_nfsstat)?;
+            drop(f);
+
+            // Cached content is now stale — nuke it and refresh metadata.
+            self.cache.invalidate_cache(&rel, id);
+            if let Ok(meta) = std::fs::metadata(&abs) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                self.cache.update_nas_metadata(&rel, new_size, mtime);
+            }
+        }
+
+        self.getattr(id).await
     }
 
     async fn read(
@@ -411,8 +446,57 @@ impl NFSFileSystem for PassthroughFs {
         self.read_with_bitmap(id, &rel, &attr, offset, read_len, bitmap).await
     }
 
-    async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let rel = self.rel_path(id)?;
+        if rel.is_empty() {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        let abs = self.absolute(&rel);
+
+        // Write-through to SMB — authoritative. Keep file alive (create=false)
+        // so we don't clobber via open-truncate semantics; writes from NFS
+        // always target an existing path (CREATE makes the initial file).
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(&abs)
+            .map_err(io_to_nfsstat)?;
+        f.write_at(data, offset).map_err(io_to_nfsstat)?;
+        f.sync_all().map_err(io_to_nfsstat)?;
+
+        // Invalidate our cache — SMB is truth. Subsequent reads will
+        // re-hydrate on demand. (An in-place cache update is a Phase 3.1
+        // optimisation; correctness first.)
+        self.cache.invalidate_cache(&rel, id);
+
+        // Refresh cached metadata from the post-write stat.
+        let meta = std::fs::metadata(&abs).map_err(io_to_nfsstat)?;
+        let new_size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.cache.update_nas_metadata(&rel, new_size, mtime);
+
+        // Build fresh attr from the post-write metadata.
+        let created = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(mtime);
+        let attr = CachedAttr {
+            is_dir: false,
+            size: new_size,
+            mtime,
+            created,
+            is_hydrated: false,
+            hydrated_size: 0,
+        };
+        Ok(attr_from_cache(id, &attr))
     }
 
     async fn create(

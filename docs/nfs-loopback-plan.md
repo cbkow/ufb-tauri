@@ -229,8 +229,17 @@ gets conflict-sidecar behavior we already have.
 
 **Goal:** not crash-prone; handles edge cases gracefully.
 
-- Persistent handle stability across agent restarts (already is — `fh` is
-  SQLite rowid).
+- **Persistent handle stability across agent restarts.** Our `fh` values
+  (from the `nfs_handles` AUTOINCREMENT column) ARE stable on disk. But
+  the `nfsserve` crate wraps them in an opaque `nfs_fh3` with a generation
+  number derived from server startup time — so every agent restart
+  invalidates every cached NFS handle in every connected kernel client,
+  forcing a full `umount`/`mount` or silent stale-handle errors mid-use.
+  Fix: override the default `id_to_fh` / `fh_to_id` in our `NFSFileSystem`
+  impl to use a persistent generation (e.g. a fixed server-id loaded at
+  startup, or just drop the generation field entirely and store the raw
+  `fh` bytes). Validate by: agent restart + `ls` on the mount should work
+  without remount. This is prerequisite to real-user dogfood.
 - Stale handle semantics: deleted row + client still has old `fh` → return
   `NFS3ERR_STALE` cleanly (not panic).
 - NAS disconnect handling: transient `EAGAIN` / `ETIMEDOUT` surface as

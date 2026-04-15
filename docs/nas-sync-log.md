@@ -3205,3 +3205,44 @@ filler can layer on later.
 
 Full design in `docs/nfs-loopback-plan.md`. Next work item: schema
 migration + block-level read path.
+
+---
+
+## 2026-04-15 — NFS Phase 2 complete + Phase 3 slice 1
+
+Phase 2 landed as commit `740681a`. Live-tested with the 8 GB Resolve
+installer: cold 52.6 s (SMB-bandwidth-limited), warm 28.2 s (NFS localhost
+to local disk), ~2× speedup. Bigger wins for random-access / scrubbing
+workloads where only requested chunks are fetched.
+
+Phase 3 slice 1 (this commit):
+- #40 dup-cache-file bug fixed by sharing one `Arc<MacosCache>` per domain
+  between fileops_server and nfs_server via a `SharedCaches` type.
+  Verified: fresh hydration of `minrender-setup-0.4.1.exe` produced
+  exactly one cache file (`000077cf`) instead of the two we saw before.
+- SETATTR: honors truncate (editor save pattern), no-ops mode/uid/gid/
+  atime/mtime. Truncate invalidates the cache and refreshes nas_size.
+- WRITE: proxy to SMB authoritatively, invalidate cache on success,
+  refresh cached metadata. Simplest correct model — next read re-hydrates
+  from SMB.
+- `VFSCapabilities::ReadWrite` flipped on.
+- Smoke test passed end-to-end: `echo > flame.txt` through NFS mount
+  → readable via plain SMB → readable via NFS with fresh bytes.
+
+### Remaining Phase 3 work (future slices)
+
+- CREATE / MKDIR (new files and folders)
+- REMOVE / RMDIR (delete — with soft-delete semantics for stable fh)
+- RENAME (fh-preserving path swap — the tricky one)
+- Conflict detection hookup into the write path
+
+### Noted for Phase 4 hardening
+
+- **Stable NFS handles across agent restarts.** The `fh` values in SQLite
+  are persistent, but `nfsserve`'s default `id_to_fh` wraps them with a
+  generation number derived from server startup time. So every agent
+  restart invalidates every client-cached handle, forcing `umount`/`mount`
+  or silent STALE errors mid-use. During slice 1 testing we hit this
+  after each `cargo build` + re-run. Override `id_to_fh` / `fh_to_id` in
+  our impl to use a persistent generation (fixed or omitted). Prerequisite
+  to real-user dogfood. Tracked in task #38.

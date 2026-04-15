@@ -30,10 +30,15 @@ fn temp_dir() -> PathBuf {
     app_group_container().join("temp")
 }
 
+/// Shared per-domain cache map. Wrapped in an outer Arc so the NFS server
+/// and the fileops_server share one MacosCache instance per domain — two
+/// instances on the same DB file caused duplicate NFS file handles (see #40).
+pub type SharedCaches = Arc<std::sync::RwLock<HashMap<String, Arc<MacosCache>>>>;
+
 /// Shared state for the file operations server.
 struct ServerState {
-    /// Per-domain cache databases.
-    caches: std::sync::RwLock<HashMap<String, MacosCache>>,
+    /// Per-domain cache databases. Shared with the NFS server (Arc wrapper).
+    caches: SharedCaches,
     /// Channel back to UFB for out-of-band events (conflict notifications, etc.).
     ipc_tx: mpsc::Sender<AgentToUfb>,
     /// Cached mounts config. Read once at startup, refreshed via `ReloadConfig`
@@ -53,9 +58,10 @@ impl FileOpsServer {
         ipc_tx: mpsc::Sender<AgentToUfb>,
         config: Arc<std::sync::RwLock<config::MountsConfig>>,
         canonical_bases: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
+        caches: SharedCaches,
     ) {
         tokio::spawn(async move {
-            if let Err(e) = Self::run(ipc_tx, config, canonical_bases).await {
+            if let Err(e) = Self::run(ipc_tx, config, canonical_bases, caches).await {
                 log::error!("[FileOps] Server failed: {}", e);
             }
         });
@@ -65,6 +71,7 @@ impl FileOpsServer {
         ipc_tx: mpsc::Sender<AgentToUfb>,
         config: Arc<std::sync::RwLock<config::MountsConfig>>,
         canonical_bases: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
+        caches: SharedCaches,
     ) -> Result<(), String> {
         let sock_path = socket_path();
         let container = app_group_container();
@@ -89,27 +96,10 @@ impl FileOpsServer {
 
         log::info!("[FileOps] Listening on {}", sock_path.display());
 
-        // Initialize caches for sync-enabled mounts
-        let mut caches = HashMap::new();
-        let initial_config = config.read().unwrap().clone();
-        for mount in &initial_config.mounts {
-            if mount.enabled && mount.is_sync_mode() {
-                let domain = mount.share_name();
-                let nas_root = PathBuf::from("/Volumes").join(&domain);
-                match MacosCache::open(&domain, nas_root, mount.sync_cache_limit_bytes) {
-                    Ok(cache) => {
-                        log::info!("[FileOps] Cache opened for domain: {}", domain);
-                        caches.insert(domain, cache);
-                    }
-                    Err(e) => {
-                        log::error!("[FileOps] Failed to open cache for {}: {}", domain, e);
-                    }
-                }
-            }
-        }
-
+        // Caches are opened in main.rs and passed in via the SharedCaches Arc
+        // so the NFS server and fileops_server share one MacosCache per domain.
         let state = Arc::new(ServerState {
-            caches: std::sync::RwLock::new(caches),
+            caches,
             ipc_tx,
             config,
             canonical_bases,
@@ -206,7 +196,7 @@ fn ensure_cache(state: &ServerState, domain: &str) {
         match MacosCache::open(domain, nas_root, mount.sync_cache_limit_bytes) {
             Ok(cache) => {
                 log::info!("[FileOps] Cache opened on demand for domain: {}", domain);
-                state.caches.write().unwrap().insert(domain.to_string(), cache);
+                state.caches.write().unwrap().insert(domain.to_string(), Arc::new(cache));
             }
             Err(e) => {
                 log::error!("[FileOps] Failed to open cache for {}: {}", domain, e);
@@ -220,7 +210,7 @@ fn with_cache<F, R>(state: &ServerState, domain: &str, f: F) -> Option<R>
 where F: FnOnce(&MacosCache) -> R {
     ensure_cache(state, domain);
     let caches = state.caches.read().unwrap();
-    caches.get(domain).map(f)
+    caches.get(domain).map(|arc| f(arc.as_ref()))
 }
 
 /// Locate the actual filesystem path where a share is mounted on macOS.
