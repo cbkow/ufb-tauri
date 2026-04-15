@@ -26,6 +26,10 @@ notify = "7"  # FSEvents file watcher for NAS change detection
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+# NFS3 loopback server — presents SMB mounts to Finder via native kernel NFS
+# client, sidestepping FileProvider's per-op framework overhead.
+nfsserve = "0.10"
+async-trait = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.6"

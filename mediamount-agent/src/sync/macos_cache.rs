@@ -17,7 +17,7 @@ const POOL_SIZE: u32 = 6;
 /// Parent directory of a relative path. "a/b/c.txt" → "a/b". "foo.txt" → "".
 /// Used to populate + query the indexed `parent_path` column on `known_files`.
 #[inline]
-fn parent_of(path: &str) -> &str {
+pub fn parent_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[..i],
         None => "",
@@ -26,6 +26,20 @@ fn parent_of(path: &str) -> &str {
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 type SqliteConn = PooledConnection<SqliteConnectionManager>;
+
+/// Subset of `known_files` fields needed to build an NFS `fattr3`. Returned
+/// from the cache-serving accessors so callers don't have to know the schema.
+#[derive(Debug, Clone)]
+pub struct CachedAttr {
+    pub is_dir: bool,
+    pub size: u64,
+    /// Seconds since Unix epoch (NAS mtime).
+    pub mtime: f64,
+    /// Seconds since Unix epoch (NAS ctime).
+    pub created: f64,
+    pub is_hydrated: bool,
+    pub hydrated_size: u64,
+}
 
 /// Per-domain cache database.
 pub struct MacosCache {
@@ -145,6 +159,25 @@ impl MacosCache {
                 "CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
                  CREATE INDEX IF NOT EXISTS idx_accessed ON known_files(last_accessed);
                  CREATE INDEX IF NOT EXISTS idx_parent_path ON known_files(parent_path);",
+            );
+
+            // NFS file handles — stable 64-bit ids that never get reused.
+            // `fh` via AUTOINCREMENT (SQLite guarantees monotonically-increasing,
+            // non-reused rowids). The root directory is assigned fh=1 via the
+            // first insert. Triggers keep this table in lock-step with
+            // known_files so every cached file/dir has a handle automatically.
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS nfs_handles (
+                     fh INTEGER PRIMARY KEY AUTOINCREMENT,
+                     path TEXT NOT NULL UNIQUE
+                 );
+                 INSERT OR IGNORE INTO nfs_handles (path) VALUES ('');
+                 INSERT OR IGNORE INTO nfs_handles (path) SELECT path FROM known_files;
+                 CREATE TRIGGER IF NOT EXISTS nfs_handles_insert
+                     AFTER INSERT ON known_files
+                 BEGIN
+                     INSERT OR IGNORE INTO nfs_handles (path) VALUES (NEW.path);
+                 END;",
             );
         }
 
@@ -712,6 +745,106 @@ impl MacosCache {
             );
             self.pending_evictions.lock().unwrap().extend(evict_paths);
         }
+    }
+
+    // ── NFS handle / metadata serving (Phase 1) ──
+
+    /// Look up the NFS file handle for a relative path. `""` is the root.
+    /// Returns `None` if the path has never been indexed.
+    pub fn fh_for_path(&self, path: &str) -> Option<u64> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT fh FROM nfs_handles WHERE path = ?1").ok()?;
+        stmt.query_row(params![path], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|v| v as u64)
+    }
+
+    /// Reverse lookup: path for an NFS file handle.
+    pub fn path_for_fh(&self, fh: u64) -> Option<String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT path FROM nfs_handles WHERE fh = ?1").ok()?;
+        stmt.query_row(params![fh as i64], |row| row.get::<_, String>(0)).ok()
+    }
+
+    /// Ensure a handle exists for `path`, returning its fh. Triggered on first
+    /// NFS lookup of a path we haven't recorded in `known_files` yet (e.g. the
+    /// share root itself, or a freshly cold-path-enumerated child).
+    pub fn ensure_fh(&self, path: &str) -> Option<u64> {
+        {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare_cached("INSERT OR IGNORE INTO nfs_handles (path) VALUES (?1)")
+                .ok()?;
+            let _ = stmt.execute(params![path]);
+        }
+        self.fh_for_path(path)
+    }
+
+    /// Cached metadata for a given path — fields an NFS GETATTR needs. Returns
+    /// `None` if the path isn't in `known_files` (cold — caller must populate).
+    pub fn cached_attr(&self, path: &str) -> Option<CachedAttr> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT is_dir, nas_size, nas_mtime, nas_created, is_hydrated, hydrated_size
+                 FROM known_files WHERE path = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![path], |row| {
+            Ok(CachedAttr {
+                is_dir: row.get::<_, i32>(0)? != 0,
+                size: row.get::<_, i64>(1)? as u64,
+                mtime: row.get::<_, f64>(2)?,
+                created: row.get::<_, f64>(3)?,
+                is_hydrated: row.get::<_, i32>(4)? != 0,
+                hydrated_size: row.get::<_, i64>(5)? as u64,
+            })
+        })
+        .ok()
+    }
+
+    /// Direct children of a folder — (fh, name, CachedAttr) tuples, joined
+    /// across `known_files` and `nfs_handles`. Returns an empty Vec for cold
+    /// folders (caller falls back to live enumeration then recalls us).
+    pub fn cached_children(&self, parent_path: &str) -> Vec<(u64, String, CachedAttr)> {
+        let conn = self.conn();
+        conn.prepare_cached(
+            "SELECT h.fh, k.name, k.is_dir, k.nas_size, k.nas_mtime, k.nas_created,
+                    k.is_hydrated, k.hydrated_size
+             FROM known_files k
+             JOIN nfs_handles h ON h.path = k.path
+             WHERE k.parent_path = ?1",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(params![parent_path], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    CachedAttr {
+                        is_dir: row.get::<_, i32>(2)? != 0,
+                        size: row.get::<_, i64>(3)? as u64,
+                        mtime: row.get::<_, f64>(4)?,
+                        created: row.get::<_, f64>(5)?,
+                        is_hydrated: row.get::<_, i32>(6)? != 0,
+                        hydrated_size: row.get::<_, i64>(7)? as u64,
+                    },
+                ))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Has this folder already been enumerated? Used to distinguish
+    /// cold-path (fall through to NAS) vs empty-but-warm folders.
+    pub fn folder_is_enumerated(&self, path: &str) -> bool {
+        let conn = self.conn();
+        conn.prepare_cached("SELECT 1 FROM visited_folders WHERE path = ?1")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row(params![path], |_| Ok(true)).ok())
+            .unwrap_or(false)
     }
 
     /// Return relative paths of currently-hydrated files. Cheap DB-only query,

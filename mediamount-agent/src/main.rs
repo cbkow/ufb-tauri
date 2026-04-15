@@ -258,6 +258,55 @@ async fn run_event_loop() {
         let mut mount_service = mount_service::MountService::new(state_tx);
         mount_service.start_from_config().await;
 
+        // Start NFS loopback servers (macOS only). One per sync-enabled mount.
+        // Gated behind UFB_ENABLE_NFS=1 while we're still in Phase 1 — the
+        // FileProvider path remains the default user-facing mount.
+        #[cfg(target_os = "macos")]
+        if std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1") {
+            let config_for_nfs = std::sync::Arc::clone(&config_cache);
+            tokio::spawn(async move {
+                // Brief delay so mount_service has time to finish initial mounts
+                // before we try to canonicalize the SMB mount paths. Lifecycle
+                // wiring (start on MountSucceeded event) is Phase 1.5.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                let mounts = config_for_nfs.read().unwrap().mounts.clone();
+                let mut sync_mounts: Vec<_> = mounts
+                    .into_iter()
+                    .filter(|m| m.enabled && m.is_sync_mode())
+                    .collect();
+                sync_mounts.sort_by(|a, b| a.id.cmp(&b.id));
+
+                for (idx, mount) in sync_mounts.iter().enumerate() {
+                    let port = sync::nfs_server::BASE_PORT + idx as u16;
+                    let Some(root) = resolve_mount_root_for_nfs(mount) else {
+                        log::warn!(
+                            "[nfs-server] {}: no SMB mount path resolved, skipping",
+                            mount.share_name()
+                        );
+                        continue;
+                    };
+                    let share = mount.share_name();
+                    let cache = match sync::MacosCache::open(
+                        &share,
+                        root.clone(),
+                        mount.sync_cache_limit_bytes,
+                    ) {
+                        Ok(c) => std::sync::Arc::new(c),
+                        Err(e) => {
+                            log::error!(
+                                "[nfs-server] {}: failed to open cache: {}",
+                                share,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    sync::nfs_server::start(share, root, port, cache);
+                }
+            });
+        }
+
         // Config file watcher — polls mtime every 5 seconds
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::mpsc::channel::<()>(1);
         if let Some(config_path) = config::config_file_path() {
@@ -544,4 +593,28 @@ fn open_log() {
                 .spawn();
         }
     }
+}
+
+/// Resolve the backing SMB mount path for a mount config. Mirrors the
+/// `resolve_smb_mount_path` helper in ipc::fileops_server so the NFS server
+/// picks up dedup-suffixed mounts (`/Volumes/Share-1`) the same way. Will be
+/// consolidated with the fileops_server copy once NFS replaces it in Phase 5.
+#[cfg(target_os = "macos")]
+fn resolve_mount_root_for_nfs(mount: &config::MountConfig) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let share_name = mount.share_name();
+    let candidates = [
+        config::MountConfig::smb_mount_base().join(&share_name),
+        std::path::PathBuf::from("/Volumes").join(&share_name),
+    ];
+    for candidate in &candidates {
+        let Ok(path_meta) = std::fs::metadata(candidate) else { continue };
+        let Some(parent_meta) = candidate.parent().and_then(|p| std::fs::metadata(p).ok())
+        else { continue };
+        if path_meta.dev() != parent_meta.dev() {
+            return Some(candidate.clone());
+        }
+    }
+    crate::platform::macos::find_existing_volume(&share_name, &mount.nas_share_path)
+        .map(std::path::PathBuf::from)
 }

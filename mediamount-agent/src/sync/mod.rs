@@ -32,6 +32,8 @@ pub mod macos_watcher;
 #[cfg(target_os = "macos")]
 pub mod macos_cache;
 #[cfg(target_os = "macos")]
+pub mod nfs_server;
+#[cfg(target_os = "macos")]
 pub use macos_watcher::MacosNasWatcher;
 #[cfg(target_os = "macos")]
 pub use macos_cache::MacosCache;
