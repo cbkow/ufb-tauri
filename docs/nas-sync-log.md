@@ -3115,3 +3115,93 @@ gate at end of Week 1 (Phase 0 spike).
 an existing SMB mount, three-way `time ls -R` measurement vs plain SMB
 and current FileProvider. If numbers don't land, we abandon this and
 the Waves 1–4 wins remain shipped.
+
+---
+
+## 2026-04-15 — NFS Phase 0 + Phase 1 results + Phase 2 design
+
+### Phase 0: passthrough measurement
+
+Standalone `mediamount-nfs-spike` crate, naive passthrough to an SMB mount.
+Three-way `time ls -R` on `z_CBtemp` (real project folder, hundreds of
+files):
+
+- plain SMB: **3.82 s**
+- NFS loopback passthrough: **4.03 s** (~5% overhead)
+- FileProvider: inconclusive — path not enumerated, macOS CloudStorage
+  permission quirks got in the way. Not needed for the go decision.
+
+**GO.** Our loopback layer adds no measurable tax on top of SMB. The gap
+we've been feeling in FileProvider is the framework, not anything we
+can optimise inside the extension.
+
+### Phase 1: cache-backed metadata serving
+
+Same `z_CBtemp` subtree, same kernel caches purged between runs:
+
+- cold (populates SQLite as we go): **8.5 s**
+- warm (all metadata served from SQLite): **0.12–0.14 s**
+
+~60× cold→warm, ~30× vs plain SMB on the warm path. The bottleneck moved
+from network round-trips to local SQLite — which was the whole point.
+Agent-side log showed zero SMB traffic during warm runs.
+
+Implementation landed as commit `c6bcfda`:
+
+- `nfs_handles` table with `fh INTEGER PRIMARY KEY AUTOINCREMENT`, trigger
+  mirroring `known_files` inserts. Handles stable across agent restarts
+  (SQLite AUTOINCREMENT never-reuse guarantee).
+- `MacosCache` accessors: `fh_for_path`, `path_for_fh`, `ensure_fh`,
+  `cached_attr`, `cached_children`, `folder_is_enumerated`.
+- `PassthroughFs` in `sync/nfs_server.rs` serves LOOKUP / GETATTR /
+  READDIR / READDIRPLUS from SQLite; cold folders fall through to a
+  one-shot `fs::read_dir` that populates the cache via
+  `record_enumeration` then retries.
+- Gated behind `UFB_ENABLE_NFS=1` env var so we can run it alongside
+  FileProvider for comparison.
+- One NFS server per sync-enabled mount, each on `127.0.0.1:(BASE_PORT + idx)`.
+
+### Strategic re-framing (mid-session)
+
+Discussion clarified the true priority:
+
+> "I am happy with SMB access speeds. Faster will always be better, but
+> local cache for accessed files is my one and only priority."
+
+**Implications:**
+
+1. The metadata cache we just landed is not strictly required — we could
+   ship content caching with a plain passthrough and be at SMB-speed for
+   nav. But it's already built, already correct, and gives a free nav
+   speedup. Keep it, stop actively investing in it (no background
+   refresh worker, no fancy invalidation — accept the warm-cache pattern
+   as-is).
+2. Phase 2 (content cache) is the user-facing win. Everything else is
+   plumbing.
+3. Additional ask — **mid-access hydration with back/forward scrubbing**.
+   "Switch to local cache as soon as we have it, not just on subsequent
+   loads." This rules out a whole-file-level `is_hydrated` flag as the
+   only signal.
+
+### Phase 2 design revision: block-level bitmap
+
+Two variants considered:
+
+- **(A) Sequential watermark.** Background task downloads file from byte
+  0 forward; reads below watermark served from partial cache file, above
+  proxy SMB. Simple. Loses on back-scrubbing a partially-hydrated file.
+- **(B) Per-chunk bitmap.** Each file has a bitmap (1 bit per 1 MiB
+  chunk) persisted in SQLite. Reads check each chunk's bit: cached → local
+  disk, missing → SMB + write to cache as we go. Wins on all access
+  patterns including media scrubbing.
+
+**Decision: (B).** Media workflow needs it, marginal code cost over (A)
+is worth it, persisting the bitmap makes partial caches survive restart.
+
+**v1 non-goal:** proactive background full-hydration. User's own access
+drives caching. If the partial-cache pattern isn't enough (e.g. user
+wants to go offline after "touching" a file to mark it), a background
+filler can layer on later.
+
+Full design in `docs/nfs-loopback-plan.md`. Next work item: schema
+migration + block-level read path.

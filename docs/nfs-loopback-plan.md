@@ -127,26 +127,79 @@ All `list_dir` SMB calls happen off the request path.
 
 ---
 
-## Phase 2 — Content cache + hydration (Weeks 5–7)
+## Phase 2 — Block-level content cache (Weeks 5–7)
 
-**Goal:** hydrated files read from local disk at local-disk speeds.
+**Goal:** once a chunk of a file lives on local disk, reads of that chunk
+come from disk — even mid-open, even when the user is scrubbing forward /
+backward through a partially-hydrated media file.
 
-- Content layout: `~/ufb/cache/by_handle/{fh}` — flat, keyed by handle.
-  Rename-safe (update `path` in SQLite, cache file untouched).
-- NFS `READ`:
-  - `is_hydrated=1` → `pread` on cache file.
-  - `is_hydrated=0` → proxy bytes from SMB this read; async-queue
-    hydration for next time.
-- Hydration worker (tokio task): pulls cold files to
-  `cache/by_handle/`, flips `is_hydrated=1`, updates `hydrated_size`.
-  Reuses download logic.
-- Eviction worker (tokio task): LRU on `last_accessed`, enforces
-  `cache_limit_bytes`. Reuse existing `clear_all_hydrated` /
-  `evict_if_over_budget` logic from `macos_cache.rs`.
-- Access tracking: bump `last_accessed` on every read.
+**Why block-level instead of whole-file:**
 
-**Exit criteria:** 1 GB cache-hit re-open < 100 ms. Eviction fires
-correctly when over budget.
+Whole-file (is_hydrated true/false) means every first-read pays full SMB
+cost and nothing is cacheable until download completes. For a 4 GB ProRes
+clip a user scrubbed in yesterday, that's a hard no-go. Block-level means:
+
+- Scrub to 75% of a file you opened yesterday → chunk at that offset is
+  already cached → instant seek.
+- Mid-open read of a brand-new file: chunks the user just read are cached
+  immediately; chunks they haven't touched yet proxy SMB on demand.
+- Background hydration (optional, later) fills the gaps so eventually the
+  whole file is local.
+
+**Chunk size:** 1 MiB. Matches our NFS `rsize=1048576` mount option, so
+each NFS `READ` RPC typically maps to exactly one chunk — clean accounting,
+no cross-chunk splitting in the hot path.
+
+**Schema additions (`known_files`):**
+
+- `chunk_bitmap BLOB NULL` — one bit per chunk, little-endian byte order.
+  NULL until the file has at least one cached chunk. For fully-cached
+  files the `is_hydrated=1` shortcut avoids a bitmap read.
+- Computed from `nas_size`: `num_chunks = (size + CHUNK_SIZE - 1) / CHUNK_SIZE`.
+  A 4 GB file → 4096 chunks → 512 bytes of bitmap.
+
+**Content layout:** `~/ufb/cache/by_handle/{fh}` — sparse files. We only
+write chunks we have. `pread` on a missing region would return zeros, so
+the bitmap is authoritative for "is this chunk valid."
+
+**NFS `READ(fh, offset, count)`:**
+
+1. Load `(is_hydrated, chunk_bitmap, nas_size)` from `known_files`.
+2. If `is_hydrated=1`: single `pread` on the cache file, return.
+3. Otherwise split `[offset, offset+count)` into chunk-aligned runs:
+   - Consecutive cached chunks → one `pread` on the cache file.
+   - Consecutive missing chunks → one SMB read, then `pwrite` into the
+     cache file + set those bits + persist bitmap. Bytes go to both the
+     caller's buffer AND the cache.
+4. If all chunks in the file are now set, flip `is_hydrated=1` and drop
+   the bitmap column (null out to save space, is_hydrated=1 is the fast
+   path anyway).
+
+**Eviction (LRU):**
+
+- `last_accessed` bumped on every read.
+- When over `cache_limit_bytes`: evict the oldest file wholesale — delete
+  cache file, NULL out bitmap, set `is_hydrated=0`, `hydrated_size=0`.
+- Partial hydration survives agent restart (bitmap persisted in SQLite);
+  eviction still wipes it cleanly.
+
+**Explicit non-goal for v1:** background full-hydration worker. The user's
+own access drives what gets cached. If they play a file linearly, the whole
+file ends up cached as they watch. If they only scrub certain ranges, only
+those are cached. A proactive background filler can come later if the
+partial-cache pattern isn't good enough (measure first).
+
+**Exit criteria:**
+
+- Scrubbing (jumping around) a 4 GB file that's been touched before in the
+  same region feels local-disk-fast.
+- First linear read of a cold 1 GB file: each chunk after the first arrives
+  faster (same read but now also writing to cache has negligible overhead
+  vs plain SMB).
+- Second linear read of the same file (now fully cached): pure local
+  disk speed, << 100 ms.
+- Agent restart mid-hydration: cached chunks are still honored, missing
+  chunks still fetch from SMB.
 
 ---
 

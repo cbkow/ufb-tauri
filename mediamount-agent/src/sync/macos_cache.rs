@@ -14,6 +14,59 @@ use std::sync::Mutex;
 const EVICTION_TARGET_PERCENT: f64 = 0.8;
 const POOL_SIZE: u32 = 6;
 
+/// Content cache chunk size — matches the NFS `rsize` mount option (1 MiB)
+/// so each NFS READ RPC maps cleanly to one chunk.
+pub const CHUNK_SIZE: u64 = 1024 * 1024;
+
+/// How many chunks cover a file of `size` bytes.
+#[inline]
+pub fn num_chunks(size: u64) -> u64 {
+    (size + CHUNK_SIZE - 1) / CHUNK_SIZE
+}
+
+/// Bit operations on the chunk bitmap. Bits are packed LSB-first within each
+/// byte: chunk `i` lives in byte `i/8`, bit `i%8`.
+#[inline]
+pub fn bit_is_set(bitmap: &[u8], chunk: u64) -> bool {
+    let byte = (chunk / 8) as usize;
+    let mask = 1u8 << ((chunk % 8) as u8);
+    bitmap.get(byte).map(|b| b & mask != 0).unwrap_or(false)
+}
+
+#[inline]
+pub fn set_bit(bitmap: &mut Vec<u8>, chunk: u64) {
+    let byte = (chunk / 8) as usize;
+    let mask = 1u8 << ((chunk % 8) as u8);
+    if bitmap.len() <= byte {
+        bitmap.resize(byte + 1, 0);
+    }
+    bitmap[byte] |= mask;
+}
+
+/// Check if every bit in `[0, total_chunks)` is set.
+#[inline]
+pub fn bitmap_is_complete(bitmap: &[u8], total_chunks: u64) -> bool {
+    if total_chunks == 0 {
+        return true;
+    }
+    let full_bytes = (total_chunks / 8) as usize;
+    // Every full byte must be 0xFF.
+    for i in 0..full_bytes {
+        if bitmap.get(i).copied().unwrap_or(0) != 0xFF {
+            return false;
+        }
+    }
+    // Partial trailing byte: only the low `remainder` bits must be set.
+    let remainder = total_chunks % 8;
+    if remainder > 0 {
+        let mask = (1u8 << remainder) - 1;
+        if bitmap.get(full_bytes).copied().unwrap_or(0) & mask != mask {
+            return false;
+        }
+    }
+    true
+}
+
 /// Parent directory of a relative path. "a/b/c.txt" → "a/b". "foo.txt" → "".
 /// Used to populate + query the indexed `parent_path` column on `known_files`.
 #[inline]
@@ -179,6 +232,19 @@ impl MacosCache {
                      INSERT OR IGNORE INTO nfs_handles (path) VALUES (NEW.path);
                  END;",
             );
+
+            // Block-level content cache bitmap (Phase 2).
+            // One bit per 1 MiB chunk, NULL until any chunk is cached.
+            // Fully-hydrated files skip the bitmap via is_hydrated=1.
+            let has_bitmap: bool = conn
+                .prepare("SELECT chunk_bitmap FROM known_files LIMIT 0")
+                .is_ok();
+            if !has_bitmap {
+                log::info!("[macos-cache] Migrating: adding chunk_bitmap column");
+                let _ = conn.execute_batch(
+                    "ALTER TABLE known_files ADD COLUMN chunk_bitmap BLOB DEFAULT NULL;",
+                );
+            }
         }
 
         // Build the pool. Each connection applies its own per-connection PRAGMAs on init.
@@ -744,6 +810,78 @@ impl MacosCache {
                 self.cache_limit as f64 / 1_048_576.0,
             );
             self.pending_evictions.lock().unwrap().extend(evict_paths);
+        }
+    }
+
+    // ── Content cache (Phase 2) ──
+
+    /// Read the current chunk bitmap for a file. Returns an empty Vec for
+    /// uncached files (no chunks yet). Cheap — single indexed read.
+    pub fn get_chunk_bitmap(&self, path: &str) -> Vec<u8> {
+        let conn = self.conn();
+        let Ok(mut stmt) =
+            conn.prepare_cached("SELECT chunk_bitmap FROM known_files WHERE path = ?1")
+        else {
+            return Vec::new();
+        };
+        stmt.query_row(params![path], |row| {
+            Ok(row.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Persist an updated chunk bitmap for a file. Also advances
+    /// `last_accessed` (the read path is the only caller right now, so this
+    /// keeps eviction LRU honest).
+    pub fn update_chunk_bitmap(&self, path: &str, bitmap: &[u8]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let conn = self.conn();
+        let _ = conn
+            .prepare_cached(
+                "UPDATE known_files
+                 SET chunk_bitmap = ?1, last_accessed = ?2
+                 WHERE path = ?3",
+            )
+            .map(|mut stmt| stmt.execute(params![bitmap, now, path]));
+    }
+
+    /// Mark a file as fully hydrated (all chunks cached). Nulls the bitmap
+    /// since `is_hydrated=1` is the fast-path shortcut.
+    pub fn mark_fully_hydrated(&self, path: &str, size: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let conn = self.conn();
+        let _ = conn
+            .prepare_cached(
+                "UPDATE known_files
+                 SET is_hydrated = 1,
+                     hydrated_size = ?1,
+                     chunk_bitmap = NULL,
+                     last_accessed = ?2
+                 WHERE path = ?3",
+            )
+            .map(|mut stmt| stmt.execute(params![size as i64, now, path]));
+    }
+
+    /// Cache-file path for a given NFS handle. Directory is created on first
+    /// call; callers can assume the parent exists.
+    pub fn cache_file_path(&self, fh: u64) -> PathBuf {
+        let dir = Self::cache_file_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{:016x}", fh))
+    }
+
+    /// Root of the content-cache filesystem layout (shared by all domains).
+    fn cache_file_dir() -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".local/share/ufb/cache/by_handle")
+        } else {
+            PathBuf::from("/tmp/ufb-cache/by_handle")
         }
     }
 

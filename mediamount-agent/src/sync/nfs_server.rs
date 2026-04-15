@@ -17,7 +17,7 @@
 //! `mediamount-nfs-spike/`). Lifecycle integration with mount state changes
 //! comes in Phase 1.5.
 
-use crate::sync::macos_cache::{CachedAttr, MacosCache};
+use crate::sync::macos_cache::{self, CachedAttr, MacosCache, CHUNK_SIZE};
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{fattr3, fileid3, filename3, ftype3, mode3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3},
@@ -25,7 +25,7 @@ use nfsserve::{
     vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities},
 };
 use std::{
-    io::{Read, Seek, SeekFrom},
+    os::unix::fs::FileExt,
     path::PathBuf,
     sync::Arc,
 };
@@ -112,6 +112,169 @@ impl PassthroughFs {
     fn root_attr(&self) -> Result<fattr3, nfsstat3> {
         let meta = std::fs::metadata(&self.nas_root).map_err(io_to_nfsstat)?;
         Ok(nfsserve::fs_util::metadata_to_fattr3(1, &meta))
+    }
+
+    /// Serve a read from the local cache file (fully-hydrated fast path).
+    fn read_from_cache(
+        &self,
+        fh: fileid3,
+        offset: u64,
+        len: usize,
+        size: u64,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let cache_path = self.cache.cache_file_path(fh);
+        let f = std::fs::File::open(&cache_path).map_err(io_to_nfsstat)?;
+        let mut buf = vec![0u8; len];
+        let n = f.read_at(&mut buf, offset).map_err(io_to_nfsstat)?;
+        buf.truncate(n);
+        let eof = offset + n as u64 >= size;
+        Ok((buf, eof))
+    }
+
+    /// Chunk-aware read: for each chunk covered by the request, serve from
+    /// the cache if the bitmap bit is set, else pull bytes from SMB and
+    /// write them to the cache file (persisting the bitmap as we go).
+    ///
+    /// The cache file is sparse — we only write chunks we actually fetch —
+    /// and the bitmap is authoritative for "is this chunk valid" because
+    /// sparse holes would otherwise read as zeros.
+    async fn read_with_bitmap(
+        &self,
+        fh: fileid3,
+        rel: &str,
+        attr: &CachedAttr,
+        offset: u64,
+        len: usize,
+        mut bitmap: Vec<u8>,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let size = attr.size;
+        let first_chunk = offset / CHUNK_SIZE;
+        let last_chunk = (offset + len as u64 - 1) / CHUNK_SIZE;
+        let total_chunks = macos_cache::num_chunks(size);
+
+        let cache_path = self.cache.cache_file_path(fh);
+        // Open (create) the cache file. `OpenOptions::truncate(false)` so we
+        // don't wipe previously-cached chunks from a prior session.
+        let cache_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&cache_path)
+            .map_err(io_to_nfsstat)?;
+        // Ensure the sparse file is at least `size` bytes long so pread on
+        // the tail chunks doesn't short-read. No disk cost — sparse holes
+        // don't consume blocks until written.
+        if cache_file.metadata().map(|m| m.len()).unwrap_or(0) < size {
+            cache_file.set_len(size).map_err(io_to_nfsstat)?;
+        }
+
+        let abs = self.absolute(rel);
+        let mut smb_file: Option<std::fs::File> = None;
+        let mut result = vec![0u8; len];
+        let mut bitmap_dirty = false;
+
+        let mut chunk = first_chunk;
+        while chunk <= last_chunk {
+            // Expand contiguous runs of cached-or-missing chunks for one
+            // pread/SMB call instead of per-chunk round-trips.
+            let cached = macos_cache::bit_is_set(&bitmap, chunk);
+            let mut run_end = chunk;
+            while run_end < last_chunk
+                && macos_cache::bit_is_set(&bitmap, run_end + 1) == cached
+            {
+                run_end += 1;
+            }
+
+            let run_start_byte = (chunk * CHUNK_SIZE).max(offset);
+            let run_end_byte = ((run_end + 1) * CHUNK_SIZE).min(offset + len as u64);
+            let run_len = (run_end_byte - run_start_byte) as usize;
+            let result_offset = (run_start_byte - offset) as usize;
+
+            if cached {
+                let n = cache_file
+                    .read_at(&mut result[result_offset..result_offset + run_len], run_start_byte)
+                    .map_err(io_to_nfsstat)?;
+                if n < run_len {
+                    // Shouldn't happen (file len >= size, bit was set), but
+                    // guard: treat as corruption → invalidate bits + refetch.
+                    for c in chunk..=run_end {
+                        bit_unset(&mut bitmap, c);
+                    }
+                    bitmap_dirty = true;
+                    log::warn!(
+                        "[nfs-server] {}: short read from cache for {} run {}..{}, invalidating",
+                        self.domain, rel, chunk, run_end
+                    );
+                    // Fall through to the missing-path for these chunks next iter.
+                    continue;
+                }
+            } else {
+                // Missing: fetch from SMB (reuse an opened file handle across
+                // multiple missing runs in this read).
+                let f = match smb_file {
+                    Some(ref f) => f,
+                    None => {
+                        smb_file = Some(
+                            std::fs::File::open(&abs).map_err(io_to_nfsstat)?,
+                        );
+                        smb_file.as_ref().unwrap()
+                    }
+                };
+
+                // We need to write whole chunks to the cache file (so bitmap
+                // bits are honest). That means fetching from SMB for the full
+                // chunk range, not just the user's offset window.
+                let fetch_start = chunk * CHUNK_SIZE;
+                let fetch_end = ((run_end + 1) * CHUNK_SIZE).min(size);
+                let fetch_len = (fetch_end - fetch_start) as usize;
+                let mut buf = vec![0u8; fetch_len];
+                let n = f.read_at(&mut buf, fetch_start).map_err(io_to_nfsstat)?;
+                if n < fetch_len {
+                    buf.truncate(n);
+                }
+                cache_file
+                    .write_at(&buf, fetch_start)
+                    .map_err(io_to_nfsstat)?;
+                for c in chunk..=run_end {
+                    macos_cache::set_bit(&mut bitmap, c);
+                }
+                bitmap_dirty = true;
+
+                // Copy the user-requested slice out of the freshly-fetched buffer.
+                let user_start = (run_start_byte - fetch_start) as usize;
+                let user_end = user_start + run_len.min(buf.len() - user_start);
+                result[result_offset..result_offset + (user_end - user_start)]
+                    .copy_from_slice(&buf[user_start..user_end]);
+            }
+
+            chunk = run_end + 1;
+        }
+
+        if bitmap_dirty {
+            if macos_cache::bitmap_is_complete(&bitmap, total_chunks) {
+                // Whole file is cached — flip the fast-path flag and null the bitmap.
+                let _ = cache_file.sync_all();
+                self.cache.mark_fully_hydrated(rel, size);
+                log::info!("[nfs-server] {}: fully hydrated {}", self.domain, rel);
+            } else {
+                self.cache.update_chunk_bitmap(rel, &bitmap);
+            }
+        }
+
+        let eof = offset + len as u64 >= size;
+        Ok((result, eof))
+    }
+}
+
+/// Clear a bit in the chunk bitmap (used when a cached chunk turns out to
+/// be invalid and we need to refetch).
+#[inline]
+fn bit_unset(bitmap: &mut [u8], chunk: u64) {
+    let byte = (chunk / 8) as usize;
+    let mask = !(1u8 << ((chunk % 8) as u8));
+    if let Some(b) = bitmap.get_mut(byte) {
+        *b &= mask;
     }
 }
 
@@ -220,15 +383,32 @@ impl NFSFileSystem for PassthroughFs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let rel = self.rel_path(id)?;
-        let abs = self.absolute(&rel);
-        let mut f = std::fs::File::open(&abs).map_err(io_to_nfsstat)?;
-        f.seek(SeekFrom::Start(offset)).map_err(io_to_nfsstat)?;
-        let mut buf = vec![0u8; count as usize];
-        let n = f.read(&mut buf).map_err(io_to_nfsstat)?;
-        buf.truncate(n);
-        let meta = f.metadata().map_err(io_to_nfsstat)?;
-        let eof = offset + n as u64 >= meta.len();
-        Ok((buf, eof))
+        if rel.is_empty() {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        let attr = self.cache.cached_attr(&rel).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        if attr.is_dir {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        let size = attr.size;
+
+        // Clamp request to file size — NFS convention.
+        let read_end = (offset + count as u64).min(size);
+        if offset >= size {
+            return Ok((Vec::new(), true));
+        }
+        let read_len = (read_end - offset) as usize;
+
+        // Fast path: fully hydrated.
+        if attr.is_hydrated {
+            return self.read_from_cache(id, offset, read_len, size);
+        }
+
+        // Chunk-level path: walk the requested range chunk-by-chunk, serving
+        // each from cache if the bit is set, otherwise from SMB (and writing
+        // to cache as we go).
+        let bitmap = self.cache.get_chunk_bitmap(&rel);
+        self.read_with_bitmap(id, &rel, &attr, offset, read_len, bitmap).await
     }
 
     async fn write(&self, _id: fileid3, _offset: u64, _data: &[u8]) -> Result<fattr3, nfsstat3> {
