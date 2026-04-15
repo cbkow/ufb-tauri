@@ -3033,3 +3033,85 @@ no manifest layer (already rejected earlier).
 **Ordering:** Wave 1 first (low risk, measurable). Then Wave 1.5 same
 mindset. Then Wave 2 (the biggest user-visible unlock). Measure. Then
 Wave 3 if needed. Then Wave 4.
+
+---
+
+## 2026-04-15 — NFS loopback architecture decision
+
+v0.3.4 + v0.3.5 shipped Waves 1–4 + the dedup-suffix SMB mount fix.
+Dogfood result: agent-side perf is way better, SQLite is no longer a
+bottleneck, concurrent pool connections help — but macOS nav latency
+is still noticeably worse than plain SMB through Finder.
+
+### Root cause is architectural, not fixable in Waves
+
+Further analysis: FileProvider framework enforces overhead we can't
+remove — opaque `itemVersion` comparison, heavy `NSFileProviderItem`
+XPC marshalling, sandboxed extension, and we don't control *when*
+Finder / Spotlight / QL / materialization drive us. Framework was
+designed for cloud sync (100ms+ round-trips, offline primacy), not
+LAN media workflow. We are paying overhead for features we don't need.
+
+Conceptually FileProvider IS "smart metadata index + local hydrated
+files" — same shape as LucidLink's macOS arch (they migrated off
+macFUSE specifically for kext hostility on Apple Silicon). Problem
+isn't the concept, it's the contract and the pacing we don't control.
+
+### Decision: NFS3 loopback server
+
+Rust `nfsserve` crate. Server on 127.0.0.1, kernel NFS client mounts
+it natively. We implement the `NFSFileSystem` trait (~15 ops). All
+metadata served from our SQLite (`known_files` + new `fh` column).
+Content served from `~/ufb/cache/by_handle/{fh}` on cache hit, proxied
+to SMB on miss. Writes proxy to SMB authoritatively; invalidate cache.
+
+The inversion this gets us: **Finder becomes a client of our server**,
+not a driver of our extension. We control pacing. Request path does
+exactly one SQLite lookup + I/O — nothing else. Maintenance (polling,
+hydrating, evicting) runs in decoupled tokio tasks.
+
+### Why not…
+
+- **macFUSE** — Apple-hostile on Apple Silicon (kext reduction prompt).
+  LucidLink migrated AWAY from this.
+- **FUSE-T** — works, but still a kernel-userspace bridge layered on
+  top of NFS anyway. Cleaner to cut out the middleman.
+- **Custom SMB server** — writing a correct SMB server is multi-quarter
+  scope. Not worth it.
+- **Stay in FileProvider and optimize harder** — framework contract is
+  the ceiling. Known walls above.
+
+### What we keep
+
+Almost the entire Waves 1–4 SQLite layer reused:
+- `known_files` schema (just add `fh INTEGER PRIMARY KEY AUTOINCREMENT`)
+- SQLite r2d2 pool
+- `prepare_cached` hot paths
+- `parent_path` index (serves `READDIRPLUS` directly — finally pulling
+  its weight)
+- Eviction + hydration logic
+- Mesh sync, conflict detection, freshness sweep
+
+### What we retire (macOS only)
+
+- FileProvider extension (Swift) + entitlements + Xcode target
+- AgentFileOpsClient Swift IPC + Wave 2 connection pool
+- FileProvider CloudStorage path conventions
+
+### Cross-platform
+
+- **Windows** stays on Cloud Files. It works. Only revisit if metadata
+  storms appear there too.
+- **Linux** FUSE setup unchanged for now; NFS loopback migration can
+  follow later.
+
+### Plan document
+
+Detailed phase breakdown + success criteria in
+`docs/nfs-loopback-plan.md`. Six phases over ~18 weeks with a GO/NO-GO
+gate at end of Week 1 (Phase 0 spike).
+
+**Phase 0 next:** standalone throwaway crate, `nfsserve` passthrough to
+an existing SMB mount, three-way `time ls -R` measurement vs plain SMB
+and current FileProvider. If numbers don't land, we abandon this and
+the Waves 1–4 wins remain shipped.
