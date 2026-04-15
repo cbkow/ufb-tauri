@@ -224,7 +224,9 @@ fn percent_encode_userinfo(s: &str) -> String {
 }
 
 /// Check if a volume matching the expected name is already mounted from the correct server.
-fn find_existing_volume(expected_name: &str, nas_share_path: &str) -> Option<String> {
+/// Accepts macOS dedup suffixes (e.g. `MyShare-1` when another SMB mount already holds
+/// `MyShare`) and verifies via `mount` output that the backing SMB source matches.
+pub fn find_existing_volume(expected_name: &str, nas_share_path: &str) -> Option<String> {
     let candidates: Vec<String> = if let Ok(entries) = std::fs::read_dir("/Volumes") {
         entries
             .flatten()
