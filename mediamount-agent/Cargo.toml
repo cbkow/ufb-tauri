@@ -24,10 +24,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 notify = "7"  # FSEvents file watcher for NAS change detection
 rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 cloud-filter = "0.0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

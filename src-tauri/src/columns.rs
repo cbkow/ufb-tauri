@@ -82,7 +82,7 @@ impl ColumnConfigManager {
             .db
             .with_conn(|conn| {
                 // Try folder-specific first, fall back to job-level ("*")
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT id, job_path, folder_name, column_name, column_type,
                             column_order, column_width, is_visible, default_value
                      FROM column_definitions
@@ -111,7 +111,7 @@ impl ColumnConfigManager {
                 // Load options for each column
                 for def in &mut defs {
                     if let Some(col_id) = def.id {
-                        let mut opt_stmt = conn.prepare(
+                        let mut opt_stmt = conn.prepare_cached(
                             "SELECT id, option_name, option_color
                              FROM column_options WHERE column_id = ?1",
                         )?;

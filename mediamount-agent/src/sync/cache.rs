@@ -7,15 +7,21 @@
 /// Dehydration: cloud_filter::ext::file::FileExt::dehydrate(..) → CfDehydratePlaceholder.
 
 use cloud_filter::ext::FileExt;
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const EVICTION_TARGET_PERCENT: f64 = 0.80;
+const POOL_SIZE: u32 = 6;
+
+type SqlitePool = Pool<SqliteConnectionManager>;
+type SqliteConn = PooledConnection<SqliteConnectionManager>;
 
 pub struct CacheIndex {
-    db: Mutex<Connection>,
+    pool: SqlitePool,
     cache_limit: u64,
     client_root: PathBuf,
     /// Shared with NasSyncFilter — files with refcount > 0 can't be evicted.
@@ -39,10 +45,26 @@ impl CacheIndex {
         };
         let _ = std::fs::create_dir_all(&cache_dir);
         let db_path = cache_dir.join(format!("{}.db", mount_id));
-        let (conn, needs_repair) = Self::open_or_repair(&db_path);
+
+        // Run schema init / repair on a single serial connection before the pool opens.
+        let needs_repair = Self::prepare_db(&db_path);
+
+        // Build the pool. Per-connection pragmas set on init (WAL is persistent on-disk,
+        // no need to re-set per connection).
+        let manager = SqliteConnectionManager::file(&db_path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA synchronous=NORMAL;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA foreign_keys=ON;",
+            )
+        });
+        let pool = Pool::builder()
+            .max_size(POOL_SIZE)
+            .build(manager)
+            .expect("Failed to build SQLite pool");
 
         let index = Self {
-            db: Mutex::new(conn),
+            pool,
             cache_limit,
             client_root: client_root.to_path_buf(),
             open_handles,
@@ -50,15 +72,14 @@ impl CacheIndex {
         (index, needs_repair)
     }
 
-    fn open_or_repair(db_path: &Path) -> (Connection, bool) {
-        // Try to open existing DB
+    /// Initialize (or repair) the DB on a single serial connection. Returns true
+    /// if the DB was recreated from scratch (caller should rebuild cache index).
+    fn prepare_db(db_path: &Path) -> bool {
         match Connection::open(db_path) {
             Ok(conn) => {
-                // Check integrity
                 if Self::init_schema(&conn).is_ok() && Self::check_integrity(&conn) {
-                    return (conn, false);
+                    return false;
                 }
-                // Corrupt — drop and recreate
                 drop(conn);
                 log::warn!("[cache] DB corrupt, recreating: {:?}", db_path);
                 let _ = std::fs::remove_file(db_path);
@@ -69,10 +90,15 @@ impl CacheIndex {
             }
         }
 
-        // Create fresh
         let conn = Connection::open(db_path).expect("Failed to create cache DB");
         Self::init_schema(&conn).expect("Failed to init cache schema");
-        (conn, true)
+        true
+    }
+
+    /// Get a pooled connection. Short-lived; returned to pool on drop.
+    #[inline]
+    fn db(&self) -> SqliteConn {
+        self.pool.get().expect("SQLite pool exhausted")
     }
 
     fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -155,13 +181,14 @@ impl CacheIndex {
         let path_str = path.to_string_lossy();
         let now = Self::unix_now();
 
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
-             VALUES (?1, ?2, 0, 1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET is_hydrated=1, hydrated_size=?2, last_accessed=?3",
-            params![path_str.as_ref(), size as i64, now],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached(
+                "INSERT INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
+                 VALUES (?1, ?2, 0, 1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET is_hydrated=1, hydrated_size=?2, last_accessed=?3",
+            )
+            .map(|mut stmt| stmt.execute(params![path_str.as_ref(), size as i64, now]));
         drop(db);
 
         self.evict_if_over_budget();
@@ -170,22 +197,20 @@ impl CacheIndex {
     /// Record a dehydration (OS-initiated or programmatic).
     pub fn record_dehydration(&self, path: &Path) {
         let path_str = path.to_string_lossy();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path = ?1",
-            params![path_str.as_ref()],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached("UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path = ?1")
+            .map(|mut stmt| stmt.execute(params![path_str.as_ref()]));
     }
 
     /// Update last-access timestamp (LRU refresh on re-access).
     pub fn touch(&self, path: &Path) {
         let path_str = path.to_string_lossy();
         let now = Self::unix_now();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE known_files SET last_accessed = ?1 WHERE path = ?2",
-            params![now, path_str.as_ref()],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached("UPDATE known_files SET last_accessed = ?1 WHERE path = ?2")
+            .map(|mut stmt| stmt.execute(params![now, path_str.as_ref()]));
     }
 
     /// Stamp last_verified_at = now. Called after a successful NAS stat confirms
@@ -193,11 +218,10 @@ impl CacheIndex {
     pub fn record_verification(&self, path: &Path) {
         let path_str = path.to_string_lossy();
         let now = Self::unix_now();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE known_files SET last_verified_at = ?1 WHERE path = ?2",
-            params![now, path_str.as_ref()],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached("UPDATE known_files SET last_verified_at = ?1 WHERE path = ?2")
+            .map(|mut stmt| stmt.execute(params![now, path_str.as_ref()]));
     }
 
     /// Update NAS metadata to fresh stat values and stamp last_verified_at.
@@ -205,11 +229,12 @@ impl CacheIndex {
     pub fn update_nas_metadata(&self, path: &Path, nas_size: u64, nas_mtime: i64) {
         let path_str = path.to_string_lossy();
         let now = Self::unix_now();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "UPDATE known_files SET nas_size = ?1, nas_mtime = ?2, last_verified_at = ?3 WHERE path = ?4",
-            params![nas_size as i64, nas_mtime, now, path_str.as_ref()],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached(
+                "UPDATE known_files SET nas_size = ?1, nas_mtime = ?2, last_verified_at = ?3 WHERE path = ?4",
+            )
+            .map(|mut stmt| stmt.execute(params![nas_size as i64, nas_mtime, now, path_str.as_ref()]));
     }
 
     /// Compare provided NAS metadata against the cached row.
@@ -220,33 +245,33 @@ impl CacheIndex {
     /// second NAS round-trip via `stat_and_refresh`.
     pub fn compare_nas_metadata(&self, path: &Path, nas_size: u64, nas_mtime: i64) -> Option<bool> {
         let path_str = path.to_string_lossy();
-        let db = self.db.lock().unwrap();
-        db.query_row(
-            "SELECT nas_size, nas_mtime FROM known_files WHERE path = ?1",
-            params![path_str.as_ref()],
-            |row| {
-                let size: i64 = row.get(0)?;
-                let mtime: i64 = row.get(1)?;
-                Ok((size, mtime))
-            },
-        )
-        .ok()
-        .map(|(cached_size, cached_mtime)| {
-            nas_size != cached_size as u64 || nas_mtime != cached_mtime
-        })
+        let db = self.db();
+        db.prepare_cached("SELECT nas_size, nas_mtime FROM known_files WHERE path = ?1")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row(params![path_str.as_ref()], |row| {
+                    let size: i64 = row.get(0)?;
+                    let mtime: i64 = row.get(1)?;
+                    Ok((size, mtime))
+                })
+                .ok()
+            })
+            .map(|(cached_size, cached_mtime)| {
+                nas_size != cached_size as u64 || nas_mtime != cached_mtime
+            })
     }
 
     /// Check if a path has any row in known_files.
     /// Used by `stat_and_refresh` to disambiguate "within TTL" from "unknown".
     pub fn is_known(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
-        let db = self.db.lock().unwrap();
-        db.query_row(
-            "SELECT 1 FROM known_files WHERE path = ?1",
-            params![path_str.as_ref()],
-            |_| Ok(true),
-        )
-        .unwrap_or(false)
+        let db = self.db();
+        db.prepare_cached("SELECT 1 FROM known_files WHERE path = ?1")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row(params![path_str.as_ref()], |_| Ok(true)).ok()
+            })
+            .unwrap_or(false)
     }
 
     /// Returns cached `(nas_size, nas_mtime)` if the entry warrants re-verification,
@@ -257,18 +282,20 @@ impl CacheIndex {
     pub fn needs_verification(&self, path: &Path, ttl_secs: i64) -> Option<(u64, i64)> {
         let path_str = path.to_string_lossy();
         let now = Self::unix_now();
-        let db = self.db.lock().unwrap();
-        db.query_row(
+        let db = self.db();
+        db.prepare_cached(
             "SELECT nas_size, nas_mtime, last_verified_at FROM known_files WHERE path = ?1",
-            params![path_str.as_ref()],
-            |row| {
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_row(params![path_str.as_ref()], |row| {
                 let size: i64 = row.get(0)?;
                 let mtime: i64 = row.get(1)?;
                 let verified: i64 = row.get(2)?;
                 Ok((size, mtime, verified))
-            },
-        )
-        .ok()
+            })
+            .ok()
+        })
         .and_then(|(size, mtime, verified)| {
             if now - verified < ttl_secs {
                 None
@@ -282,7 +309,7 @@ impl CacheIndex {
     pub fn rename_entry(&self, old_path: &Path, new_path: &Path) {
         let old_str = old_path.to_string_lossy();
         let new_str = new_path.to_string_lossy();
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute(
             "UPDATE known_files SET path = ?1 WHERE path = ?2",
             params![new_str.as_ref(), old_str.as_ref()],
@@ -291,12 +318,12 @@ impl CacheIndex {
 
     /// Total bytes of cached (hydrated) files.
     pub fn total_cached_bytes(&self) -> u64 {
-        let db = self.db.lock().unwrap();
-        db.query_row(
+        let db = self.db();
+        db.prepare_cached(
             "SELECT COALESCE(SUM(hydrated_size), 0) FROM known_files WHERE is_hydrated = 1",
-            [],
-            |row| row.get::<_, i64>(0),
         )
+        .ok()
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)).ok())
         .unwrap_or(0) as u64
     }
 
@@ -305,28 +332,28 @@ impl CacheIndex {
     /// Record a known file (placeholder created during FETCH_PLACEHOLDERS or watcher).
     pub fn record_known_file(&self, path: &Path, nas_size: u64, nas_mtime: i64) {
         let path_str = path.to_string_lossy();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "INSERT INTO known_files (path, nas_size, nas_mtime) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET nas_size=?2, nas_mtime=?3",
-            params![path_str.as_ref(), nas_size as i64, nas_mtime],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached(
+                "INSERT INTO known_files (path, nas_size, nas_mtime) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET nas_size=?2, nas_mtime=?3",
+            )
+            .map(|mut stmt| stmt.execute(params![path_str.as_ref(), nas_size as i64, nas_mtime]));
     }
 
     /// Remove a known file (placeholder removed).
     pub fn remove_known_file(&self, path: &Path) {
         let path_str = path.to_string_lossy();
-        let db = self.db.lock().unwrap();
-        let _ = db.execute(
-            "DELETE FROM known_files WHERE path = ?1",
-            params![path_str.as_ref()],
-        );
+        let db = self.db();
+        let _ = db
+            .prepare_cached("DELETE FROM known_files WHERE path = ?1")
+            .map(|mut stmt| stmt.execute(params![path_str.as_ref()]));
     }
 
     /// Get all known files for a folder (for reconciliation diff).
     pub fn known_files_in_folder(&self, folder_path: &Path) -> Vec<(String, i64, i64)> {
         let prefix = format!("{}\\", folder_path.to_string_lossy());
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let mut stmt = db
             .prepare("SELECT path, nas_size, nas_mtime FROM known_files WHERE path LIKE ?1 AND path NOT LIKE ?2")
             .unwrap();
@@ -345,7 +372,7 @@ impl CacheIndex {
     pub fn record_visited_folder(&self, nas_path: &Path, client_path: &Path, folder_mtime: i64) {
         let nas_str = nas_path.to_string_lossy();
         let client_str = client_path.to_string_lossy();
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute(
             "INSERT OR REPLACE INTO visited_folders (nas_path, client_path, folder_mtime) VALUES (?1, ?2, ?3)",
             params![nas_str.as_ref(), client_str.as_ref(), folder_mtime],
@@ -357,7 +384,7 @@ impl CacheIndex {
     pub fn ensure_visited_folder(&self, nas_path: &Path, client_path: &Path) {
         let nas_str = nas_path.to_string_lossy();
         let client_str = client_path.to_string_lossy();
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute(
             "INSERT OR IGNORE INTO visited_folders (nas_path, client_path, folder_mtime) VALUES (?1, ?2, 0)",
             params![nas_str.as_ref(), client_str.as_ref()],
@@ -366,7 +393,7 @@ impl CacheIndex {
 
     /// Get all visited folders for startup reconciliation.
     pub fn visited_folders(&self) -> Vec<(PathBuf, PathBuf, i64)> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let mut stmt = db
             .prepare("SELECT nas_path, client_path, folder_mtime FROM visited_folders")
             .unwrap();
@@ -384,7 +411,7 @@ impl CacheIndex {
     /// Update folder mtime after reconciliation.
     pub fn update_folder_mtime(&self, nas_path: &Path, folder_mtime: i64) {
         let nas_str = nas_path.to_string_lossy();
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute(
             "UPDATE visited_folders SET folder_mtime = ?1 WHERE nas_path = ?2",
             params![folder_mtime, nas_str.as_ref()],
@@ -395,7 +422,7 @@ impl CacheIndex {
 
     /// Get last_connected_at timestamp.
     pub fn last_connected_at(&self) -> Option<i64> {
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         db.query_row(
             "SELECT value FROM metadata WHERE key = 'last_connected_at'",
             [],
@@ -408,7 +435,7 @@ impl CacheIndex {
     /// Update last_connected_at to now.
     pub fn update_last_connected(&self) {
         let now = Self::unix_now();
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_connected_at', ?1)",
             params![now.to_string()],
@@ -440,7 +467,7 @@ impl CacheIndex {
 
         // Get LRU candidates (hydrated files, oldest first)
         let victims = {
-            let db = self.db.lock().unwrap();
+            let db = self.db();
             let mut stmt = db
                 .prepare("SELECT path, hydrated_size FROM known_files WHERE is_hydrated = 1 ORDER BY last_accessed ASC")
                 .unwrap();
@@ -467,7 +494,7 @@ impl CacheIndex {
             }
 
             if self.dehydrate_file(&path) {
-                let db = self.db.lock().unwrap();
+                let db = self.db();
                 let _ = db.execute(
                     "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path = ?1",
                     params![path_str],
@@ -492,7 +519,7 @@ impl CacheIndex {
     /// Clear ALL cached data for this mount. Returns (files_cleared, bytes_cleared).
     pub fn clear_all(&self) -> (u32, u64) {
         let entries = {
-            let db = self.db.lock().unwrap();
+            let db = self.db();
             let mut stmt = db
                 .prepare("SELECT path, hydrated_size FROM known_files WHERE is_hydrated = 1")
                 .unwrap();
@@ -517,7 +544,7 @@ impl CacheIndex {
         }
 
         // Mark all as dehydrated (don't delete — we still know about these files)
-        let db = self.db.lock().unwrap();
+        let db = self.db();
         let _ = db.execute("UPDATE known_files SET is_hydrated=0, hydrated_size=0", []);
 
         log::info!(
@@ -558,7 +585,7 @@ impl CacheIndex {
         if dehydrate_all {
             self.dehydrate_tree(&self.client_root);
             // Clear all tracking — fresh start
-            let db = self.db.lock().unwrap();
+            let db = self.db();
             let _ = db.execute("DELETE FROM known_files", []);
             let _ = db.execute("DELETE FROM visited_folders", []);
             let _ = db.execute("DELETE FROM metadata", []);
@@ -605,7 +632,7 @@ impl CacheIndex {
             } else if is_hydrated(&path) {
                 if let Ok(meta) = std::fs::metadata(&path) {
                     let path_str = path.to_string_lossy();
-                    let db = self.db.lock().unwrap();
+                    let db = self.db();
                     let _ = db.execute(
                         "INSERT INTO known_files (path, nas_size, nas_mtime, is_hydrated, hydrated_size, last_accessed)
                          VALUES (?1, ?2, 0, 1, ?2, ?3)

@@ -56,15 +56,17 @@ impl MetadataManager {
 
         self.db
             .with_conn(|conn| {
-                conn.execute(
+                let mut stmt = conn.prepare_cached(
                     "INSERT INTO item_metadata (item_path, job_path, folder_name, metadata_json, is_tracked, modified_time)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(item_path) DO UPDATE SET
                          metadata_json = excluded.metadata_json,
                          is_tracked = excluded.is_tracked,
                          modified_time = excluded.modified_time",
-                    rusqlite::params![item_path, job_path, folder_name, metadata_json, is_tracked as i64, now],
                 )?;
+                stmt.execute(rusqlite::params![
+                    item_path, job_path, folder_name, metadata_json, is_tracked as i64, now
+                ])?;
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
@@ -91,13 +93,10 @@ impl MetadataManager {
         // Fall back to DB
         self.db
             .with_conn(|conn| {
-                match conn.query_row(
-                    "SELECT metadata_json FROM item_metadata WHERE item_path = ?1",
-                    [item_path],
-                    |row| row.get::<_, String>(0),
-                ) {
+                let mut stmt = conn
+                    .prepare_cached("SELECT metadata_json FROM item_metadata WHERE item_path = ?1")?;
+                match stmt.query_row([item_path], |row| row.get::<_, String>(0)) {
                     Ok(json) => {
-                        // Cache for next time
                         let mut cache = self.cache.lock().unwrap();
                         cache.insert(item_path.to_string(), json.clone());
                         Ok(Some(json))

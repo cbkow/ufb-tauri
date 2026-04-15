@@ -36,21 +36,36 @@ struct ServerState {
     caches: std::sync::RwLock<HashMap<String, MacosCache>>,
     /// Channel back to UFB for out-of-band events (conflict notifications, etc.).
     ipc_tx: mpsc::Sender<AgentToUfb>,
+    /// Cached mounts config. Read once at startup, refreshed via `ReloadConfig`
+    /// IPC — eliminates disk+JSON-parse per request on every handler.
+    config: Arc<std::sync::RwLock<config::MountsConfig>>,
+    /// Cached canonicalized base path per domain. Eliminates one of two
+    /// `canonicalize()` SMB round-trips per file op. Populated lazily on
+    /// first use; invalidated on config reload (main.rs clears on reload).
+    canonical_bases: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
 }
 
 /// File operations IPC server for the FileProvider extension.
 pub struct FileOpsServer;
 
 impl FileOpsServer {
-    pub fn start(ipc_tx: mpsc::Sender<AgentToUfb>) {
+    pub fn start(
+        ipc_tx: mpsc::Sender<AgentToUfb>,
+        config: Arc<std::sync::RwLock<config::MountsConfig>>,
+        canonical_bases: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
+    ) {
         tokio::spawn(async move {
-            if let Err(e) = Self::run(ipc_tx).await {
+            if let Err(e) = Self::run(ipc_tx, config, canonical_bases).await {
                 log::error!("[FileOps] Server failed: {}", e);
             }
         });
     }
 
-    async fn run(ipc_tx: mpsc::Sender<AgentToUfb>) -> Result<(), String> {
+    async fn run(
+        ipc_tx: mpsc::Sender<AgentToUfb>,
+        config: Arc<std::sync::RwLock<config::MountsConfig>>,
+        canonical_bases: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
+    ) -> Result<(), String> {
         let sock_path = socket_path();
         let container = app_group_container();
 
@@ -76,8 +91,8 @@ impl FileOpsServer {
 
         // Initialize caches for sync-enabled mounts
         let mut caches = HashMap::new();
-        let config = config::load_config();
-        for mount in &config.mounts {
+        let initial_config = config.read().unwrap().clone();
+        for mount in &initial_config.mounts {
             if mount.enabled && mount.is_sync_mode() {
                 let domain = mount.share_name();
                 let nas_root = PathBuf::from("/Volumes").join(&domain);
@@ -96,6 +111,8 @@ impl FileOpsServer {
         let state = Arc::new(ServerState {
             caches: std::sync::RwLock::new(caches),
             ipc_tx,
+            config,
+            canonical_bases,
         });
 
         loop {
@@ -170,6 +187,7 @@ fn handle_request(req: FileOpsRequest, state: &ServerState) -> FileOpsResponse {
         FileOpsRequest::RenameItem(r) => handle_rename_item(r, state),
         FileOpsRequest::RecordEnumeration(r) => handle_record_enumeration(r, state),
         FileOpsRequest::ClearCache(r) => handle_clear_cache(r, state),
+        FileOpsRequest::EvictAll(r) => handle_evict_all(r, state),
         FileOpsRequest::GetChanges(r) => handle_get_changes(r, state),
     }
 }
@@ -181,7 +199,7 @@ fn ensure_cache(state: &ServerState, domain: &str) {
         return;
     }
     // Need to open — use write lock
-    let config = config::load_config();
+    let config = state.config.read().unwrap();
     if let Some(mount) = config.mounts.iter().find(|m| m.share_name() == domain && m.enabled && m.is_sync_mode()) {
         let nas_root = resolve_smb_mount_path(&mount.share_name())
             .unwrap_or_else(|| PathBuf::from("/Volumes").join(&mount.share_name()));
@@ -238,26 +256,8 @@ fn resolve_smb_mount_path(_share_name: &str) -> Option<PathBuf> {
 
 // ── Path resolution ──
 
-fn resolve_path(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
-    let config = config::load_config();
-    let mount = config
-        .mounts
-        .iter()
-        .find(|m| m.share_name() == domain && m.enabled)
-        .ok_or_else(|| format!("No enabled mount found for domain '{}'", domain))?;
-
-    // macOS: resolve to the actual SMB mount path (user-owned or /Volumes/
-    // fallback). Don't resolve via mount.mount_path() — that's the user-facing
-    // symlink, which for sync mode points to CloudStorage (circular).
-    #[cfg(target_os = "macos")]
-    let base = resolve_smb_mount_path(&mount.share_name())
-        .ok_or_else(|| format!("SMB mount not found for share '{}'", mount.share_name()))?;
-    #[cfg(not(target_os = "macos"))]
-    let base = PathBuf::from(mount.mount_path());
-
-    let base_canonical = base
-        .canonicalize()
-        .map_err(|e| format!("Base path resolution failed for {}: {}", base.display(), e))?;
+fn resolve_path(state: &ServerState, domain: &str, relative_path: &str) -> Result<PathBuf, String> {
+    let base_canonical = get_or_canonicalize_base(state, domain)?;
 
     let full_path = if relative_path.is_empty() {
         base_canonical.clone()
@@ -276,12 +276,50 @@ fn resolve_path(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Get the canonicalized base path for a domain, caching the result. Without
+/// this we'd canonicalize the base on every file operation — an SMB round-trip
+/// that rarely changes. The cache is invalidated on config reload.
+fn get_or_canonicalize_base(state: &ServerState, domain: &str) -> Result<PathBuf, String> {
+    // Fast path: read lock + HashMap lookup.
+    if let Some(cached) = state.canonical_bases.read().unwrap().get(domain).cloned() {
+        return Ok(cached);
+    }
+
+    // Slow path: compute and insert.
+    let config = state.config.read().unwrap();
+    let mount = config
+        .mounts
+        .iter()
+        .find(|m| m.share_name() == domain && m.enabled)
+        .ok_or_else(|| format!("No enabled mount found for domain '{}'", domain))?;
+
+    #[cfg(target_os = "macos")]
+    let base = resolve_smb_mount_path(&mount.share_name())
+        .ok_or_else(|| format!("SMB mount not found for share '{}'", mount.share_name()))?;
+    #[cfg(not(target_os = "macos"))]
+    let base = PathBuf::from(mount.mount_path());
+
+    drop(config); // release read lock before the SMB round-trip
+
+    let canonical = base
+        .canonicalize()
+        .map_err(|e| format!("Base path resolution failed for {}: {}", base.display(), e))?;
+
+    state
+        .canonical_bases
+        .write()
+        .unwrap()
+        .insert(domain.to_string(), canonical.clone());
+
+    Ok(canonical)
+}
+
 /// Resolve for new files that don't exist yet (can't canonicalize).
-fn resolve_path_for_write(domain: &str, relative_path: &str) -> Result<PathBuf, String> {
-    match resolve_path(domain, relative_path) {
+fn resolve_path_for_write(state: &ServerState, domain: &str, relative_path: &str) -> Result<PathBuf, String> {
+    match resolve_path(state, domain, relative_path) {
         Ok(p) => Ok(p),
         Err(_) => {
-            let config = config::load_config();
+            let config = state.config.read().unwrap();
             let mount = config.mounts.iter()
                 .find(|m| m.share_name() == domain && m.enabled)
                 .ok_or_else(|| format!("No mount for domain '{}'", domain))?;
@@ -298,7 +336,7 @@ fn resolve_path_for_write(domain: &str, relative_path: &str) -> Result<PathBuf, 
 // ── Handlers ──
 
 fn handle_list_dir(req: ListDirReq, state: &ServerState) -> FileOpsResponse {
-    let dir_path = match resolve_path(&req.domain, &req.relative_path) {
+    let dir_path = match resolve_path(state, &req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -353,7 +391,7 @@ fn handle_list_dir(req: ListDirReq, state: &ServerState) -> FileOpsResponse {
 }
 
 fn handle_stat(req: StatReq, state: &ServerState) -> FileOpsResponse {
-    let file_path = match resolve_path(&req.domain, &req.relative_path) {
+    let file_path = match resolve_path(state, &req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -424,7 +462,7 @@ fn handle_stat(req: StatReq, state: &ServerState) -> FileOpsResponse {
 }
 
 fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
-    let source_path = match resolve_path(&req.domain, &req.relative_path) {
+    let source_path = match resolve_path(state, &req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -514,7 +552,7 @@ fn handle_read_file(req: ReadFileReq, state: &ServerState) -> FileOpsResponse {
 }
 
 fn handle_write_file(req: WriteFileReq, state: &ServerState) -> FileOpsResponse {
-    let dest_path = match resolve_path_for_write(&req.domain, &req.relative_path) {
+    let dest_path = match resolve_path_for_write(state, &req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -719,7 +757,7 @@ fn emit_conflict_event(
 }
 
 fn handle_delete_item(req: DeleteItemReq, state: &ServerState) -> FileOpsResponse {
-    let target_path = match resolve_path(&req.domain, &req.relative_path) {
+    let target_path = match resolve_path(state, &req.domain, &req.relative_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -765,7 +803,7 @@ fn handle_delete_item(req: DeleteItemReq, state: &ServerState) -> FileOpsRespons
 }
 
 fn handle_rename_item(req: RenameItemReq, state: &ServerState) -> FileOpsResponse {
-    let old_path = match resolve_path(&req.domain, &req.old_path) {
+    let old_path = match resolve_path(state, &req.domain, &req.old_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -775,7 +813,7 @@ fn handle_rename_item(req: RenameItemReq, state: &ServerState) -> FileOpsRespons
         }
     };
 
-    let new_path = match resolve_path_for_write(&req.domain, &req.new_path) {
+    let new_path = match resolve_path_for_write(state, &req.domain, &req.new_path) {
         Ok(p) => p,
         Err(e) => {
             return FileOpsResponse::Error(FileOpsErrorResp {
@@ -850,6 +888,22 @@ fn handle_clear_cache(req: ClearCacheReq, state: &ServerState) -> FileOpsRespons
     })
 }
 
+fn handle_evict_all(req: EvictAllReq, state: &ServerState) -> FileOpsResponse {
+    ensure_cache(state, &req.domain);
+    let paths = state
+        .caches
+        .read()
+        .unwrap()
+        .get(&req.domain)
+        .map(|c| c.hydrated_paths())
+        .unwrap_or_default();
+    log::info!("[FileOps] EvictAll {}: {} hydrated paths", req.domain, paths.len());
+    FileOpsResponse::EvictList(EvictListResp {
+        request_id: req.request_id,
+        paths,
+    })
+}
+
 fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsResponse {
     let since: f64 = req.since_anchor.parse().unwrap_or(0.0);
 
@@ -880,7 +934,7 @@ fn handle_get_changes(req: GetChangesReq, state: &ServerState) -> FileOpsRespons
     } else {
         // Passthrough mount (no cache DB) — do a fresh readdir of root
         // and return everything as "updated". The system diffs against its cache.
-        let config = config::load_config();
+        let config = state.config.read().unwrap();
         let mount = config.mounts.iter()
             .find(|m| m.share_name() == req.domain && m.enabled);
 

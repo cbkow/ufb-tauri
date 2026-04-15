@@ -2930,3 +2930,106 @@ the same share reuse one physical mount.
 
 One Finder dialog per affected share per launch is the current-build
 limitation. Works, ugly. Fix when there's time.
+
+---
+
+## 2026-04-15 — Concurrency & performance audit: pattern-level findings
+
+User reported ~30× slower directory loads and ~10× slower per-file access
+through the FileProvider sync path vs plain SMB. Three parallel audits
+(Swift extension concurrency, agent Rust hot paths, src-tauri state) all
+converged on the **same two systemic patterns** that serialize the whole
+stack:
+
+### Pattern 1 — "shared connection + lock-around-send-recv" at every IPC boundary
+
+- Swift `AgentFileOpsClient.shared` holds one `UnixStream` + one `NSLock`
+  spanning the entire send-receive cycle. Every delegate method (`item`,
+  `fetchContents`, `enumerateItems`, etc.) serializes at that lock. A
+  10-second `fs::copy` blocks every stat queued behind it. No request-ID
+  multiplexing — assumes FIFO.
+- Agent `handle_client` is serial per-connection. Since Swift only opens
+  one connection, Layer 2 is effectively always one-at-a-time, with the
+  thread free only when each request completes.
+- Distributed-notification handler `clearCacheRequested` calls `listDir`
+  via the shared lock — notification handling blocks unrelated Finder ops.
+
+### Pattern 2 — "single Mutex<Connection>" for every SQLite touch
+
+- Agent cache (`macos_cache.rs`): one `Mutex<Connection>` serializes ALL
+  reads and writes across all handlers.
+- `record_enumeration` on a 100-entry folder: ~200 autocommit ops
+  (SELECT + INSERT OR REPLACE per entry + visited_folder + orphan scan)
+  under one mutex hold. Each op a separate fsync.
+- `get_changes_since` holds `conn.lock()` across `fs::read_dir` on
+  each visited NAS folder — every other cache op waits on SMB latency.
+- Agent watcher poll loop holds `folder_state` mutex across `fs::read_dir`
+  for each folder — same pattern, different mutex.
+- `pending_evictions` mutex acquired nested inside `conn.lock()` — poor
+  hygiene.
+- src-tauri `Database` is also a single `Mutex<Connection>`. `upsert_item_metadata`
+  takes DB mutex, then mesh_sync_manager mutex — nested locks create
+  stalls during mesh propagation.
+- HTTP peer handlers nest DB → command_tx — same pattern.
+
+### Other per-request overhead
+
+- `config::load_config()` runs on every agent handler invocation (disk
+  read + JSON parse).
+- `resolve_path` calls `canonicalize()` twice (two SMB round-trips per op).
+- No `prepare_cached` for any hot SQLite statement — SQL re-parsed every
+  call.
+- Orphan query uses `WHERE path LIKE '%'` — not index-usable with leading
+  wildcard; degrades to full scan at scale.
+- src-tauri commands reload `settings.json` from disk on every invocation
+  (path mapping lookup).
+- Missing indexes: `subscriptions(is_active)`, `item_metadata(job_path, is_tracked)`.
+
+### The honest limits below Rust
+
+Fixing these is leverage within what Rust + macOS + Apple's SMB stack permit.
+What we can't move:
+
+- **SMB is synchronous at the OS level.** Every concurrent read needs its
+  own thread. No language changes this.
+- **Apple's FileProvider extension is a sync-contract model.** Delegate
+  methods must complete in bounded time on system-managed queues.
+- **SQLite WAL still has one-writer semantics.** Many readers concurrent,
+  but writes serialize.
+
+Rust makes these limits visible (explicit `Mutex<Connection>`, `spawn_blocking`).
+Other languages hide the same cost without actually reducing it. We're
+not hitting "Rust's limits" — we're hitting the limits of the layers below.
+
+### Plan
+
+Captured in detail at `~/.claude/plans/abundant-churning-wadler.md`. Five
+waves:
+
+- **Wave 1** — Agent additive perf (config cache, canonicalize cache,
+  SQLite transaction batching, prepare_cached, I/O out of mutex,
+  un-nest pending_evictions). ~300 lines.
+- **Wave 1.5** — r2d2 SQLite connection pool for both agent cache and
+  src-tauri DB. Eliminates "reader blocks writer" across the stack.
+  WAL mode supports many readers + one writer natively — just need multiple
+  Connection instances. ~250 lines.
+- **Wave 2** — Swift connection pool (4 concurrent agent connections).
+  Unlocks real parallelism since agent's accept loop already spawns per-client
+  handlers. Plus new `EvictAll` IPC message to keep clear-cache notification
+  out of the main pool. ~240 lines.
+- **Wave 3** — Measure-triggered mop-up (watcher poll I/O, parent_path
+  index, defer record_enumeration off hot path). Only if Waves 1+1.5+2
+  don't close the gap. ~180 lines.
+- **Wave 4** — src-tauri cleanup (transaction + prepare_cached pass,
+  cache settings, break DB→mesh nested lock, missing indexes, async
+  create_directory/rename_path). ~225 lines.
+
+Non-goals explicit: no async runtime restructure (tokio's blocking pool
+handles the workload fine up to ~16 concurrent connections; revisit if we
+scale past); no database swap (SQLite with pool is the right tool); no
+user-space SMB client (nice idea; massive scope; moves post-Wave-2 ceiling);
+no manifest layer (already rejected earlier).
+
+**Ordering:** Wave 1 first (low risk, measurable). Then Wave 1.5 same
+mindset. Then Wave 2 (the biggest user-visible unlock). Measure. Then
+Wave 3 if needed. Then Wave 4.

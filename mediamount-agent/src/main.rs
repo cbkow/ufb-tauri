@@ -224,11 +224,28 @@ async fn run_event_loop() {
         // Channel for agent→UFB messages from mount orchestrators
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(128);
 
+        // Shared config cache — loaded once at startup, refreshed when the
+        // config file changes (watcher below). FileOpsServer reads from this
+        // instead of hitting disk + JSON-parsing mounts.json on every handler.
+        let config_cache: std::sync::Arc<std::sync::RwLock<config::MountsConfig>> =
+            std::sync::Arc::new(std::sync::RwLock::new(config::load_config()));
+
+        // Shared cache of canonicalized base paths per domain. Eliminates one
+        // of the two SMB `canonicalize()` round-trips per file op. Main clears
+        // this on config reload so mounts that moved are re-resolved.
+        let canonical_bases: std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, std::path::PathBuf>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
         // Start file operations server for FileProvider extension (macOS only).
         // It uses the same agent→UFB channel to emit out-of-band events such
         // as conflict-detected notifications.
         #[cfg(target_os = "macos")]
-        ipc::fileops_server::FileOpsServer::start(state_tx.clone());
+        ipc::fileops_server::FileOpsServer::start(
+            state_tx.clone(),
+            std::sync::Arc::clone(&config_cache),
+            std::sync::Arc::clone(&canonical_bases),
+        );
 
         // Tray receives a copy of state updates
         let (tray_state_tx, tray_state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(64);
@@ -291,6 +308,12 @@ async fn run_event_loop() {
 
                 // Config file changed on disk
                 Some(()) = config_reload_rx.recv() => {
+                    // Refresh shared cache BEFORE mount_service reloads, so
+                    // any FileOpsServer handlers that race with the reload
+                    // see the new config. Also invalidate the canonical-base
+                    // cache — a mount path change would otherwise stick.
+                    *config_cache.write().unwrap() = config::load_config();
+                    canonical_bases.write().unwrap().clear();
                     mount_service.reload_config().await;
                 }
 

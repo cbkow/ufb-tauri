@@ -230,13 +230,28 @@ fn run_poll_loop(
         }
 
         log::info!("[macos-watcher] Poll cycle for {}", domain);
-        let mut changed = false;
-        let mut state = folder_state.lock().unwrap();
 
-        // Check root and any previously seen folders
-        let folders: Vec<PathBuf> = state.keys().cloned().collect();
-        for folder in folders {
-            if let Some(new_snapshot) = snapshot_folder(&folder) {
+        // Two-phase: snapshot folder keys under a short-held lock, release it,
+        // do all SMB read_dirs outside, then reacquire for the diff+apply.
+        // This keeps the shared folder_state map available to other writers
+        // (FSEvents callbacks, register_folder) during slow NAS I/O.
+        let folders: Vec<PathBuf> = {
+            let mut keys: Vec<PathBuf> = folder_state.lock().unwrap().keys().cloned().collect();
+            if !keys.iter().any(|p| p == nas_root) {
+                keys.push(nas_root.to_path_buf());
+            }
+            keys
+        };
+
+        let fresh: Vec<(PathBuf, FolderSnapshot)> = folders
+            .into_iter()
+            .filter_map(|f| snapshot_folder(&f).map(|s| (f, s)))
+            .collect();
+
+        let mut changed = false;
+        {
+            let mut state = folder_state.lock().unwrap();
+            for (folder, new_snapshot) in fresh {
                 if let Some(old_snapshot) = state.get(&folder) {
                     if new_snapshot.entry_count != old_snapshot.entry_count
                         || new_snapshot.mtime != old_snapshot.mtime
@@ -254,15 +269,6 @@ fn run_poll_loop(
                 state.insert(folder, new_snapshot);
             }
         }
-
-        // Also check root even if not in map yet
-        if !state.contains_key(nas_root) {
-            if let Some(snapshot) = snapshot_folder(nas_root) {
-                state.insert(nas_root.to_path_buf(), snapshot);
-            }
-        }
-
-        drop(state);
 
         if changed {
             post_darwin_notification(domain);

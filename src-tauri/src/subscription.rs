@@ -161,11 +161,11 @@ impl SubscriptionManager {
         let now = chrono::Utc::now().timestamp_millis();
         self.db
             .with_conn(|conn| {
-                conn.execute(
+                let mut stmt = conn.prepare_cached(
                     "UPDATE subscriptions SET sync_status = ?1, last_sync_time = ?2
                      WHERE job_path = ?3",
-                    rusqlite::params![status.to_string(), now, job_path],
                 )?;
+                stmt.execute(rusqlite::params![status.to_string(), now, job_path])?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -174,10 +174,9 @@ impl SubscriptionManager {
     pub fn update_shot_count(&self, job_path: &str, count: i64) -> Result<(), String> {
         self.db
             .with_conn(|conn| {
-                conn.execute(
-                    "UPDATE subscriptions SET shot_count = ?1 WHERE job_path = ?2",
-                    rusqlite::params![count, job_path],
-                )?;
+                let mut stmt = conn
+                    .prepare_cached("UPDATE subscriptions SET shot_count = ?1 WHERE job_path = ?2")?;
+                stmt.execute(rusqlite::params![count, job_path])?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -196,15 +195,17 @@ impl SubscriptionManager {
         let now = chrono::Utc::now().timestamp_millis();
         self.db
             .with_conn(|conn| {
-                conn.execute(
+                let mut stmt = conn.prepare_cached(
                     "INSERT INTO item_metadata (item_path, job_path, folder_name, metadata_json, is_tracked, modified_time)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(item_path) DO UPDATE SET
                          metadata_json = excluded.metadata_json,
                          is_tracked = excluded.is_tracked,
                          modified_time = excluded.modified_time",
-                    rusqlite::params![item_path, job_path, folder_name, metadata_json, is_tracked as i64, now],
                 )?;
+                stmt.execute(rusqlite::params![
+                    item_path, job_path, folder_name, metadata_json, is_tracked as i64, now
+                ])?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -213,11 +214,9 @@ impl SubscriptionManager {
     pub fn get_item_metadata(&self, item_path: &str) -> Result<Option<String>, String> {
         self.db
             .with_conn(|conn| {
-                let result = conn.query_row(
-                    "SELECT metadata_json FROM item_metadata WHERE item_path = ?1",
-                    [item_path],
-                    |row| row.get::<_, String>(0),
-                );
+                let mut stmt = conn
+                    .prepare_cached("SELECT metadata_json FROM item_metadata WHERE item_path = ?1")?;
+                let result = stmt.query_row([item_path], |row| row.get::<_, String>(0));
                 match result {
                     Ok(json) => Ok(Some(json)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -230,7 +229,7 @@ impl SubscriptionManager {
     pub fn get_tracked_items(&self, job_path: &str) -> Result<Vec<TrackedItemRecord>, String> {
         self.db
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT im.item_path, im.job_path, s.job_name, im.folder_name, im.metadata_json, im.modified_time
                      FROM item_metadata im
                      JOIN subscriptions s ON im.job_path = s.job_path
@@ -256,7 +255,7 @@ impl SubscriptionManager {
     pub fn get_all_tracked_items(&self) -> Result<Vec<TrackedItemRecord>, String> {
         self.db
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT im.item_path, im.job_path, s.job_name, im.folder_name, im.metadata_json, im.modified_time
                      FROM item_metadata im
                      JOIN subscriptions s ON im.job_path = s.job_path
@@ -282,10 +281,9 @@ impl SubscriptionManager {
     pub fn delete_item_metadata(&self, item_path: &str) -> Result<(), String> {
         self.db
             .with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM item_metadata WHERE item_path = ?1",
-                    [item_path],
-                )?;
+                let mut stmt =
+                    conn.prepare_cached("DELETE FROM item_metadata WHERE item_path = ?1")?;
+                stmt.execute([item_path])?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -297,7 +295,7 @@ impl SubscriptionManager {
     ) -> Result<Vec<ItemMetadataRecord>, String> {
         self.db
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT item_path, folder_name, metadata_json, is_tracked
                      FROM item_metadata WHERE job_path = ?1",
                 )?;
@@ -324,7 +322,7 @@ impl SubscriptionManager {
     ) -> Result<Vec<ItemMetadataRecord>, String> {
         self.db
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT item_path, folder_name, metadata_json, is_tracked
                      FROM item_metadata WHERE job_path = ?1 AND folder_name = ?2",
                 )?;

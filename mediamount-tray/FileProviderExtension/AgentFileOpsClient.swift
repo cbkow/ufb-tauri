@@ -1,17 +1,23 @@
 import Foundation
 
 /// IPC client for file operations with the mediamount-agent.
-/// Connects to the agent's file operations socket in the app group container.
-/// All calls are synchronous (blocking) — the FileProvider system calls extension
-/// methods on its own work queues, so blocking is expected.
+///
+/// Uses a pool of independent Unix-socket connections so concurrent
+/// FileProvider delegate methods (fetchContents, item, enumerateItems, etc.)
+/// don't serialize behind a single mutex. Each pooled connection uses its own
+/// lock to guarantee FIFO request/response framing on that connection; the
+/// pool itself uses a semaphore to gate overall concurrency.
 class AgentFileOpsClient {
     static let shared = AgentFileOpsClient()
 
     private let appGroupID = "5Z4S9VHV56.group.com.unionfiles.mediamount-tray"
-    private var inputStream: InputStream?
-    private var outputStream: OutputStream?
-    private var buffer = Data()
-    private let lock = NSLock()
+    private let poolSize = 4
+
+    /// Array of connections owned by this client. `acquire` / `release` move
+    /// them between an idle set and an in-use set.
+    private var idleConnections: [AgentConnection] = []
+    private let poolLock = NSLock()
+    private let semaphore: DispatchSemaphore
 
     private var socketPath: String {
         let groupContainer = FileManager.default.containerURL(
@@ -20,7 +26,6 @@ class AgentFileOpsClient {
         if let container = groupContainer {
             return container.appendingPathComponent("fp.sock").path
         }
-        // Fallback: try the hardcoded path
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home
             .appendingPathComponent("Library/Group Containers")
@@ -29,9 +34,14 @@ class AgentFileOpsClient {
             .path
     }
 
-    // MARK: - Public API
+    private init() {
+        self.semaphore = DispatchSemaphore(value: poolSize)
+        let path = socketPath
+        self.idleConnections = (0..<poolSize).map { _ in AgentConnection(socketPath: path) }
+    }
 
-    /// List directory contents for a domain + relative path.
+    // MARK: - Public API (unchanged surface)
+
     func listDir(domain: String, relativePath: String) throws -> [DirEntryResponse] {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -40,27 +50,15 @@ class AgentFileOpsClient {
             "domain": domain,
             "relativePath": relativePath,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "dir_listing",
+        try throwIfError(response)
+        guard response["type"] as? String == "dir_listing",
               let entries = response["entries"] as? [[String: Any]] else {
             throw FileOpsError.invalidResponse("Expected dir_listing response")
         }
-
         return entries.compactMap { DirEntryResponse(json: $0) }
     }
 
-    /// Get metadata for a single file/directory.
     func stat(domain: String, relativePath: String) throws -> FileStatResponse {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -69,30 +67,15 @@ class AgentFileOpsClient {
             "domain": domain,
             "relativePath": relativePath,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "file_stat" else {
+        try throwIfError(response)
+        guard response["type"] as? String == "file_stat",
+              let stat = FileStatResponse(json: response) else {
             throw FileOpsError.invalidResponse("Expected file_stat response")
-        }
-
-        guard let stat = FileStatResponse(json: response) else {
-            throw FileOpsError.invalidResponse("Failed to parse file_stat")
         }
         return stat
     }
 
-    /// Read a file — agent copies it to a temp path in the app group container.
-    /// Returns the URL to the temp file.
     func readFile(domain: String, relativePath: String) throws -> (url: URL, stat: FileStatResponse) {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -101,26 +84,14 @@ class AgentFileOpsClient {
             "domain": domain,
             "relativePath": relativePath,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "file_ready",
+        try throwIfError(response)
+        guard response["type"] as? String == "file_ready",
               let tempPath = response["tempPath"] as? String else {
             throw FileOpsError.invalidResponse("Expected file_ready response")
         }
-
         let size = response["size"] as? UInt64 ?? 0
         let modified = response["modified"] as? Double ?? 0
-
         let stat = FileStatResponse(
             name: (relativePath as NSString).lastPathComponent,
             isDir: false,
@@ -128,11 +99,9 @@ class AgentFileOpsClient {
             modified: modified,
             created: modified
         )
-
         return (URL(fileURLWithPath: tempPath), stat)
     }
 
-    /// Staging directory in the app group container for file handoff to the agent.
     private var stagingDir: URL {
         let groupContainer = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupID
@@ -142,23 +111,15 @@ class AgentFileOpsClient {
         return groupContainer.appendingPathComponent("staging")
     }
 
-    /// Write a file to the NAS. For files, the extension stages the content in the app group
-    /// container (where the agent can read it), then tells the agent to copy it to the NAS.
-    /// For directory creation, pass isDir=true and sourceURL=nil.
     func writeFile(domain: String, relativePath: String, sourceURL: URL?, isDir: Bool = false) throws -> (size: UInt64, modified: Double) {
         var stagedPath = ""
-
-        // Stage file content in the app group container so the agent can access it
         if let sourceURL = sourceURL, !isDir {
             let staging = stagingDir
             try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-
             let stagedFile = staging.appendingPathComponent(
                 "\(ProcessInfo.processInfo.processIdentifier)-\(Int(Date().timeIntervalSince1970 * 1000)).tmp"
             )
-            // Remove old staged file if exists
             try? FileManager.default.removeItem(at: stagedFile)
-
             try FileManager.default.copyItem(at: sourceURL, to: stagedFile)
             stagedPath = stagedFile.path
             NSLog("[FileOpsClient] Staged file: \(sourceURL.path) → \(stagedPath)")
@@ -173,28 +134,16 @@ class AgentFileOpsClient {
             "sourcePath": stagedPath,
             "isDir": isDir,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "write_ok" else {
+        try throwIfError(response)
+        guard response["type"] as? String == "write_ok" else {
             throw FileOpsError.invalidResponse("Expected write_ok response")
         }
-
         let size = response["size"] as? UInt64 ?? 0
         let modified = response["modified"] as? Double ?? 0
         return (size, modified)
     }
 
-    /// Delete a file or directory on the NAS.
     func deleteItem(domain: String, relativePath: String) throws {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -203,20 +152,10 @@ class AgentFileOpsClient {
             "domain": domain,
             "relativePath": relativePath,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
+        try throwIfError(response)
     }
 
-    /// Rename a file or directory on the NAS.
     func renameItem(domain: String, oldPath: String, newPath: String) throws -> (size: UInt64, modified: Double) {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -226,28 +165,16 @@ class AgentFileOpsClient {
             "oldPath": oldPath,
             "newPath": newPath,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
-        }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "rename_ok" else {
+        try throwIfError(response)
+        guard response["type"] as? String == "rename_ok" else {
             throw FileOpsError.invalidResponse("Expected rename_ok response")
         }
-
         let size = response["size"] as? UInt64 ?? 0
         let modified = response["modified"] as? Double ?? 0
         return (size, modified)
     }
 
-    /// Get changes since a given sync anchor. Agent diffs its cache DB against live NAS state.
     func getChanges(domain: String, sinceAnchor: String) throws -> ChangesResponse {
         let requestId = makeRequestId()
         let request: [String: Any] = [
@@ -256,32 +183,18 @@ class AgentFileOpsClient {
             "domain": domain,
             "sinceAnchor": sinceAnchor,
         ]
-
         let response = try sendAndReceive(request)
-
-        guard let type_ = response["type"] as? String else {
-            throw FileOpsError.invalidResponse("Missing type field")
+        try throwIfError(response)
+        guard response["type"] as? String == "changes" else {
+            throw FileOpsError.invalidResponse("Expected changes response")
         }
-
-        if type_ == "error" {
-            let message = response["message"] as? String ?? "Unknown error"
-            throw FileOpsError.agentError(message)
-        }
-
-        guard type_ == "changes" else {
-            throw FileOpsError.invalidResponse("Expected changes response, got \(type_)")
-        }
-
         let updated = (response["updated"] as? [[String: Any]] ?? []).compactMap { ChangedEntryResponse(json: $0) }
         let deleted = response["deleted"] as? [String] ?? []
         let newAnchor = response["newAnchor"] as? String ?? ""
-
         let evict = response["evict"] as? [String] ?? []
         return ChangesResponse(updated: updated, deleted: deleted, evict: evict, newAnchor: newAnchor)
     }
 
-    /// Tell the agent to record an enumeration in its cache DB.
-    /// Called after enumerateItems completes so the agent knows what we've reported.
     func recordEnumeration(domain: String, relativePath: String, entries: [DirEntryResponse]) {
         let requestId = makeRequestId()
         let entriesJson: [[String: Any]] = entries.map { entry in
@@ -293,7 +206,6 @@ class AgentFileOpsClient {
                 "created": entry.created,
             ] as [String: Any]
         }
-
         let request: [String: Any] = [
             "type": "record_enumeration",
             "requestId": requestId,
@@ -301,8 +213,6 @@ class AgentFileOpsClient {
             "relativePath": relativePath,
             "entries": entriesJson,
         ]
-
-        // Fire and forget — don't block on response
         do {
             let _ = try sendAndReceive(request)
         } catch {
@@ -310,7 +220,133 @@ class AgentFileOpsClient {
         }
     }
 
-    // MARK: - Connection
+    /// Query the agent for all currently-hydrated relative paths in a domain.
+    /// Cheap — it's a single indexed SQLite query, no NAS I/O.
+    func evictAll(domain: String) throws -> [String] {
+        let requestId = makeRequestId()
+        let request: [String: Any] = [
+            "type": "evict_all",
+            "requestId": requestId,
+            "domain": domain,
+        ]
+        let response = try sendAndReceive(request)
+        try throwIfError(response)
+        guard response["type"] as? String == "evict_list" else {
+            throw FileOpsError.invalidResponse("Expected evict_list response")
+        }
+        return response["paths"] as? [String] ?? []
+    }
+
+    // MARK: - Pool management
+
+    private func acquire() -> AgentConnection {
+        semaphore.wait()
+        poolLock.lock()
+        // By construction (semaphore gates to poolSize), there is always at
+        // least one idle connection when we get here.
+        let conn = idleConnections.removeLast()
+        poolLock.unlock()
+        return conn
+    }
+
+    private func release(_ conn: AgentConnection) {
+        poolLock.lock()
+        idleConnections.append(conn)
+        poolLock.unlock()
+        semaphore.signal()
+    }
+
+    private func sendAndReceive(_ request: [String: Any]) throws -> [String: Any] {
+        let conn = acquire()
+        defer { release(conn) }
+        return try conn.sendAndReceive(request)
+    }
+
+    private func throwIfError(_ response: [String: Any]) throws {
+        if response["type"] as? String == "error" {
+            let message = response["message"] as? String ?? "Unknown error"
+            throw FileOpsError.agentError(message)
+        }
+    }
+
+    // Request IDs are advisory for logs — the pool uses FIFO framing, not
+    // multiplexing, so request IDs don't need to coordinate across connections.
+    private var requestCounter: UInt64 = 0
+    private let counterLock = NSLock()
+    private func makeRequestId() -> String {
+        counterLock.lock()
+        defer { counterLock.unlock() }
+        requestCounter += 1
+        return "fp-\(requestCounter)"
+    }
+}
+
+// MARK: - Pooled connection
+
+/// A single Unix-socket connection to the agent. All send/receive traffic on
+/// this connection is serialized by `lock` (required because the agent's
+/// wire protocol is FIFO request/response per connection, no multiplexing).
+/// On any I/O error the connection is torn down and reconnected on the next
+/// call; one retry before we propagate the error upward.
+private final class AgentConnection {
+    let socketPath: String
+    private var inputStream: InputStream?
+    private var outputStream: OutputStream?
+    private var buffer = Data()
+    private let lock = NSLock()
+
+    init(socketPath: String) {
+        self.socketPath = socketPath
+    }
+
+    func sendAndReceive(_ request: [String: Any]) throws -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // One retry after a teardown+reconnect.
+        do {
+            try ensureConnected()
+            return try sendAndReceiveLocked(request)
+        } catch {
+            NSLog("[FileOpsClient] Connection error, retrying: \(error)")
+            disconnect()
+            try ensureConnected()
+            return try sendAndReceiveLocked(request)
+        }
+    }
+
+    private func sendAndReceiveLocked(_ request: [String: Any]) throws -> [String: Any] {
+        guard let output = outputStream, let input = inputStream else {
+            throw FileOpsError.connectionFailed("Not connected")
+        }
+
+        let jsonData = try JSONSerialization.data(withJSONObject: request)
+
+        var length = UInt32(jsonData.count).littleEndian
+        let lengthData = Data(bytes: &length, count: 4)
+
+        let writeResult1 = lengthData.withUnsafeBytes { ptr in
+            output.write(ptr.bindMemory(to: UInt8.self).baseAddress!, maxLength: 4)
+        }
+        guard writeResult1 == 4 else {
+            disconnect()
+            throw FileOpsError.connectionFailed("Failed to write length prefix")
+        }
+
+        let writeResult2 = jsonData.withUnsafeBytes { ptr in
+            output.write(ptr.bindMemory(to: UInt8.self).baseAddress!, maxLength: jsonData.count)
+        }
+        guard writeResult2 == jsonData.count else {
+            disconnect()
+            throw FileOpsError.connectionFailed("Failed to write payload")
+        }
+
+        let responseData = try readMessage(from: input)
+        guard let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+            throw FileOpsError.invalidResponse("Failed to parse JSON response")
+        }
+        return json
+    }
 
     private func ensureConnected() throws {
         if inputStream != nil && outputStream != nil {
@@ -318,7 +354,6 @@ class AgentFileOpsClient {
         }
 
         let path = socketPath
-        NSLog("[FileOpsClient] Connecting to %@", path)
 
         let socket = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socket >= 0 else {
@@ -367,7 +402,7 @@ class AgentFileOpsClient {
         self.outputStream = output
         self.buffer = Data()
 
-        NSLog("[FileOpsClient] Connected")
+        NSLog("[FileOpsClient] Pool connection opened")
     }
 
     private func disconnect() {
@@ -378,66 +413,13 @@ class AgentFileOpsClient {
         buffer = Data()
     }
 
-    // MARK: - Wire Protocol
-
-    /// Send a request and wait for the response. Thread-safe via lock.
-    private func sendAndReceive(_ request: [String: Any]) throws -> [String: Any] {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Try to connect (or reconnect)
-        do {
-            try ensureConnected()
-        } catch {
-            // Retry once after disconnect
-            disconnect()
-            try ensureConnected()
-        }
-
-        guard let output = outputStream, let input = inputStream else {
-            throw FileOpsError.connectionFailed("Not connected")
-        }
-
-        // Serialize request
-        let jsonData = try JSONSerialization.data(withJSONObject: request)
-
-        // Write: 4-byte LE length + JSON
-        var length = UInt32(jsonData.count).littleEndian
-        let lengthData = Data(bytes: &length, count: 4)
-
-        let writeResult1 = lengthData.withUnsafeBytes { ptr in
-            output.write(ptr.bindMemory(to: UInt8.self).baseAddress!, maxLength: 4)
-        }
-        guard writeResult1 == 4 else {
-            disconnect()
-            throw FileOpsError.connectionFailed("Failed to write length prefix")
-        }
-
-        let writeResult2 = jsonData.withUnsafeBytes { ptr in
-            output.write(ptr.bindMemory(to: UInt8.self).baseAddress!, maxLength: jsonData.count)
-        }
-        guard writeResult2 == jsonData.count else {
-            disconnect()
-            throw FileOpsError.connectionFailed("Failed to write payload")
-        }
-
-        // Read response: 4-byte LE length + JSON
-        let responseData = try readMessage(from: input)
-
-        guard let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
-            throw FileOpsError.invalidResponse("Failed to parse JSON response")
-        }
-
-        return json
-    }
-
-    /// Read a length-prefixed message from the input stream.
     private func readMessage(from input: InputStream) throws -> Data {
-        // Read 4-byte length prefix
         var lengthBuf = [UInt8](repeating: 0, count: 4)
         var bytesRead = 0
         while bytesRead < 4 {
-            let n = input.read(&lengthBuf + bytesRead, maxLength: 4 - bytesRead)
+            let n = lengthBuf.withUnsafeMutableBufferPointer { ptr -> Int in
+                input.read(ptr.baseAddress! + bytesRead, maxLength: 4 - bytesRead)
+            }
             if n <= 0 {
                 disconnect()
                 throw FileOpsError.connectionFailed("Connection closed while reading length")
@@ -450,7 +432,6 @@ class AgentFileOpsClient {
             throw FileOpsError.invalidResponse("Invalid message length: \(length)")
         }
 
-        // Read payload
         var payload = Data(count: length)
         var totalRead = 0
         while totalRead < length {
@@ -465,12 +446,6 @@ class AgentFileOpsClient {
         }
 
         return payload
-    }
-
-    private var requestCounter: UInt64 = 0
-    private func makeRequestId() -> String {
-        requestCounter += 1
-        return "fp-\(requestCounter)"
     }
 }
 
@@ -560,7 +535,6 @@ enum FileOpsError: Error, LocalizedError {
         }
     }
 
-    /// Convert to NSError in a domain that FileProvider accepts.
     var asNSError: NSError {
         switch self {
         case .connectionFailed:

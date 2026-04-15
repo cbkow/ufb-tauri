@@ -63,22 +63,22 @@ class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         NSLog("[FileProvider] Clear cache requested for \(domainId)")
         guard let manager = NSFileProviderManager(for: domain) else { return }
 
-        // Get all items via a fresh listing and evict each one
+        // Ask the agent for the list of currently-hydrated files directly from
+        // its cache DB. Avoids a listDir / NAS round-trip and scales with
+        // hydrated-set size instead of share size.
         do {
-            let entries = try AgentFileOpsClient.shared.listDir(domain: domainId, relativePath: "")
-            var evictCount = 0
-            for entry in entries where !entry.isDir {
-                let identifier = NSFileProviderItemIdentifier(rawValue: entry.name)
+            let paths = try AgentFileOpsClient.shared.evictAll(domain: domainId)
+            for relPath in paths {
+                let identifier = NSFileProviderItemIdentifier(rawValue: relPath)
                 manager.evictItem(identifier: identifier) { error in
                     if let error = error {
-                        NSLog("[FileProvider] evict error: \(error.localizedDescription)")
+                        NSLog("[FileProvider] evict error for \(relPath): \(error.localizedDescription)")
                     }
                 }
-                evictCount += 1
             }
-            NSLog("[FileProvider] Evicting \(evictCount) files for \(domainId)")
+            NSLog("[FileProvider] Evicting \(paths.count) hydrated files for \(domainId)")
         } catch {
-            NSLog("[FileProvider] Clear cache listing failed: \(error.localizedDescription)")
+            NSLog("[FileProvider] Clear cache evictAll failed: \(error.localizedDescription)")
         }
     }
 

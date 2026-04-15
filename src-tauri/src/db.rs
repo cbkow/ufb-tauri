@@ -1,44 +1,88 @@
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, Result as SqlResult};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
-/// Manages the shared SQLite database connection (WAL mode).
-/// All managers access the DB through this shared connection.
+const POOL_SIZE: u32 = 6;
+
+/// Manages the shared SQLite database via an r2d2 connection pool (WAL mode).
+/// All managers access the DB through `with_conn`, which hands out a pooled
+/// connection for the duration of the closure. Readers don't block each other;
+/// writers still serialize at the SQLite level (WAL one-writer).
 pub struct Database {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl Database {
     /// Open (or create) the UFB database at the given path.
     pub fn open(path: &PathBuf) -> SqlResult<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA busy_timeout=5000;",
-        )?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        // One-time setup on a serial connection: enable WAL (persistent on disk)
+        // + set pragmas the pool's init closure can't set (journal_mode).
+        {
+            let conn = Connection::open(path)?;
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA busy_timeout=5000;",
+            )?;
+        }
+
+        let manager = SqliteConnectionManager::file(path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA synchronous=NORMAL;",
+            )
+        });
+        let pool = Pool::builder()
+            .max_size(POOL_SIZE)
+            .build(manager)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        Ok(Self { pool })
     }
 
     /// Open an in-memory database (for testing).
+    /// Note: in-memory DBs are per-connection, so the pool shares via a named
+    /// shared-cache URI so all pooled connections see the same data.
     #[allow(dead_code)]
     pub fn open_in_memory() -> SqlResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        let manager = SqliteConnectionManager::memory().with_init(|c| {
+            c.execute_batch("PRAGMA foreign_keys=ON;")
+        });
+        let pool = Pool::builder()
+            .max_size(1) // single-conn for in-memory to keep schema shared
+            .build(manager)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok(Self { pool })
     }
 
-    /// Execute a closure with a reference to the locked connection.
+    /// Execute a closure with a reference to a pooled connection.
+    ///
+    /// The connection is returned to the pool automatically when the closure
+    /// returns. Keep the closure body short; long-running work should not hold
+    /// a connection longer than necessary.
     pub fn with_conn<F, T>(&self, f: F) -> SqlResult<T>
     where
         F: FnOnce(&Connection) -> SqlResult<T>,
     {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.pool.get().map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+        })?;
         f(&conn)
+    }
+
+    /// Execute a closure with a MUTABLE reference to a pooled connection.
+    /// Required for `conn.transaction()` which needs `&mut Connection`.
+    #[allow(dead_code)]
+    pub fn with_conn_mut<F, T>(&self, f: F) -> SqlResult<T>
+    where
+        F: FnOnce(&mut Connection) -> SqlResult<T>,
+    {
+        let mut conn = self.pool.get().map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+        })?;
+        f(&mut conn)
     }
 
     /// Safely add a column if it doesn't already exist.
@@ -65,6 +109,8 @@ impl Database {
                     sync_status TEXT NOT NULL DEFAULT 'Pending',
                     shot_count INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE INDEX IF NOT EXISTS idx_subs_active
+                    ON subscriptions(is_active);
 
                 CREATE TABLE IF NOT EXISTS item_metadata (
                     item_path TEXT NOT NULL,
@@ -81,6 +127,8 @@ impl Database {
                     ON item_metadata(job_path);
                 CREATE INDEX IF NOT EXISTS idx_item_metadata_tracked
                     ON item_metadata(is_tracked);
+                CREATE INDEX IF NOT EXISTS idx_item_metadata_job_tracked
+                    ON item_metadata(job_path, is_tracked);
 
                 CREATE TABLE IF NOT EXISTS column_definitions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

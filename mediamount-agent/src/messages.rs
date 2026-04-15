@@ -110,6 +110,10 @@ pub enum FileOpsRequest {
     RecordEnumeration(RecordEnumerationReq),
     GetChanges(GetChangesReq),
     ClearCache(ClearCacheReq),
+    /// List currently-hydrated relative paths for a domain. Cheap DB query
+    /// (no NAS I/O) — used by the extension's clear-cache flow to drive
+    /// `evictItem` calls without going through `ListDir`.
+    EvictAll(EvictAllReq),
     Ping,
 }
 
@@ -179,6 +183,13 @@ pub struct ClearCacheReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EvictAllReq {
+    pub request_id: String,
+    pub domain: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordEnumerationReq {
     pub request_id: String,
     pub domain: String,
@@ -207,8 +218,17 @@ pub enum FileOpsResponse {
     RenameOk(RenameOkResp),
     RecordOk(RecordOkResp),
     Changes(ChangesResp),
+    EvictList(EvictListResp),
     Error(FileOpsErrorResp),
     Pong,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvictListResp {
+    pub request_id: String,
+    /// Relative paths of currently-hydrated files in the domain.
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

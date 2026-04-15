@@ -5,11 +5,12 @@ use crate::db::Database;
 use crate::mesh_sync::MeshSyncManager;
 use crate::metadata::MetadataManager;
 use crate::mount_client::MountClient;
+use crate::settings::AppSettings;
 use crate::subscription::SubscriptionManager;
 use crate::system_icons::SystemIconCache;
 use crate::thumbnails::ThumbnailManager;
 use crate::transcode::TranscodeManager;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use std::sync::Mutex as StdMutex;
 
@@ -29,6 +30,26 @@ pub struct AppState {
     pub device_id: String,
     /// Stores a deep-link URI from cold start so the frontend can fetch it on mount.
     pub pending_deep_link: StdMutex<Option<String>>,
+    /// Cached settings — populated at startup, refreshed on `save_settings`.
+    /// Avoids hitting `settings.json` from disk on every Tauri command.
+    pub settings: Arc<RwLock<AppSettings>>,
+}
+
+impl AppState {
+    /// Refresh the in-memory settings cache from disk. Called on save.
+    pub fn reload_settings(&self) {
+        let fresh = AppSettings::load();
+        *self.settings.write().expect("settings lock poisoned") = fresh;
+    }
+
+    /// Snapshot the current path mappings. Cheap — single RwLock read.
+    pub fn path_mappings(&self) -> Vec<crate::settings::PathMapping> {
+        self.settings
+            .read()
+            .expect("settings lock poisoned")
+            .path_mappings
+            .clone()
+    }
 }
 
 impl AppState {
@@ -81,6 +102,7 @@ impl AppState {
             mount_client,
             device_id,
             pending_deep_link: StdMutex::new(None),
+            settings: Arc::new(RwLock::new(AppSettings::load())),
         })
     }
 

@@ -10,8 +10,9 @@ use chrono::Local;
 use tauri::{Emitter, State};
 
 /// Load path mappings from settings (cached per-call).
-fn load_mappings() -> Vec<crate::settings::PathMapping> {
-    AppSettings::load().path_mappings
+#[inline]
+fn load_mappings(state: &AppState) -> Vec<crate::settings::PathMapping> {
+    state.path_mappings()
 }
 
 // ── Subscriptions ──
@@ -22,7 +23,7 @@ pub async fn subscribe_to_job(
     job_path: String,
     job_name: String,
 ) -> Result<Subscription, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_path = to_canonical_path(&job_path, &mappings);
 
     // On non-Windows, verify the path was actually translated to Windows-canonical format.
@@ -45,7 +46,7 @@ pub async fn subscribe_to_job(
 
 #[tauri::command]
 pub async fn unsubscribe_from_job(state: State<'_, AppState>, job_path: String) -> Result<(), String> {
-    let canonical_path = to_canonical_path(&job_path, &load_mappings());
+    let canonical_path = to_canonical_path(&job_path, &load_mappings(&state));
     state.subscription_manager.unsubscribe_from_job(&canonical_path)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
         let change = serde_json::json!({"action": "sub_remove", "job_path": canonical_path});
@@ -57,7 +58,7 @@ pub async fn unsubscribe_from_job(state: State<'_, AppState>, job_path: String) 
 
 #[tauri::command]
 pub fn get_subscriptions(state: State<AppState>) -> Result<Vec<Subscription>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let mut subs = state.subscription_manager.get_all_subscriptions()?;
     for sub in &mut subs {
         sub.job_path = from_canonical_path(&sub.job_path, &mappings);
@@ -69,7 +70,7 @@ pub fn get_subscriptions(state: State<AppState>) -> Result<Vec<Subscription>, St
 
 #[tauri::command]
 pub fn get_item_metadata(state: State<AppState>, item_path: String) -> Result<Option<String>, String> {
-    let canonical_path = to_canonical_path(&item_path, &load_mappings());
+    let canonical_path = to_canonical_path(&item_path, &load_mappings(&state));
     state.metadata_manager.get_metadata(&canonical_path)
 }
 
@@ -82,7 +83,7 @@ pub async fn upsert_item_metadata(
     metadata_json: String,
     is_tracked: bool,
 ) -> Result<(), String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_job = to_canonical_path(&job_path, &mappings);
     let canonical_item = to_canonical_path(&item_path, &mappings);
     state.metadata_manager.write_immediate(
@@ -106,7 +107,7 @@ pub fn get_tracked_items(
     state: State<AppState>,
     job_path: String,
 ) -> Result<Vec<TrackedItemRecord>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_job = to_canonical_path(&job_path, &mappings);
     let mut items = state.subscription_manager.get_tracked_items(&canonical_job)?;
     for item in &mut items {
@@ -118,7 +119,7 @@ pub fn get_tracked_items(
 
 #[tauri::command]
 pub fn get_all_tracked_items(state: State<AppState>) -> Result<Vec<TrackedItemRecord>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let mut items = state.subscription_manager.get_all_tracked_items()?;
     for item in &mut items {
         item.item_path = from_canonical_path(&item.item_path, &mappings);
@@ -133,7 +134,7 @@ pub fn get_folder_metadata(
     job_path: String,
     folder_name: String,
 ) -> Result<Vec<crate::subscription::ItemMetadataRecord>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_job = to_canonical_path(&job_path, &mappings);
     let mut records = state.subscription_manager.get_folder_item_metadata(&canonical_job, &folder_name)?;
     for record in &mut records {
@@ -150,7 +151,7 @@ pub fn get_column_defs(
     job_path: String,
     folder_name: String,
 ) -> Result<Vec<ColumnDefinition>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_job = to_canonical_path(&job_path, &mappings);
     let mut defs = state.column_config_manager.get_column_defs(&canonical_job, &folder_name)?;
     for def in &mut defs {
@@ -161,7 +162,7 @@ pub fn get_column_defs(
 
 #[tauri::command]
 pub async fn add_column(state: State<'_, AppState>, mut def: ColumnDefinition) -> Result<i64, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     def.job_path = to_canonical_path(&def.job_path, &mappings);
     let result = state.column_config_manager.add_column(&def)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
@@ -175,7 +176,7 @@ pub async fn add_column(state: State<'_, AppState>, mut def: ColumnDefinition) -
 
 #[tauri::command]
 pub async fn update_column(state: State<'_, AppState>, mut def: ColumnDefinition) -> Result<(), String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     def.job_path = to_canonical_path(&def.job_path, &mappings);
     state.column_config_manager.update_column(&def)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
@@ -238,7 +239,7 @@ pub async fn add_preset_column(
     job_path: String,
     folder_name: String,
 ) -> Result<i64, String> {
-    let canonical_job = to_canonical_path(&job_path, &load_mappings());
+    let canonical_job = to_canonical_path(&job_path, &load_mappings(&state));
     let col_id = state.column_config_manager.add_preset_column(preset_id, &canonical_job, &folder_name)?;
     if let Some(ref mesh) = *state.mesh_sync_manager.lock().await {
         let change = serde_json::json!({"action": "preset_add", "preset_id": preset_id, "job_path": canonical_job, "folder_name": folder_name});
@@ -252,7 +253,7 @@ pub async fn add_preset_column(
 
 #[tauri::command]
 pub fn get_bookmarks(state: State<AppState>) -> Result<Vec<Bookmark>, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let mut bookmarks = state.bookmark_manager.get_all_bookmarks()?;
     for bm in &mut bookmarks {
         bm.path = from_canonical_path(&bm.path, &mappings);
@@ -267,7 +268,7 @@ pub fn add_bookmark(
     display_name: String,
     is_project_folder: bool,
 ) -> Result<Bookmark, String> {
-    let mappings = load_mappings();
+    let mappings = load_mappings(&state);
     let canonical_path = to_canonical_path(&path, &mappings);
     let mut result = state.bookmark_manager.add_bookmark(&canonical_path, &display_name, is_project_folder)?;
     result.path = from_canonical_path(&result.path, &mappings);
@@ -278,7 +279,7 @@ pub fn add_bookmark(
 
 #[tauri::command]
 pub fn remove_bookmark(state: State<AppState>, path: String) -> Result<(), String> {
-    let canonical_path = to_canonical_path(&path, &load_mappings());
+    let canonical_path = to_canonical_path(&path, &load_mappings(&state));
     let result = state.bookmark_manager.remove_bookmark(&canonical_path);
     #[cfg(windows)]
     sync_explorer_pins(&state);
@@ -306,13 +307,17 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
 }
 
 #[tauri::command]
-pub fn create_directory(path: String) -> Result<(), String> {
-    crate::file_ops::create_directory(&path)
+pub async fn create_directory(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::file_ops::create_directory(&path))
+        .await
+        .map_err(|e| format!("create_directory task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
-    crate::file_ops::rename_path(&old_path, &new_path)
+pub async fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::file_ops::rename_path(&old_path, &new_path))
+        .await
+        .map_err(|e| format!("rename_path task failed: {}", e))?
 }
 
 /// Generate a unique operation ID for progress tracking.
@@ -740,8 +745,12 @@ pub fn load_settings() -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: AppSettings) -> Result<(), String> {
-    settings.save()
+pub fn save_settings(state: State<AppState>, settings: AppSettings) -> Result<(), String> {
+    settings.save()?;
+    // Refresh in-memory cache so subsequent commands see the new settings
+    // without having to hit disk.
+    state.reload_settings();
+    Ok(())
 }
 
 // ── Mesh Sync ──
@@ -1565,7 +1574,7 @@ pub async fn create_job_from_template(
         .map_err(|e| format!("Failed to copy template: {}", e))?;
 
     // Auto-subscribe (store canonical path in DB)
-    let canonical_path = to_canonical_path(&full_path_str, &load_mappings());
+    let canonical_path = to_canonical_path(&full_path_str, &load_mappings(&state));
     state.subscription_manager.subscribe_to_job(&canonical_path, &folder_name)?;
 
     // Notify mesh sync
