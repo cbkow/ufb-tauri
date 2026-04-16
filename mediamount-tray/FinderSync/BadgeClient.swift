@@ -34,8 +34,10 @@ class BadgeClient {
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+        // Short filename matches unix_server::socket_path — keeps the full
+        // path under macOS's 104-byte `sun_path` limit.
         socketPath =
-            "\(home)/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/mediamount-agent.sock"
+            "\(home)/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/a.sock"
     }
 
     func connect() {

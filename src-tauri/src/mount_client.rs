@@ -617,8 +617,10 @@ fn agent_socket_path() -> std::path::PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME") {
+            // Short filename (`a.sock`) matches unix_server::socket_path —
+            // keeps the full path under macOS's 104-byte sun_path limit.
             return std::path::PathBuf::from(home).join(
-                "Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/mediamount-agent.sock",
+                "Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/a.sock",
             );
         }
     }

@@ -1,32 +1,22 @@
 import SwiftUI
 
 /// Minimal MenuBarExtra app that shows mount status from the mediamount-agent.
-/// Communicates with the Rust agent via Unix domain socket IPC. Manages the
-/// Finder sidebar entries via `SidebarManager`; the FinderSync extension
-/// (separate target) paints hydration badges in Finder.
+/// Communicates with the Rust agent via Unix domain socket IPC. The FinderSync
+/// extension (separate target) paints hydration badges in Finder.
+///
+/// No Finder sidebar integration — `LSSharedFileList`'s write path is broken
+/// on macOS 26+ (kLSSharedFileListItemLast resolves to a bad pointer and
+/// `LSSharedFileListInsertItemURL` segfaults in objc_retain). FileProvider's
+/// auto-registered sidebar entries are the only programmatic path, and we
+/// rejected that framework in Slice 5. Users bookmark mount paths manually
+/// (drag `/Volumes/<share>` into Favorites once).
 @main
 struct MediaMountTrayApp: App {
     @StateObject private var agent = AgentConnection()
-    @StateObject private var sidebarManager = SidebarManager()
     private let agentProcess = AgentProcess()
 
     init() {
         agentProcess.start()
-
-        // One-shot: remove any FileProvider domains left over from a
-        // pre-Slice-5 install so they stop shadowing our NFS mounts in
-        // the Finder sidebar.
-        LegacyDomainCleanup.runOnce()
-
-        // SidebarManager observes agent.$mounts via Combine once attached.
-        // @StateObject isn't available during `init` (it's only valid inside
-        // `body`), so defer attachment to a short async hop after launch —
-        // the StateObject is materialized by then.
-        let agentRef = agent
-        let sidebarRef = sidebarManager
-        DispatchQueue.main.async {
-            sidebarRef.attach(to: agentRef)
-        }
     }
 
     var body: some Scene {

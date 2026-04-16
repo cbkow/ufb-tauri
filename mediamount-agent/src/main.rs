@@ -288,9 +288,28 @@ async fn run_event_loop() {
 
                 for (idx, mount) in sync_mounts.iter().enumerate() {
                     let port = sync::nfs_server::BASE_PORT + idx as u16;
-                    let Some(root) = resolve_mount_root_for_nfs(mount) else {
+                    // Bounded retry: SMB mounts can take 10–30s on cold boot,
+                    // longer on slow networks. Poll every 2s for up to 60s
+                    // before giving up. Beats the prior one-shot that stranded
+                    // the NFS server when resolve_mount_root_for_nfs lost a
+                    // race with mount_smbfs.
+                    let mut root_opt = None;
+                    for attempt in 0..30 {
+                        if let Some(r) = resolve_mount_root_for_nfs(mount) {
+                            root_opt = Some(r);
+                            break;
+                        }
+                        if attempt == 0 {
+                            log::info!(
+                                "[nfs-server] {}: waiting for SMB mount to come up…",
+                                mount.share_name()
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    let Some(root) = root_opt else {
                         log::warn!(
-                            "[nfs-server] {}: no SMB mount path resolved, skipping",
+                            "[nfs-server] {}: SMB mount never resolved after 60s, skipping",
                             mount.share_name()
                         );
                         continue;

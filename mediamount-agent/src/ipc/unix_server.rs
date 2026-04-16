@@ -7,9 +7,16 @@ use tokio::sync::{mpsc, Mutex};
 /// Resolve the socket path for the IPC server.
 ///
 /// On macOS we put it inside the shared app group container so the sandboxed
-/// FileProvider and FinderSync extensions can reach it — sandboxed processes
-/// can't open sockets in `/tmp`. The tray is not sandboxed but uses the same
-/// path for consistency.
+/// FinderSync extension can reach it — sandboxed processes can't open
+/// sockets in `/tmp`. The tray is not sandboxed but uses the same path for
+/// consistency.
+///
+/// **Filename is intentionally short.** `sockaddr_un.sun_path` is 104 bytes
+/// on macOS. The group container path is long enough on its own that a
+/// verbose socket filename (`mediamount-agent.sock`) pushes the total over
+/// the limit and `bind(2)` rejects it with `EINVAL`/`SUN_LEN`. `a.sock`
+/// keeps the full path comfortably under 100 bytes for reasonable home
+/// directory lengths.
 ///
 /// Linux / other platforms keep the XDG_RUNTIME_DIR → /tmp fallback.
 fn socket_path() -> std::path::PathBuf {
@@ -20,7 +27,7 @@ fn socket_path() -> std::path::PathBuf {
                 "Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray",
             );
             let _ = std::fs::create_dir_all(&dir);
-            return dir.join("mediamount-agent.sock");
+            return dir.join("a.sock");
         }
     }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {

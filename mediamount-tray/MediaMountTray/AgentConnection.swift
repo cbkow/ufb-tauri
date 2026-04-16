@@ -19,12 +19,14 @@ class AgentConnection: ObservableObject {
 
     /// Shared socket-path resolution — mirrors `unix_server::socket_path()`
     /// in the Rust agent. Lives inside the app group container on macOS so
-    /// sandboxed extensions (FinderSync) can reach it.
+    /// sandboxed extensions (FinderSync) can reach it. Filename is short
+    /// (`a.sock`) so the full path stays under macOS's 104-byte `sun_path`
+    /// limit for reasonable user home directory lengths.
     static func defaultSocketPath() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let groupDir =
             "\(home)/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray"
-        return "\(groupDir)/mediamount-agent.sock"
+        return "\(groupDir)/a.sock"
     }
 
     func connect() {
