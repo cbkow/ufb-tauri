@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>FileProviderExtension</string>
+    <string>UFB</string>
     <key>CFBundleIdentifier</key>
     <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleVersion</key>
@@ -13,19 +13,14 @@
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundlePackageType</key>
-    <string>XPC!</string>
+    <string>APPL</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
-    <key>NSExtension</key>
-    <dict>
-        <key>NSExtensionFileProviderDocumentGroup</key>
-        <string>5Z4S9VHV56.group.com.unionfiles.mediamount-tray</string>
-        <key>NSExtensionFileProviderSupportsEnumeration</key>
-        <true/>
-        <key>NSExtensionPointIdentifier</key>
-        <string>com.apple.fileprovider-nonui</string>
-        <key>NSExtensionPrincipalClass</key>
-        <string>$(PRODUCT_MODULE_NAME).FileProviderExtension</string>
-    </dict>
 </dict>
 </plist>

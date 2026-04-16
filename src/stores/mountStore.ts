@@ -9,8 +9,13 @@ import {
   mountStop as tauriMountStop,
   mountSaveConfig,
   mountGetConfig,
+  mountGetMode,
   mountLaunchAgent,
   mountCreateSymlinks,
+  mountGetCacheStats,
+  mountDrainShareCache,
+  type MountMode,
+  type CacheStats,
 } from "../lib/tauri";
 
 export interface MountStateUpdate {
@@ -48,12 +53,19 @@ interface MountStoreState {
   states: Record<string, MountStateUpdate>;
   connected: boolean;
   configs: MountConfig[];
+  mode: MountMode;
+  /// Per-mount cache footprint. Populated on demand by `refreshCacheStats`
+  /// and refreshed asynchronously when the agent emits `mount:cache-stats`
+  /// (e.g., after a drain).
+  cacheStats: Record<string, CacheStats>;
 }
 
 const [state, setState] = createStore<MountStoreState>({
   states: {},
   connected: false,
   configs: [],
+  mode: "fileprovider",
+  cacheStats: {},
 });
 
 let listenersSetUp = false;
@@ -78,6 +90,10 @@ function setupListeners(): Promise<void> {
     await listen<boolean>("mount:connection", (e) => {
       console.log("[mountStore] connection:", e.payload);
       setState("connected", e.payload);
+    });
+
+    await listen<CacheStats>("mount:cache-stats", (e) => {
+      setState("cacheStats", e.payload.mountId, e.payload);
     });
 
     listenersSetUp = true;
@@ -116,6 +132,11 @@ async function loadStates() {
     const cfg = await mountGetConfig();
     console.log("[mountStore] configs:", cfg.mounts?.length, cfg.mounts);
     setState("configs", (cfg.mounts ?? []).filter((m) => m.enabled));
+    // Mode tells macOS sync mounts apart: NFS loopback at ~/ufb/vfs/{share}
+    // vs FileProvider at ~/Library/CloudStorage/UFB-{display}.
+    const mode = await mountGetMode();
+    console.log("[mountStore] mode:", mode);
+    setState("mode", mode);
   } catch (e) {
     console.error("Failed to load mount states:", e);
   }
@@ -195,7 +216,13 @@ function getMountPath(cfg: MountConfig): string {
     if (cfg.mountPathMacos) return cfg.mountPathMacos;
     const shareName = getShareName(cfg);
     if (cfg.syncEnabled) {
-      // Sync mounts use FileProvider — path is ~/Library/CloudStorage/UFB-{displayName}
+      // Sync mounts: path depends on which backend the agent is running.
+      // NFS loopback mounts natively at the same ~/ufb/mounts/{shareName}
+      // path as non-sync mounts (unified in v0.4.0+); the legacy FileProvider
+      // extension presents under ~/Library/CloudStorage/UFB-{displayName}.
+      if (state.mode === "nfs") {
+        return `${platformStore.home}/ufb/mounts/${shareName}`;
+      }
       const displayName = (cfg.displayName || shareName).replace(/\s+/g, "");
       return `${platformStore.home}/Library/CloudStorage/UFB-${displayName}`;
     }
@@ -228,6 +255,24 @@ async function createSymlinks() {
   }
 }
 
+/** Fire-and-forget: ask the agent for fresh cache stats. Response lands
+ * on the `mount:cache-stats` event and updates `cacheStats[mountId]`. */
+async function refreshCacheStats(mountId: string) {
+  try {
+    await mountGetCacheStats(mountId);
+  } catch (e) {
+    console.error("Failed to request cache stats:", e);
+  }
+}
+
+async function drainShareCache(mountId: string) {
+  try {
+    await mountDrainShareCache(mountId);
+  } catch (e) {
+    console.error("Failed to drain cache:", e);
+  }
+}
+
 /** Default cache root display — matches agent's default_cache_root(). */
 const defaultCacheRoot = platformStore.platform === "win"
   ? "%LOCALAPPDATA%\\ufb\\sync"
@@ -242,6 +287,12 @@ export const mountStore = {
   },
   get configs() {
     return state.configs;
+  },
+  get mode() {
+    return state.mode;
+  },
+  get cacheStats() {
+    return state.cacheStats;
   },
   get needsElevation() {
     return needsElevation();
@@ -259,4 +310,6 @@ export const mountStore = {
   createSymlinks,
   saveConfig,
   loadConfig,
+  refreshCacheStats,
+  drainShareCache,
 };

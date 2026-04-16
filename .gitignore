@@ -41,8 +41,9 @@ scripts/
 # macOS Quick Actions (local install)
 macos-quickactions/
 
-# Swift tray app build artifacts
-mediamount-tray/MediaMountTray
+# Swift tray app build artifacts (the source directory
+# mediamount-tray/MediaMountTray/ is tracked — only these
+# generated/output paths are ignored).
 mediamount-tray/MediaMountTray.bin
 mediamount-tray/MediaMountTray.app/
 mediamount-tray/MediaMountTray.xcodeproj/

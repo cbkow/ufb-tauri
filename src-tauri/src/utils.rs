@@ -98,6 +98,40 @@ pub fn parse_path_uri(uri: &str) -> Option<ParsedUri> {
     })
 }
 
+/// Expand a leading `~` or `~/` against the current machine's $HOME. Returns
+/// the input unchanged if it doesn't start with `~`. Only meaningful when the
+/// path is intended for the current OS — we never expand against some other
+/// machine's home. Callers gate by comparing the mapping's OS to
+/// `current_os_tag()`.
+fn expand_home(path: &str) -> String {
+    let rest = if let Some(r) = path.strip_prefix("~/") {
+        r
+    } else if path == "~" {
+        ""
+    } else {
+        return path.to_string();
+    };
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string();
+    };
+    let home_str = home.to_string_lossy();
+    if rest.is_empty() {
+        home_str.into_owned()
+    } else {
+        format!("{}/{}", home_str.trim_end_matches('/'), rest)
+    }
+}
+
+/// Expand `~` in a mapping prefix iff the mapping's OS is also the current
+/// machine's OS — otherwise we'd be expanding against the wrong home dir.
+fn expand_mapping_prefix(prefix: &str, os: &str) -> String {
+    if os == current_os_tag() {
+        expand_home(prefix)
+    } else {
+        prefix.to_string()
+    }
+}
+
 /// Translate a path from source_os format to target_os format using mapping rules.
 pub fn translate_path_to(
     source_os: &str,
@@ -113,22 +147,28 @@ pub fn translate_path_to(
     // Try each mapping rule (skip disabled mappings)
     for mapping in mappings {
         if !mapping.enabled { continue; }
-        let source_prefix = match source_os {
+        let source_prefix_raw = match source_os {
             "win" => &mapping.win,
             "mac" => &mapping.mac,
             "lin" => &mapping.lin,
             _ => continue,
         };
-        let target_prefix = match target_os {
+        let target_prefix_raw = match target_os {
             "win" => &mapping.win,
             "mac" => &mapping.mac,
             "lin" => &mapping.lin,
             _ => continue,
         };
 
-        if source_prefix.is_empty() || target_prefix.is_empty() {
+        if source_prefix_raw.is_empty() || target_prefix_raw.is_empty() {
             continue;
         }
+
+        // Expand ~/ in prefixes when they refer to the current machine. This
+        // lets a stored mapping of `~/ufb/mounts/X` work on any Mac regardless
+        // of the user's login name.
+        let source_prefix = expand_mapping_prefix(source_prefix_raw, source_os);
+        let target_prefix = expand_mapping_prefix(target_prefix_raw, target_os);
 
         // Normalize for comparison (forward slashes, case-insensitive on Windows)
         let norm_path = path.replace('\\', "/");
@@ -189,5 +229,61 @@ fn to_native_path(path: &str, os: &str) -> String {
         path.replace('/', "\\")
     } else {
         path.replace('\\', "/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::PathMapping;
+
+    fn mapping(win: &str, mac: &str, lin: &str) -> PathMapping {
+        PathMapping {
+            win: win.to_string(),
+            mac: mac.to_string(),
+            lin: lin.to_string(),
+            enabled: true,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn expand_home_basic() {
+        // Can't assert exact expansion (depends on $HOME on test machine) but
+        // we can assert the transformation shape.
+        let out = expand_home("~/ufb/mounts/X");
+        assert!(!out.starts_with('~'), "~/... should be expanded: {}", out);
+        assert!(out.ends_with("/ufb/mounts/X"), "suffix preserved: {}", out);
+        assert_eq!(expand_home("/abs/path"), "/abs/path");
+        assert_eq!(expand_home("relative"), "relative");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_tilde_mac_to_win() {
+        let maps = [mapping("R:\\Jobs_Live", "~/ufb/mounts/Jobs_Live", "/mnt/jobs")];
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        // Input is an expanded absolute path (what the filesystem gives us).
+        let input = format!("{}/ufb/mounts/Jobs_Live/Flame/reel.mov", home);
+        let out = translate_path_to("mac", "win", &input, &maps);
+        assert_eq!(out, "R:\\Jobs_Live\\Flame\\reel.mov");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_win_to_tilde_mac() {
+        let maps = [mapping("R:\\Jobs_Live", "~/ufb/mounts/Jobs_Live", "/mnt/jobs")];
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        let out = translate_path_to("win", "mac", "R:\\Jobs_Live\\Flame\\reel.mov", &maps);
+        assert_eq!(out, format!("{}/ufb/mounts/Jobs_Live/Flame/reel.mov", home));
+    }
+
+    #[test]
+    fn translate_no_mapping_preserves_path() {
+        let maps: [PathMapping; 0] = [];
+        assert_eq!(
+            translate_path_to("mac", "win", "/Volumes/X/file", &maps),
+            "\\Volumes\\X\\file"
+        );
     }
 }

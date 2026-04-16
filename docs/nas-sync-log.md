@@ -3322,3 +3322,278 @@ Phase 3 slice 1 (this commit):
   after each `cargo build` + re-run. Override `id_to_fh` / `fh_to_id` in
   our impl to use a persistent generation (fixed or omitted). Prerequisite
   to real-user dogfood. Tracked in task #38.
+
+## 2026-04-16 — Slice 1 + 2: unified mount path + `~`-aware mappings
+
+Landed as a single commit (Slice 1 + Slice 2 of the NFS cutover plan in
+`.claude/plans/abundant-churning-wadler.md`).
+
+**What changed.**
+
+- `nfs_server::mount_point_for` moved from `~/ufb/vfs/<share>` to
+  `~/ufb/mounts/<share>` — same user-facing path whether a mount is in
+  sync mode (real NFS mount point) or non-sync mode (symlink to
+  `/Volumes/<share>`). Toggling sync no longer invalidates Finder
+  bookmarks.
+- New `prepare_nfs_mount_point()` helper unlinks any stale plain-SMB
+  symlink at the target path before `create_dir_all`. Covers bootstrap
+  from installs that were running the old non-sync orchestration.
+- `mount_service::apply_config` orphan sweep now classifies entries at
+  `~/ufb/mounts/` — symlinks are removed as before; directories (which
+  may be live NFS mount points from a since-disabled mount) are
+  `umount`'d via `nfs_server::is_mounted` check, then `rmdir`'d. Previous
+  blind `remove_file` silently skipped directories, leaving stale mounts
+  lingering.
+- `src-tauri/src/utils.rs::translate_path_to` gained `~`-expansion in
+  mapping prefixes (via `expand_home`) so a stored mapping of
+  `~/ufb/mounts/Jobs_Live` works on any Mac regardless of login name.
+  Expansion only fires when the mapping's OS matches the current
+  machine's OS — we never expand against some other machine's `$HOME`.
+- `AppSettings::load` runs a one-shot migration that collapses
+  `/Users/<me>/...` in the `mac` field (and `/home/<me>/...` in `lin`)
+  to `~/...` so the stored settings file becomes portable. Idempotent.
+- Frontend `mountStore.getMountPath` macOS sync branch now returns
+  `~/ufb/mounts/<share>` under NFS mode (same path as non-sync); the
+  `~/Library/CloudStorage/UFB-*` branch survives until Slice 5 rips
+  FileProvider.
+- Settings-dialog FileProvider tooltip rewords under NFS mode.
+
+**Why.** User caught that "/Users/<name>" embedded in stored mappings
+would break on a Mac with a different username — real issue for
+cross-machine workflows. And the split paths (`ufb/vfs` vs `ufb/mounts`)
+disagreed with the plan doc and with what non-sync mounts had always
+used. Unifying them closes the last seam before we can commit to
+NFS-only on macOS.
+
+**Verification.** `cargo test --lib utils::tests` — 4 tests pass
+(expand_home_basic, translate_tilde_mac_to_win, translate_win_to_tilde_mac,
+translate_no_mapping_preserves_path). Agent + src-tauri `cargo check`
+clean. Frontend `npx tsc --noEmit` — no new errors.
+
+**Remaining on the cutover plan:** Slice 3 (NFS cache evictor), Slice 4
+(UI drain + stats), Slice 5 (FileProvider removal). Tracked in tasks
+#45, #46, #47.
+
+## 2026-04-16 — Slice 3: NFS-native cache evictor
+
+FileProvider's eviction dance was: agent flips `is_hydrated=0` + queues
+the path in `pending_evictions`, Swift extension drains the queue via
+`getChanges` and calls `FileProvider.evictItem()` which actually
+deletes the bytes. Under NFS loopback there's no extension to drain
+the queue, so we need the agent to own the teardown.
+
+**Added.**
+
+- `MacosCache::evict_over_budget_now()` — async, LRU, inline. Selects
+  `fh, path, hydrated_size` from `known_files` ordered by
+  `last_accessed`. For each candidate: acquires the per-fh
+  `tokio::sync::RwLock` write guard via non-blocking `try_write()`
+  (skips any fh with an in-flight read rather than blocking eviction);
+  `fs::remove_file` on the cache file at
+  `~/.local/share/ufb/cache/by_handle/{fh:016x}`; UPDATE
+  `is_hydrated=0, hydrated_size=0, chunk_bitmap=NULL WHERE fh=?`.
+  Stops when remaining ≤ `cache_limit * 0.8`. Returns (files_evicted,
+  bytes_freed).
+- `MacosCache::fh_lock(fh)` — lazily-created per-file-handle
+  `Arc<RwLock<()>>` kept in a `HashMap` behind a std Mutex. Removed
+  from the map after successful eviction to bound memory.
+- `PassthroughFs::read()` (NFS `read` op) — takes a read guard on the
+  fh lock for the duration of cache file I/O. Read guards never block
+  each other; they only block the evictor's try_write.
+- `nfs_server::start()` — spawns one eviction tick task per MacosCache
+  when `cache_limit > 0`, 30s cadence. First tick is skipped so
+  mount-up doesn't race. Task lives for the lifetime of the NFS
+  server.
+
+**Not added (scope cut).** The plan sketched a new `dirty` column for
+"unflushed writes" — dropped. Our write path is synchronous SMB
+write-through (see `PassthroughFs::write`) + immediate
+`invalidate_cache`, so there's never an unflushed window. If we ever
+go to a write-back model, add the column then.
+
+**Not done yet.** The old `evict_if_over_budget` + `pending_evictions`
+path is still there — it's consumed by fileops IPC (FileProvider
+extension). Stays until Slice 5 retires the extension.
+
+**Verification.** Agent `cargo check` clean. End-to-end validation
+waits on dogfood: fill a share past `cache_limit_bytes`, observe 30s
+ticks then `ls ~/.local/share/ufb/cache/by_handle/` shrinks. Tracked
+in task #45.
+
+## 2026-04-16 — Slice 4: UI drain + cache stats
+
+Replaces the FileProvider-notification "Clear Cache" button with a
+proper drain/stats UX that works under both FileProvider (legacy) and
+NFS (current). Under NFS the agent's `MacosCache` owns the teardown;
+under FileProvider it still runs the old orchestrator event path.
+
+**Added (agent).**
+
+- New `UfbToAgent::GetCacheStats(MountIdMsg)` → `AgentToUfb::CacheStats
+  { mount_id, hydrated_bytes, hydrated_count, command_id }`.
+- `MacosCache::drain_all()` — NFS-native bulk drain. Like
+  `evict_over_budget_now` but ignores LRU + budget; tries to delete
+  every hydrated file. Uses `try_write` on per-fh locks so an active
+  read skips cleanly (revisited on next drain or eviction tick).
+- `MacosCache::cache_stats()` — single indexed query returns
+  `(hydrated_bytes, hydrated_count)`. Cheap enough to call on every
+  dialog open.
+- `MountService` gained `shared_caches` access via new
+  `set_shared_caches` setter. `ClearSyncCache` handling grew a
+  macOS-first branch: if the shared cache map has the mount's domain,
+  call `drain_all`, ack, and emit fresh stats. Otherwise fall through
+  to the orchestrator event path (Windows; macOS-FP).
+- `GetCacheStats` handler replies with the cache's current footprint,
+  or zeros when no cache exists for the mount (Windows, non-sync).
+
+**Added (src-tauri).**
+
+- Tauri command `mount_clear_sync_cache` → renamed
+  `mount_drain_share_cache`. Plain rename at the command boundary;
+  underlying agent message name (`UfbToAgent::ClearSyncCache`) stayed
+  stable so Windows path is unaffected.
+- New Tauri command `mount_get_cache_stats` — fire-and-forget, agent
+  replies async.
+- `mount_client.rs`: `AgentToUfb::CacheStats` added. Incoming stats
+  emit on `mount:cache-stats` Tauri event, consumed by frontend.
+
+**Added (frontend).**
+
+- `mountStore.cacheStats: Record<mountId, CacheStats>`, populated by
+  `mount:cache-stats` listener. `refreshCacheStats(id)` and
+  `drainShareCache(id)` expose the two user actions.
+- `SettingsDialog` sync section:
+  - `createEffect` calls `refreshCacheStats` whenever the editor opens
+    or switches to a sync-enabled mount.
+  - "Cache: X MB across N files" line appears above the cache limit
+    control.
+  - "Clear Cache" button renamed to "Drain Cache" and now opens a
+    confirmation modal. On confirm: `drainShareCache` + a follow-up
+    `refreshCacheStats`. Modal wording reminds the user the drain is
+    non-destructive and active reads are skipped.
+
+**Not changed.**
+
+- Windows Cloud Files drain still routes through the orchestrator's
+  existing `MountEvent::ClearSyncCache` handler.
+- macOS FileProvider code path still posts the Darwin notification;
+  that goes away in Slice 5.
+- No mesh-sync touches.
+
+**Verification.** Agent + src-tauri `cargo check` green. Frontend
+`tsc --noEmit` — no new errors (the 7 reported are pre-existing
+unused-import warnings). End-to-end validation waits on dogfood:
+open a sync mount's settings, observe the stats line populates within
+~200ms, click Drain, confirm, observe stats drop to `0 B across 0
+files` and `~/.local/share/ufb/cache/by_handle/` is empty for that
+domain's rows. Tracked in task #46.
+
+## 2026-04-16 — Slice 4.5: Finder sidebar + FinderSync badges
+
+Restores the first-class Finder presence we lost when we stopped
+registering `NSFileProviderDomain` objects under NFS mode. Three
+sub-parts, landed together.
+
+**4.5a — LSSharedFileList sidebar reconciler.**
+
+- New `mediamount-tray/MediaMountTray/SidebarManager.swift` places
+  `~/ufb/mounts/<shareName>` entries in the user's Favorites list.
+  Observes `AgentConnection.$mounts` via Combine; reconciles on
+  change (add / remove / rename).
+- Owned-entry check: only touches URLs whose path starts with
+  `~/ufb/mounts/`. User-added Favorites are never disturbed.
+- Gated on `UFB_ENABLE_NFS=1` so we don't produce duplicates when
+  the FileProvider domain sidebar entries are still active.
+- Icon: nil (default macOS folder icon at 16pt). Passing a custom
+  icon requires `IconRef` (legacy C API) and NSImage→IconRef
+  conversion is gnarly. Revisit if users ask.
+
+**4.5b — FinderSync extension with hydration badges.**
+
+- New Xcode target `FinderSync` / bundle id
+  `com.unionfiles.mediamount-tray.FinderSync` / **module name
+  `UFBFinderSync`**. The module rename is mandatory — target name
+  `FinderSync` was shadowing the Apple framework and breaking
+  `import FinderSync`.
+- `FinderSyncController.swift` subclasses `FIFinderSync`, monitors
+  `~/ufb/mounts/` (one URL, covers all shares via cascade — avoids
+  the ~20 monitored-URL soft limit).
+  - Registers 2 badge identifiers (`ufb.hydrated` green check,
+    `ufb.partial` half-circle) rendered from SF Symbols via
+    `NSImage(systemSymbolName:)` at build time. No asset catalog.
+  - Toolbar button "UFB" opens the main app.
+  - Context menu: "Open in UFB" (always), "Drain Cache for this
+    Share" (only on share-root items — detected by path-component
+    depth check against `mountsRoot`).
+- `BadgeClient.swift` subscribes to the agent's Unix socket (same
+  length-prefixed JSON protocol as tray's AgentConnection). On each
+  incoming `badge_update`, resolves `(domain, relpath)` → `file://`
+  URL and calls `FIFinderSyncController.default().setBadgeIdentifier`
+  directly. No local badge cache.
+
+**Socket path migration (required for 4.5b to work).**
+
+- `/tmp/ufb-mediamount-agent.sock` → `~/Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/mediamount-agent.sock`.
+  The old path was world-readable `/tmp`, unreachable from
+  sandboxed extensions.
+- Touched: `mediamount-agent/src/ipc/unix_server.rs`,
+  `src-tauri/src/mount_client.rs`,
+  `mediamount-tray/MediaMountTray/AgentConnection.swift`. Linux
+  keeps the XDG_RUNTIME_DIR / /tmp fallback.
+- Agent IPC was already multi-client (`unix_server.rs:24`
+  broadcasts to every connected stream), so both the tray and
+  FinderSync subscribe independently without server changes.
+
+**New agent IPC: `BadgeUpdate`.**
+
+- `messages.rs::AgentToUfb::BadgeUpdate { domain, relpath, badge }`
+  with `BadgeKind = { Hydrated, Partial, Uncached }`.
+- `MacosCache` gained `domain: String` field + `badge_tx:
+  Mutex<Option<Sender>>` + `set_badge_tx()` setter. `emit_badge`
+  helper fires `try_send` (non-blocking — drops if the channel is
+  full). Hooked into `record_hydration`, `mark_fully_hydrated`,
+  `invalidate_cache`, `evict_over_budget_now`, `drain_all`.
+- Scope cut: plan had 5 badge kinds including `Dirty` and
+  `Syncing`. Dropped both. Dirty has no emit site under our
+  write-through model (no unflushed bytes); Syncing would flood
+  during chunk fetches and serves no clear UX purpose.
+- `Partial` is currently unused at emit sites — the chunk-level
+  read path doesn't emit to avoid flood. Enum spot held open for
+  a future throttled emitter.
+
+**4.5c — DomainManager neuter + one-shot cleanup.**
+
+- `DomainManager` early-exits `registerDomains()` when
+  `UFB_ENABLE_NFS=1`, and runs `cleanupLegacyDomainsOnce` once per
+  install (UserDefaults-flagged) to remove any previously-
+  registered UFB domains. Bridge code — the whole file goes away
+  in Slice 5.
+
+**Backend shim: accept share name as mount id.**
+
+- `mount_service::try_drain_nfs_cache` (macOS) now accepts either
+  the config mount id (src-tauri sends this) or the share name
+  (FinderSync sends this, since sandboxed extensions don't know
+  mount config). Mount-id lookup is tried first, fallback string
+  is used as share name directly.
+
+**Signing + packaging.**
+
+- `scripts/build-macos.sh` — ad-hoc signs `FinderSync.appex`
+  alongside `FileProviderExtension.appex`.
+- `scripts/sign-and-notarize.sh` — prod-signs the FinderSync
+  extension with its own entitlements (app sandbox + group only,
+  no network or user-selected file access).
+
+**Not addressed (flagged for Slice 5 dogfood).**
+
+- Badge cold-start gap: extension launches with empty state;
+  badges only appear for post-launch hydration events. Fine for
+  v1; add `GetAllBadges` IPC if dogfood shows this is a problem.
+- Still need real-world validation that
+  `NSFileProviderManager.removeDomain` from 4.5c actually removes
+  sidebar entries on upgrade. Tracked in task #48 verification.
+
+**Verification.** xcodebuild clean (agent `cargo check`, src-tauri
+`cargo check`, xcodebuild Release all green). Both extensions
+embed in `UFB.app/Contents/PlugIns/`. Tracked in task #48.

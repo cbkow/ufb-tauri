@@ -1049,14 +1049,38 @@ pub async fn get_thumbnail(
 
 // ── Sync Cache ──
 
+/// Drain all hydrated cache bytes for a share. On macOS under NFS this
+/// hits the agent's in-process evictor (deletes the cache files + flips
+/// DB rows to uncached). On Windows it invokes the Cloud Files clear-
+/// cache path. Agent replies with a fresh `CacheStatsMsg` after the drain
+/// so the UI can refresh without a second round-trip.
 #[tauri::command]
-pub async fn mount_clear_sync_cache(
+pub async fn mount_drain_share_cache(
     state: State<'_, AppState>,
     mount_id: String,
 ) -> Result<(), String> {
     state
         .mount_client
         .send_command(crate::mount_client::UfbToAgent::ClearSyncCache(
+            crate::mount_client::MountIdMsg {
+                mount_id,
+                command_id: String::new(),
+            },
+        ))
+        .await
+}
+
+/// Ask the agent for the current cache footprint of a share. Response
+/// arrives asynchronously as a `mount:cache-stats` event emitted by
+/// `mount_client` when the agent's `CacheStatsMsg` comes back.
+#[tauri::command]
+pub async fn mount_get_cache_stats(
+    state: State<'_, AppState>,
+    mount_id: String,
+) -> Result<(), String> {
+    state
+        .mount_client
+        .send_command(crate::mount_client::UfbToAgent::GetCacheStats(
             crate::mount_client::MountIdMsg {
                 mount_id,
                 command_id: String::new(),
@@ -1796,6 +1820,21 @@ pub async fn mount_save_config(
 #[tauri::command]
 pub fn mount_get_config() -> Result<crate::mount_client::MountsConfig, String> {
     Ok(crate::mount_client::load_mount_config())
+}
+
+/// Which user-facing file-serving surface the agent is running.
+/// - `"nfs"` — macOS NFS loopback (mount at ~/ufb/vfs/{share})
+/// - `"fileprovider"` — macOS FileProvider (mount at ~/Library/CloudStorage/UFB-{display})
+/// Non-macOS always returns `"fileprovider"` (the name is a no-op on those platforms).
+#[tauri::command]
+pub fn mount_get_mode() -> Result<String, String> {
+    if cfg!(target_os = "macos")
+        && std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1")
+    {
+        Ok("nfs".to_string())
+    } else {
+        Ok("fileprovider".to_string())
+    }
 }
 
 #[tauri::command]

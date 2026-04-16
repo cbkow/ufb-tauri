@@ -119,8 +119,10 @@ NAS round-trip on the request path.
   `visited_folders`, diffs, updates `known_files`, bumps `generation`
   on changes.
 - Mount opts: `vers=3,tcp,nolocks,actimeo=1,nobrowse`.
-- Symlink at `~/ufb/mounts/<share>` points to NFS mount path
-  (muscle memory preserved).
+- NFS mount point lives at `~/ufb/mounts/<share>` — the same user-facing
+  path as non-sync plain-SMB mounts. Toggling sync on a mount only swaps
+  the backing at that path (symlink ↔ NFS mount point); bookmarks stay
+  valid. A stale symlink at that path is unlinked before NFS mount.
 
 **Exit criteria:** warm nav < 5 ms. Cold first-visit populates cache.
 All `list_dir` SMB calls happen off the request path.

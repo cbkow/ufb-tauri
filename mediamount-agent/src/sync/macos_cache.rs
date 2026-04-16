@@ -9,7 +9,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const EVICTION_TARGET_PERCENT: f64 = 0.8;
 const POOL_SIZE: u32 = 6;
@@ -99,8 +99,23 @@ pub struct MacosCache {
     pool: SqlitePool,
     nas_root: PathBuf,
     cache_limit: u64,
+    /// Domain/share name this cache belongs to — used when emitting
+    /// BadgeUpdate messages so the FinderSync extension can scope badges
+    /// to a specific share.
+    domain: String,
     /// Paths pending eviction — consumed by getChanges response.
+    /// FileProvider-era queue; `evict_over_budget_now` is the NFS-native
+    /// replacement. Kept populated until Slice 5 retires the extension.
     pending_evictions: Mutex<Vec<String>>,
+    /// Per-file-handle read/write lock registry. Readers (NFS `read()`) take a
+    /// read guard for the duration of the call; the eviction worker takes a
+    /// non-blocking write guard, skipping any fh whose read is in flight.
+    /// Sparse — entries are created lazily on first access.
+    per_fh_locks: Mutex<HashMap<u64, Arc<tokio::sync::RwLock<()>>>>,
+    /// Optional agent→UFB channel used to broadcast BadgeUpdate messages
+    /// on hydration state changes. Set via `set_badge_tx` after
+    /// construction (during agent wiring). None on Windows / tests.
+    badge_tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::messages::AgentToUfb>>>,
 }
 
 impl MacosCache {
@@ -333,8 +348,56 @@ impl MacosCache {
             pool,
             nas_root,
             cache_limit,
+            domain: domain.to_string(),
             pending_evictions: Mutex::new(Vec::new()),
+            per_fh_locks: Mutex::new(HashMap::new()),
+            badge_tx: Mutex::new(None),
         })
+    }
+
+    /// Wire a broadcast channel for BadgeUpdate messages. Called once
+    /// during agent startup after MacosCache::open. Before this setter
+    /// runs or when `None`, badge emissions are silently dropped.
+    pub fn set_badge_tx(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::messages::AgentToUfb>,
+    ) {
+        *self.badge_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Send a BadgeUpdate to any connected subscribers. Non-blocking:
+    /// the channel has a bounded queue; if the consumer is slow the
+    /// update is silently dropped (FinderSync re-derives state from the
+    /// next update or a full-state refresh).
+    fn emit_badge(&self, relpath: &str, badge: crate::messages::BadgeKind) {
+        let Some(tx) = self.badge_tx.lock().unwrap().clone() else {
+            return;
+        };
+        let msg = crate::messages::AgentToUfb::BadgeUpdate(crate::messages::BadgeUpdateMsg {
+            domain: self.domain.clone(),
+            relpath: relpath.to_string(),
+            badge,
+        });
+        // try_send drops rather than blocking; acceptable for a coalescing
+        // UI cue. Using spawn to avoid awaiting inside sync callers would
+        // require a runtime handle — simpler to fire-and-forget.
+        let _ = tx.try_send(msg);
+    }
+
+    /// Get-or-create the per-fh RwLock used to serialize readers/evictor on a
+    /// single cache file. Call before touching `cache_file_path(fh)` from a
+    /// request path; hold the read guard for the duration of the I/O.
+    pub fn fh_lock(&self, fh: u64) -> Arc<tokio::sync::RwLock<()>> {
+        let mut guard = self.per_fh_locks.lock().unwrap();
+        guard
+            .entry(fh)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// Cache limit in bytes (0 = unlimited).
+    pub fn cache_limit(&self) -> u64 {
+        self.cache_limit
     }
 
     /// Get a pooled connection. Short-lived; returned to pool on drop.
@@ -763,6 +826,7 @@ impl MacosCache {
                 .map(|mut stmt| stmt.execute(params![size as i64, now, relative_path]));
         }
 
+        self.emit_badge(relative_path, crate::messages::BadgeKind::Hydrated);
         self.evict_if_over_budget();
     }
 
@@ -914,6 +978,107 @@ impl MacosCache {
             );
             self.pending_evictions.lock().unwrap().extend(evict_paths);
         }
+    }
+
+    /// NFS-native eviction: if hydrated bytes exceed `cache_limit`, delete
+    /// oldest-accessed cache files until back under `cache_limit * 0.9`.
+    /// Unlike `evict_if_over_budget` (which queues for FileProvider), this
+    /// method performs the actual `fs::remove_file` + row update inline.
+    ///
+    /// Uses `try_write` on the per-fh RwLock so in-flight NFS reads are never
+    /// blocked; contending files are skipped this tick and revisited next
+    /// time. Returns `(files_evicted, bytes_freed)`.
+    pub async fn evict_over_budget_now(&self) -> (usize, u64) {
+        if self.cache_limit == 0 {
+            return (0, 0);
+        }
+        let total = self.total_cached_bytes();
+        if total <= self.cache_limit {
+            return (0, 0);
+        }
+        let target = (self.cache_limit as f64 * EVICTION_TARGET_PERCENT) as u64;
+
+        // Collect candidates in LRU order. We include `fh` so we can scope
+        // the per-fh lock and name the cache file without another lookup,
+        // and `path` so we can emit a BadgeUpdate after eviction.
+        let candidates: Vec<(u64, String, u64)> = {
+            let conn = self.conn();
+            let mut stmt = match conn.prepare(
+                "SELECT fh, path, hydrated_size FROM known_files
+                 WHERE is_hydrated=1 AND is_dir=0
+                 ORDER BY last_accessed ASC",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("[macos-cache] eviction prepare failed: {}", e);
+                    return (0, 0);
+                }
+            };
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        };
+
+        let mut remaining = total;
+        let mut files_evicted = 0usize;
+
+        for (fh, path, size) in candidates {
+            if remaining <= target {
+                break;
+            }
+            // Non-blocking try: if a read is in flight, skip and revisit later.
+            let lock = self.fh_lock(fh);
+            let Ok(_write_guard) = lock.try_write() else {
+                continue;
+            };
+
+            // Remove the bytes first (best effort; a missing file is fine —
+            // the DB is the source of truth we're fixing).
+            let cache_path = self.cache_file_path(fh);
+            let _ = std::fs::remove_file(&cache_path);
+
+            // Then flip the row. If this fails the file is gone from disk
+            // but the DB still says hydrated — evict_over_budget_now on the
+            // next tick will re-try.
+            {
+                let conn = self.conn();
+                let _ = conn
+                    .prepare_cached(
+                        "UPDATE known_files
+                         SET is_hydrated=0, hydrated_size=0, chunk_bitmap=NULL
+                         WHERE fh=?1",
+                    )
+                    .map(|mut stmt| stmt.execute(params![fh as i64]));
+            }
+
+            self.emit_badge(&path, crate::messages::BadgeKind::Uncached);
+
+            remaining = remaining.saturating_sub(size);
+            files_evicted += 1;
+
+            // Drop the map entry so we don't accumulate dead Arcs. Next
+            // access will re-create lazily.
+            self.per_fh_locks.lock().unwrap().remove(&fh);
+        }
+
+        let bytes_freed = total - remaining;
+        if files_evicted > 0 {
+            log::info!(
+                "[macos-cache] NFS eviction: {} files ({:.1} MB) — cache {:.1}/{:.1} MB",
+                files_evicted,
+                bytes_freed as f64 / 1_048_576.0,
+                remaining as f64 / 1_048_576.0,
+                self.cache_limit as f64 / 1_048_576.0,
+            );
+        }
+        (files_evicted, bytes_freed)
     }
 
     // ── Content cache (Phase 2) ──
@@ -1098,6 +1263,7 @@ impl MacosCache {
         }
         let cache_path = self.cache_file_path(fh);
         let _ = std::fs::remove_file(&cache_path);
+        self.emit_badge(path, crate::messages::BadgeKind::Uncached);
     }
 
     /// Mark a file as fully hydrated (all chunks cached). Nulls the bitmap
@@ -1107,17 +1273,20 @@ impl MacosCache {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let conn = self.conn();
-        let _ = conn
-            .prepare_cached(
-                "UPDATE known_files
-                 SET is_hydrated = 1,
-                     hydrated_size = ?1,
-                     chunk_bitmap = NULL,
-                     last_accessed = ?2
-                 WHERE path = ?3",
-            )
-            .map(|mut stmt| stmt.execute(params![size as i64, now, path]));
+        {
+            let conn = self.conn();
+            let _ = conn
+                .prepare_cached(
+                    "UPDATE known_files
+                     SET is_hydrated = 1,
+                         hydrated_size = ?1,
+                         chunk_bitmap = NULL,
+                         last_accessed = ?2
+                     WHERE path = ?3",
+                )
+                .map(|mut stmt| stmt.execute(params![size as i64, now, path]));
+        }
+        self.emit_badge(path, crate::messages::BadgeKind::Hydrated);
     }
 
     /// Cache-file path for a given NFS handle. Directory is created on first
@@ -1305,6 +1474,90 @@ impl MacosCache {
     /// Drain pending eviction candidates (consumed by getChanges response).
     pub fn drain_pending_evictions(&self) -> Vec<String> {
         std::mem::take(&mut *self.pending_evictions.lock().unwrap())
+    }
+
+    /// NFS-native "drain all": delete every hydrated cache file for this
+    /// share, flip their DB rows to uncached, and return (count, bytes).
+    /// Uses non-blocking `try_write` on each fh — files with active readers
+    /// are skipped (user retries; rare). Intended to back the UI "Drain
+    /// Cache" button under NFS mode.
+    pub async fn drain_all(&self) -> (u64, u64) {
+        let candidates: Vec<(u64, String, u64)> = {
+            let conn = self.conn();
+            let mut stmt = match conn.prepare(
+                "SELECT fh, path, hydrated_size FROM known_files
+                 WHERE is_hydrated=1 AND is_dir=0",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("[macos-cache] drain_all prepare failed: {}", e);
+                    return (0, 0);
+                }
+            };
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        };
+
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        for (fh, path, size) in candidates {
+            let lock = self.fh_lock(fh);
+            let Ok(_wg) = lock.try_write() else {
+                continue;
+            };
+            let cache_path = self.cache_file_path(fh);
+            let _ = std::fs::remove_file(&cache_path);
+            {
+                let conn = self.conn();
+                let _ = conn
+                    .prepare_cached(
+                        "UPDATE known_files
+                         SET is_hydrated=0, hydrated_size=0, chunk_bitmap=NULL
+                         WHERE fh=?1",
+                    )
+                    .map(|mut stmt| stmt.execute(params![fh as i64]));
+            }
+            self.emit_badge(&path, crate::messages::BadgeKind::Uncached);
+            self.per_fh_locks.lock().unwrap().remove(&fh);
+            count += 1;
+            bytes += size;
+        }
+
+        if count > 0 {
+            log::info!(
+                "[macos-cache] drain_all: {} files, {:.1} MB",
+                count,
+                bytes as f64 / 1_048_576.0,
+            );
+        }
+        (count, bytes)
+    }
+
+    /// Cheap single-query stats for the UI: (hydrated_bytes, hydrated_count).
+    pub fn cache_stats(&self) -> (u64, u64) {
+        let conn = self.conn();
+        let row: Option<(i64, i64)> = conn
+            .prepare_cached(
+                "SELECT
+                    COALESCE(SUM(hydrated_size), 0),
+                    COUNT(*)
+                 FROM known_files
+                 WHERE is_hydrated=1 AND is_dir=0",
+            )
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                    .ok()
+            });
+        row.map(|(b, c)| (b as u64, c as u64)).unwrap_or((0, 0))
     }
 
     /// If this path is currently materialized (hydrated), queue it for eviction.

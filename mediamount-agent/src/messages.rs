@@ -10,6 +10,48 @@ pub enum AgentToUfb {
     Error(ErrorMsg),
     Pong,
     ConflictDetected(ConflictDetectedMsg),
+    /// Response to `UfbToAgent::GetCacheStats`. Zero values are emitted
+    /// for mounts that have no cache (plain SMB on macOS, Windows without
+    /// sync) so the frontend can treat the message as authoritative.
+    CacheStats(CacheStatsMsg),
+    /// Hydration state changed for a file. Consumed by the FinderSync
+    /// extension to paint overlay badges in Finder. Broadcast to every
+    /// connected client; non-FinderSync clients can ignore.
+    BadgeUpdate(BadgeUpdateMsg),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadgeKind {
+    /// Fully hydrated — all bytes cached locally.
+    Hydrated,
+    /// Partial — some chunks cached (chunk_bitmap has bits set).
+    Partial,
+    /// No local cache — reads will proxy to SMB. FinderSync should drop
+    /// any existing badge for this path.
+    Uncached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BadgeUpdateMsg {
+    pub domain: String,
+    /// Path relative to the share root.
+    pub relpath: String,
+    pub badge: BadgeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStatsMsg {
+    pub mount_id: String,
+    /// Total bytes of hydrated (locally cached) file content for this share.
+    pub hydrated_bytes: u64,
+    /// Number of files currently hydrated.
+    pub hydrated_count: u64,
+    /// Command ID to correlate with the triggering GetCacheStats request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +108,10 @@ pub enum UfbToAgent {
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
     ClearSyncCache(MountIdMsg),
+    /// Ask the agent how much content is currently cached for a share.
+    /// Agent replies with `AgentToUfb::CacheStats`. Cheap (one indexed
+    /// SUM query); safe to poll on dialog open.
+    GetCacheStats(MountIdMsg),
     CreateSymlinks,
     ReloadConfig,
     GetStates,

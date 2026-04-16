@@ -13,9 +13,10 @@
 //!
 //! One NFS server per sync-enabled mount. Each binds a distinct loopback port
 //! (base + offset) so multiple mounts don't collide. The client mounts at
-//! `~/ufb/vfs/<share>`; for now the mount is invoked manually (see README in
-//! `mediamount-nfs-spike/`). Lifecycle integration with mount state changes
-//! comes in Phase 1.5.
+//! `~/ufb/mounts/<share>` — the same user-facing path as non-sync plain-SMB
+//! mounts, so toggling sync on a mount does not invalidate bookmarks. A stale
+//! symlink at that path (from a prior non-sync run) is unlinked before the
+//! NFS mount.
 
 use crate::messages::{AgentToUfb, ConflictDetectedMsg};
 use crate::sync::conflict;
@@ -69,14 +70,15 @@ pub fn unmount_all() {
     }
 }
 
-/// Local user-facing mount point for a domain.
+/// Local user-facing mount point for a domain. Unified with the non-sync
+/// SMB symlink path so toggling sync preserves bookmarks.
 pub fn mount_point_for(domain: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join("ufb/vfs").join(domain)
+    PathBuf::from(home).join("ufb/mounts").join(domain)
 }
 
 /// True if `path` currently appears as a mount point in `mount(8)` output.
-fn is_mounted(path: &Path) -> bool {
+pub fn is_mounted(path: &Path) -> bool {
     let Ok(out) = std::process::Command::new("mount").output() else {
         return false;
     };
@@ -85,10 +87,29 @@ fn is_mounted(path: &Path) -> bool {
     text.contains(&needle)
 }
 
+/// Prepare `path` for use as an NFS mount point. Existing installs may have a
+/// plain-SMB symlink at this location (pointing to `/Volumes/<share>`); we
+/// unlink it first so `mkdir` succeeds and the NFS mount can take over.
+/// Idempotent — returns Ok(()) if the directory is already in place.
+fn prepare_nfs_mount_point(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            std::fs::remove_file(path).map_err(|e| {
+                format!("remove stale symlink {}: {}", path.display(), e)
+            })?;
+        }
+        Ok(_) => { /* already a dir (possibly a live mount, is_mounted handles that) */ }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* fresh install */ }
+        Err(e) => return Err(format!("lstat {}: {}", path.display(), e)),
+    }
+    Ok(())
+}
+
 /// Mount the loopback NFS export at `mount_point`. Pre-cleans a stale mount
 /// if the process was previously killed uncleanly. Returns the path that
 /// was mounted (same as `mount_point`) on success.
 fn mount_nfs_share(domain: &str, port: u16, mount_point: &Path) -> Result<(), String> {
+    prepare_nfs_mount_point(mount_point)?;
     std::fs::create_dir_all(mount_point)
         .map_err(|e| format!("mkdir {}: {}", mount_point.display(), e))?;
 
@@ -849,6 +870,13 @@ impl NFSFileSystem for PassthroughFs {
         }
         let read_len = (read_end - offset) as usize;
 
+        // Hold a read guard on this fh for the duration of the cache touch.
+        // The eviction worker takes a non-blocking `try_write`, so it skips
+        // any fh with an active reader rather than tearing the file out from
+        // under us.
+        let fh_lock = self.cache.fh_lock(id);
+        let _read_guard = fh_lock.read().await;
+
         // Fast path: fully hydrated.
         if attr.is_hydrated {
             return self.read_from_cache(id, offset, read_len, size);
@@ -1194,6 +1222,31 @@ pub fn start(
     tokio::spawn(async move {
         let health = NasHealth::new(domain.clone(), nas_root.clone());
         Arc::clone(&health).spawn_probe_loop();
+
+        // Cache eviction tick runs independently of the NFS listener. One
+        // task per cache instance; 30s cadence trades bounded-over-budget
+        // latency for low idle wakeups. Clone `cache` here before it's moved
+        // into `PassthroughFs::new` below.
+        if cache.cache_limit() > 0 {
+            let cache_for_evict = Arc::clone(&cache);
+            let domain_for_evict = domain.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                // First tick fires immediately — skip it so we don't race
+                // against the initial mount-up window.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let (files, bytes) = cache_for_evict.evict_over_budget_now().await;
+                    if files > 0 {
+                        log::debug!(
+                            "[nfs-server] {} evictor freed {} files / {} bytes",
+                            domain_for_evict, files, bytes,
+                        );
+                    }
+                }
+            });
+        }
 
         let fs = match PassthroughFs::new(
             domain.clone(),

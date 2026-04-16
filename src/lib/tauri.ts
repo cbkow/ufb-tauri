@@ -253,8 +253,18 @@ export const getSystemIcon = (extension: string, size: number = 32) =>
 
 // ── Sync Cache ──
 
-export const mountClearSyncCache = (mountId: string) =>
-  invoke<void>("mount_clear_sync_cache", { mountId });
+export interface CacheStats {
+  mountId: string;
+  hydratedBytes: number;
+  hydratedCount: number;
+  commandId?: string;
+}
+
+export const mountDrainShareCache = (mountId: string) =>
+  invoke<void>("mount_drain_share_cache", { mountId });
+
+export const mountGetCacheStats = (mountId: string) =>
+  invoke<void>("mount_get_cache_stats", { mountId });
 
 // ── Mount (MediaMount Agent) ──
 
@@ -278,6 +288,11 @@ export const mountSaveConfig = (config: import("./types").MountsConfig) =>
 
 export const mountGetConfig = () =>
   invoke<import("./types").MountsConfig>("mount_get_config");
+
+export type MountMode = "nfs" | "fileprovider";
+
+export const mountGetMode = () =>
+  invoke<MountMode>("mount_get_mode");
 
 export const mountLaunchAgent = () =>
   invoke<void>("mount_launch_agent");

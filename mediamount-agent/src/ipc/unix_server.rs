@@ -5,7 +5,24 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 /// Resolve the socket path for the IPC server.
+///
+/// On macOS we put it inside the shared app group container so the sandboxed
+/// FileProvider and FinderSync extensions can reach it — sandboxed processes
+/// can't open sockets in `/tmp`. The tray is not sandboxed but uses the same
+/// path for consistency.
+///
+/// Linux / other platforms keep the XDG_RUNTIME_DIR → /tmp fallback.
 fn socket_path() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::PathBuf::from(home).join(
+                "Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray",
+            );
+            let _ = std::fs::create_dir_all(&dir);
+            return dir.join("mediamount-agent.sock");
+        }
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         let dir = std::path::PathBuf::from(runtime_dir).join("ufb");
         let _ = std::fs::create_dir_all(&dir);

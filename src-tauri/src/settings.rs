@@ -235,14 +235,18 @@ impl AppSettings {
     /// Load settings from disk, falling back to defaults.
     pub fn load() -> Self {
         let path = crate::utils::get_settings_path();
-        if path.exists() {
+        let mut settings: Self = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
                 Err(_) => Self::default(),
             }
         } else {
             Self::default()
+        };
+        if settings.collapse_home_in_mappings() {
+            let _ = settings.save();
         }
+        settings
     }
 
     /// Save settings to disk.
@@ -251,6 +255,42 @@ impl AppSettings {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
         std::fs::write(&path, json).map_err(|e| format!("Failed to write settings: {}", e))
+    }
+
+    /// One-shot migration: rewrite stored `/Users/<me>/...` (mac) or
+    /// `/home/<me>/...` (lin) prefixes in path mappings to `~/...` so the
+    /// settings file is portable across machines with different usernames.
+    /// Only touches the field matching the current OS. Returns true if any
+    /// mapping changed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn collapse_home_in_mappings(&mut self) -> bool {
+        let Some(home) = dirs::home_dir() else { return false };
+        let home_str = home.to_string_lossy().into_owned();
+        if home_str.is_empty() {
+            return false;
+        }
+        let prefix = format!("{}/", home_str);
+        let mut changed = false;
+        for m in self.path_mappings.iter_mut() {
+            #[cfg(target_os = "macos")]
+            let field = &mut m.mac;
+            #[cfg(target_os = "linux")]
+            let field = &mut m.lin;
+
+            if let Some(rest) = field.strip_prefix(&prefix) {
+                *field = format!("~/{}", rest);
+                changed = true;
+            } else if field.as_str() == home_str {
+                *field = "~".to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn collapse_home_in_mappings(&mut self) -> bool {
+        false
     }
 }
 

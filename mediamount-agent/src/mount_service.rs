@@ -1,5 +1,5 @@
 use crate::config::{self, MountConfig, MountsConfig};
-use crate::messages::{AgentToUfb, AckMsg, ErrorMsg, FreshnessSweepMsg, UfbToAgent};
+use crate::messages::{AckMsg, AgentToUfb, CacheStatsMsg, ErrorMsg, FreshnessSweepMsg, MountIdMsg, UfbToAgent};
 use crate::orchestrator::Orchestrator;
 use crate::state::MountEvent;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,10 @@ pub struct MountService {
     connected_servers: Arc<Mutex<HashSet<String>>>,
     /// Global cache root for sync mounts.
     cache_root: std::path::PathBuf,
+    /// Per-domain NFS caches (macOS only). Shared with the NFS loopback
+    /// server so UI-triggered drain + stats commands hit the same instance.
+    #[cfg(target_os = "macos")]
+    shared_caches: Option<crate::ipc::fileops_server::SharedCaches>,
 }
 
 struct MountInstance {
@@ -29,7 +33,17 @@ impl MountService {
             ipc_tx,
             connected_servers: Arc::new(Mutex::new(HashSet::new())),
             cache_root: crate::config::MountConfig::default_cache_root(),
+            #[cfg(target_os = "macos")]
+            shared_caches: None,
         }
+    }
+
+    /// Inject the per-domain NFS cache map (macOS only). Call after `new`
+    /// but before `start_from_config` so UI drain/stats commands have
+    /// access from the first message in.
+    #[cfg(target_os = "macos")]
+    pub fn set_shared_caches(&mut self, caches: crate::ipc::fileops_server::SharedCaches) {
+        self.shared_caches = Some(caches);
     }
 
     /// Load config and start all enabled mounts.
@@ -60,7 +74,11 @@ impl MountService {
             crate::sync::SyncRoot::cleanup_stale_roots(&active_sync_mounts);
         }
 
-        // macOS: clean up stale symlinks from old {id}-based naming or removed mounts
+        // macOS: clean up stale entries in ~/ufb/mounts/ from removed mounts.
+        // Entries may be symlinks (plain-SMB mounts point at /Volumes/<share>)
+        // or real directories (NFS mount points for sync mounts). Both live in
+        // the same namespace now so toggling sync on a mount doesn't move the
+        // user-facing path — orphan classification has to handle both shapes.
         #[cfg(target_os = "macos")]
         {
             let active_names: std::collections::HashSet<String> = config
@@ -73,12 +91,43 @@ impl MountService {
             if let Ok(entries) = std::fs::read_dir(&base) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_symlink() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if !active_names.contains(name) {
-                                let _ = std::fs::remove_file(&path);
-                                log::info!("Removed stale symlink: {}", path.display());
+                    let name = match path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    if active_names.contains(&name) {
+                        continue;
+                    }
+                    let md = match std::fs::symlink_metadata(&path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if md.file_type().is_symlink() {
+                        let _ = std::fs::remove_file(&path);
+                        log::info!("Removed stale symlink: {}", path.display());
+                    } else if md.is_dir() {
+                        // Directory entry: could be a live NFS mount point left
+                        // over from a now-disabled mount, or just an empty dir.
+                        if crate::sync::nfs_server::is_mounted(&path) {
+                            log::info!("Umounting stale NFS mount: {}", path.display());
+                            let _ = std::process::Command::new("umount")
+                                .arg(&path)
+                                .status();
+                            // Try forced umount if the gentle one left it mounted
+                            if crate::sync::nfs_server::is_mounted(&path) {
+                                let _ = std::process::Command::new("umount")
+                                    .arg("-f")
+                                    .arg(&path)
+                                    .status();
                             }
+                        }
+                        match std::fs::remove_dir(&path) {
+                            Ok(()) => log::info!("Removed stale dir: {}", path.display()),
+                            Err(e) => log::warn!(
+                                "Could not remove stale dir {} (may still be mounted or non-empty): {}",
+                                path.display(),
+                                e
+                            ),
                         }
                     }
                 }
@@ -225,8 +274,20 @@ impl MountService {
                     .await;
             }
             UfbToAgent::ClearSyncCache(msg) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.try_drain_nfs_cache(&msg).await {
+                        return;
+                    }
+                }
+                // Fall-through: Windows (and macOS FileProvider while the
+                // extension is still the cache owner) — orchestrator's
+                // ClearSyncCache handler does the per-platform teardown.
                 self.send_to_mount(&msg.mount_id, MountEvent::ClearSyncCache, &msg.command_id)
                     .await;
+            }
+            UfbToAgent::GetCacheStats(msg) => {
+                self.handle_get_cache_stats(msg).await;
             }
             UfbToAgent::CreateSymlinks => {
                 #[cfg(windows)]
@@ -302,6 +363,108 @@ impl MountService {
                 }))
                 .await;
         }
+    }
+
+    /// macOS-NFS branch for ClearSyncCache: if this mount has an active
+    /// NFS cache instance in the shared map, drain it inline and ack the
+    /// command. Returns `true` when handled; `false` means the caller
+    /// should fall back to the orchestrator path (Windows, or macOS-FP
+    /// while the extension is still around).
+    #[cfg(target_os = "macos")]
+    async fn try_drain_nfs_cache(&self, msg: &MountIdMsg) -> bool {
+        let Some(ref caches) = self.shared_caches else {
+            return false;
+        };
+        // Accept either a mount id (sent by src-tauri via the Settings
+        // dialog) or a share name (sent by FinderSync's context menu,
+        // which only knows the folder name). Mount ids take priority; if
+        // no mount matches, fall through and try the string directly as
+        // a share name.
+        let share_name = self
+            .mounts
+            .get(&msg.mount_id)
+            .map(|instance| instance.config.share_name())
+            .unwrap_or_else(|| msg.mount_id.clone());
+        let cache = {
+            let guard = caches.read().unwrap();
+            guard.get(&share_name).cloned()
+        };
+        let Some(cache) = cache else {
+            return false;
+        };
+
+        let (count, bytes) = cache.drain_all().await;
+        log::info!(
+            "[{}] Drain cache (NFS): {} files, {:.1} MB",
+            msg.mount_id,
+            count,
+            bytes as f64 / 1_048_576.0,
+        );
+        if !msg.command_id.is_empty() {
+            let _ = self
+                .ipc_tx
+                .send(AgentToUfb::Ack(AckMsg {
+                    command_id: msg.command_id.clone(),
+                }))
+                .await;
+        }
+        // Emit fresh stats so the UI can update without a second round-trip.
+        let (hb, hc) = cache.cache_stats();
+        let _ = self
+            .ipc_tx
+            .send(AgentToUfb::CacheStats(CacheStatsMsg {
+                mount_id: msg.mount_id.clone(),
+                hydrated_bytes: hb,
+                hydrated_count: hc,
+                command_id: String::new(),
+            }))
+            .await;
+        true
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)]
+    async fn try_drain_nfs_cache(&self, _msg: &MountIdMsg) -> bool {
+        false
+    }
+
+    /// Respond to `UfbToAgent::GetCacheStats` with current cache size.
+    /// On macOS-NFS reads from the shared MacosCache; on Windows or macOS
+    /// without NFS there's no per-share hydration bookkeeping exposed
+    /// through this path, so we reply with zeros (the UI treats that as
+    /// "no cache to show").
+    async fn handle_get_cache_stats(&self, msg: MountIdMsg) {
+        let (hydrated_bytes, hydrated_count) = {
+            #[cfg(target_os = "macos")]
+            {
+                let zeros = (0u64, 0u64);
+                let share_name = self
+                    .mounts
+                    .get(&msg.mount_id)
+                    .map(|m| m.config.share_name());
+                match (share_name, self.shared_caches.as_ref()) {
+                    (Some(share), Some(caches)) => {
+                        let cache = caches.read().unwrap().get(&share).cloned();
+                        cache.map(|c| c.cache_stats()).unwrap_or(zeros)
+                    }
+                    _ => zeros,
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = &msg;
+                (0u64, 0u64)
+            }
+        };
+        let _ = self
+            .ipc_tx
+            .send(AgentToUfb::CacheStats(CacheStatsMsg {
+                mount_id: msg.mount_id,
+                hydrated_bytes,
+                hydrated_count,
+                command_id: msg.command_id,
+            }))
+            .await;
     }
 
     async fn send_to_mount(&self, mount_id: &str, event: MountEvent, command_id: &str) {

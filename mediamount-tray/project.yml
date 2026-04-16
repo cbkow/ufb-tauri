@@ -28,6 +28,7 @@ targets:
         DEVELOPMENT_TEAM: 5Z4S9VHV56
     dependencies:
       - target: FileProviderExtension
+      - target: FinderSync
 
   FileProviderExtension:
     type: app-extension
@@ -48,3 +49,27 @@ targets:
           - "@executable_path/../../../../Frameworks"
     frameworks:
       - sdk: FileProvider.framework
+
+  FinderSync:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: FinderSync
+    settings:
+      base:
+        INFOPLIST_FILE: FinderSync/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FinderSync/FinderSync.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.unionfiles.mediamount-tray.FinderSync
+        PRODUCT_NAME: FinderSync
+        # Module name must differ from the target / product name so our
+        # code can `import FinderSync` (the Apple framework) without
+        # self-referencing the extension's own module.
+        PRODUCT_MODULE_NAME: UFBFinderSync
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 5Z4S9VHV56
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+    frameworks:
+      - sdk: FinderSync.framework

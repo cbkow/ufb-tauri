@@ -20,6 +20,21 @@ pub enum AgentToUfb {
     Error(ErrorMsg),
     Pong,
     ConflictDetected(ConflictDetectedMsg),
+    CacheStats(CacheStatsMsg),
+    /// BadgeUpdate messages are consumed by the FinderSync extension
+    /// (separate process), so src-tauri ignores them — but we still
+    /// need to decode rather than treat as malformed.
+    BadgeUpdate(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStatsMsg {
+    pub mount_id: String,
+    pub hydrated_bytes: u64,
+    pub hydrated_count: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +79,7 @@ pub enum UfbToAgent {
     StopMount(MountIdMsg),
     RestartMount(MountIdMsg),
     ClearSyncCache(MountIdMsg),
+    GetCacheStats(MountIdMsg),
     CreateSymlinks,
     ReloadConfig,
     GetStates,
@@ -271,12 +287,7 @@ impl MountClient {
         }
         #[cfg(unix)]
         {
-            let sock_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-                std::path::PathBuf::from(runtime_dir).join("ufb/mediamount-agent.sock")
-            } else {
-                std::path::PathBuf::from("/tmp/ufb-mediamount-agent.sock")
-            };
-            sock_path.exists()
+            agent_socket_path().exists()
         }
     }
 
@@ -401,6 +412,12 @@ impl MountClient {
                                         );
                                         let _ = app_handle.emit("file:conflict", &conflict);
                                     }
+                                    Some(AgentToUfb::CacheStats(stats)) => {
+                                        let _ = app_handle.emit("mount:cache-stats", &stats);
+                                    }
+                                    Some(AgentToUfb::BadgeUpdate(_)) => {
+                                        // Consumed by FinderSync extension; src-tauri ignores.
+                                    }
                                     None => {
                                         // I/O thread exited — agent disconnected
                                         break;
@@ -497,6 +514,12 @@ impl MountClient {
                                         );
                                         let _ = app_handle.emit("file:conflict", &conflict);
                                     }
+                                    Some(AgentToUfb::CacheStats(stats)) => {
+                                        let _ = app_handle.emit("mount:cache-stats", &stats);
+                                    }
+                                    Some(AgentToUfb::BadgeUpdate(_)) => {
+                                        // Consumed by FinderSync extension; src-tauri ignores.
+                                    }
                                     None => {
                                         break;
                                     }
@@ -585,16 +608,31 @@ pub fn save_mount_config(config: &MountsConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Connect to the agent's Unix domain socket (Linux/macOS).
+/// Shared socket-path resolution — mirrors `unix_server::socket_path()` in
+/// the agent. macOS puts it inside the app group container so sandboxed
+/// FileProvider / FinderSync extensions can reach it; other Unixes use the
+/// XDG_RUNTIME_DIR → /tmp fallback.
 #[cfg(unix)]
-fn connect_to_agent_unix() -> io::Result<std::os::unix::net::UnixStream> {
-    let sock_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+fn agent_socket_path() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(
+                "Library/Group Containers/5Z4S9VHV56.group.com.unionfiles.mediamount-tray/mediamount-agent.sock",
+            );
+        }
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         std::path::PathBuf::from(runtime_dir).join("ufb/mediamount-agent.sock")
     } else {
         std::path::PathBuf::from("/tmp/ufb-mediamount-agent.sock")
-    };
+    }
+}
 
-    std::os::unix::net::UnixStream::connect(&sock_path)
+/// Connect to the agent's Unix domain socket (Linux/macOS).
+#[cfg(unix)]
+fn connect_to_agent_unix() -> io::Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(&agent_socket_path())
 }
 
 /// Connect to the agent's named pipe (Windows only).

@@ -295,6 +295,8 @@ async fn run_event_loop() {
         #[cfg(target_os = "macos")]
         let state_tx_for_nfs = state_tx.clone();
         let mut mount_service = mount_service::MountService::new(state_tx);
+        #[cfg(target_os = "macos")]
+        mount_service.set_shared_caches(std::sync::Arc::clone(&shared_caches));
         mount_service.start_from_config().await;
 
         // Start NFS loopback servers (macOS only). One per sync-enabled mount.
@@ -345,6 +347,11 @@ async fn run_event_loop() {
                             ) {
                                 Ok(c) => {
                                     let arc = std::sync::Arc::new(c);
+                                    // Hand the cache a clone of the agent→UFB
+                                    // channel so hydration state changes can
+                                    // broadcast as BadgeUpdate messages to the
+                                    // FinderSync extension.
+                                    arc.set_badge_tx(ipc_tx_for_nfs.clone());
                                     caches.insert(share.clone(), std::sync::Arc::clone(&arc));
                                     log::info!(
                                         "[nfs-server] Cache opened (shared) for domain: {}",

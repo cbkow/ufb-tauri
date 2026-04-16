@@ -1,6 +1,6 @@
-import { createSignal, createResource, createMemo, For, Show, onCleanup, onMount } from "solid-js";
+import { createSignal, createResource, createMemo, createEffect, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare, mountClearSyncCache } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
 import type { CredentialInfo } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
@@ -703,6 +703,27 @@ function MountsSection(props: {
   const [editingMount, setEditingMount] = createSignal<MountConfig | null>(null);
   const [isNew, setIsNew] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal<string | null>(null);
+  const [confirmDrain, setConfirmDrain] = createSignal<{ id: string; displayName: string } | null>(null);
+
+  // Refresh cache stats whenever we open/switch to a sync-enabled mount.
+  // Agent replies via the `mount:cache-stats` event and mountStore receives it.
+  createEffect(() => {
+    const mount = editingMount();
+    if (mount && mount.syncEnabled) {
+      mountStore.refreshCacheStats(mount.id);
+    }
+  });
+
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    const units = ["KB", "MB", "GB", "TB"];
+    let v = n / 1024;
+    for (const u of units) {
+      if (v < 1024) return `${v.toFixed(v < 10 ? 1 : 0)} ${u}`;
+      v /= 1024;
+    }
+    return `${v.toFixed(1)} PB`;
+  }
 
   // ── Saved credentials ──
   const [savedCreds, setSavedCreds] = createSignal<CredentialInfo[]>([]);
@@ -906,6 +927,38 @@ function MountsSection(props: {
         </div>
       </Show>
 
+      {/* Confirm drain cache */}
+      <Show when={confirmDrain()}>
+        <div class="modal-overlay">
+          <div class="modal">
+            <div class="modal-title">Drain Cache</div>
+            <div class="modal-body">
+              <p>
+                Drain all cached files for <strong>{confirmDrain()!.displayName}</strong>?
+              </p>
+              <p class="settings-hint">
+                Non-destructive — files re-download on next access. Any active reads are skipped and drained on the next tick.
+              </p>
+            </div>
+            <div class="modal-actions">
+              <button class="modal-btn" onClick={() => setConfirmDrain(null)}>Cancel</button>
+              <button class="modal-btn modal-btn-danger" onClick={async () => {
+                const entry = confirmDrain();
+                setConfirmDrain(null);
+                if (entry) {
+                  await mountStore.drainShareCache(entry.id);
+                  // Agent emits a CacheStats message after drain; the
+                  // mount:cache-stats listener picks it up. Request an
+                  // explicit refresh too in case the agent's ack-emit
+                  // path skipped this mount (non-NFS backend).
+                  await mountStore.refreshCacheStats(entry.id);
+                }
+              }}>Drain</button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
       {/* Sync cache location — global setting for all sync mounts (not macOS — FileProvider controls cache) */}
       <Show when={props.platform() !== "mac" && props.mountConfig().mounts.some((m) => m.syncEnabled)}>
         <h3>Sync Cache</h3>
@@ -1062,7 +1115,9 @@ function MountsSection(props: {
                 </p>
                 <Show when={props.platform() === "mac"}>
                   <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)", opacity: 0.7 }}>
-                    Appears in Finder sidebar under "UFB". Cache managed by macOS FileProvider.
+                    {mountStore.mode === "nfs"
+                      ? "Mounted at ~/ufb/mounts/<share> via NFS loopback. Cache managed by the agent."
+                      : 'Appears in Finder sidebar under "UFB". Cache managed by macOS FileProvider.'}
                   </p>
                 </Show>
 
@@ -1124,17 +1179,20 @@ function MountsSection(props: {
                   })()}
                 </div>
 
+                <p class="settings-hint" style={{ "margin-top": "var(--spacing-sm)", "margin-bottom": "0" }}>
+                  {(() => {
+                    const s = mountStore.cacheStats[m().id];
+                    if (!s) return "Cache: (fetching…)";
+                    return `Cache: ${fmtBytes(s.hydratedBytes)} across ${s.hydratedCount} file${s.hydratedCount === 1 ? "" : "s"}`;
+                  })()}
+                </p>
                 <button
                   class="settings-btn"
                   style={{ "margin-top": "var(--spacing-sm)" }}
-                  onClick={async () => {
-                    try {
-                      await mountClearSyncCache(m().id);
-                    } catch (e) {
-                      console.error("Failed to clear cache:", e);
-                    }
+                  onClick={() => {
+                    setConfirmDrain({ id: m().id, displayName: m().displayName || m().id });
                   }}
-                >Clear Cache</button>
+                >Drain Cache</button>
               </Show>
             </Show>
 
