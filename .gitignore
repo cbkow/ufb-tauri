@@ -33,7 +33,7 @@ planning/
 spikes/
 
 # Claude Code local settings
-.claude/settings.local.json
+.claude/
 
 # Build/signing scripts (contain signing identity references)
 scripts/
