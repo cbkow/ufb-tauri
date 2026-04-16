@@ -994,6 +994,77 @@ impl MacosCache {
             });
     }
 
+    /// Reflect an NFS RENAME in the cache. Preserves the source row's `fh`
+    /// so NFS clients' cached handles keep resolving after the rename —
+    /// critical for editor "save as" patterns that rename over the file.
+    ///
+    /// Caller must have performed `std::fs::rename(from_abs, to_abs)` first.
+    /// This function does the DB-side bookkeeping:
+    ///   1. Delete any stale rows at the target (the disk rename already
+    ///      clobbered them).
+    ///   2. UPDATE the source row's path/parent_path/name in place so `fh`
+    ///      survives.
+    ///   3. Fix up every descendant row (when renaming a directory) —
+    ///      their path prefix changes, their `fh` stays.
+    pub fn rename_path(&self, from: &str, to: &str) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("rename tx begin: {}", e))?;
+
+        // Clear anything under the target path. The disk rename moved the
+        // actual files to `to`, so whatever was previously there is gone.
+        tx.execute(
+            "DELETE FROM known_files WHERE path = ?1 OR path LIKE ?1 || '/%'",
+            params![to],
+        )
+        .map_err(|e| format!("rename clear target: {}", e))?;
+
+        let new_parent = parent_of(to).to_string();
+        let new_name = to.rsplit('/').next().unwrap_or(to).to_string();
+        tx.execute(
+            "UPDATE known_files SET path = ?1, parent_path = ?2, name = ?3
+             WHERE path = ?4",
+            params![to, new_parent, new_name, from],
+        )
+        .map_err(|e| format!("rename update source: {}", e))?;
+
+        // Descendant fixup for directory renames. Collect first (borrow
+        // ends with the prepare), then apply UPDATEs.
+        let from_prefix = format!("{}/", from);
+        let to_prefix = format!("{}/", to);
+        let descendants: Vec<(i64, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT fh, path FROM known_files WHERE path LIKE ?1 || '%'")
+                .map_err(|e| format!("rename prep desc: {}", e))?;
+            let rows = stmt
+                .query_map(params![from_prefix], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("rename query desc: {}", e))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| format!("rename row desc: {}", e))?);
+            }
+            out
+        };
+
+        for (fh, old_desc_path) in descendants {
+            let new_desc_path =
+                format!("{}{}", to_prefix, &old_desc_path[from_prefix.len()..]);
+            let new_desc_parent = parent_of(&new_desc_path).to_string();
+            tx.execute(
+                "UPDATE known_files SET path = ?1, parent_path = ?2 WHERE fh = ?3",
+                params![new_desc_path, new_desc_parent, fh],
+            )
+            .map_err(|e| format!("rename update desc: {}", e))?;
+        }
+
+        tx.commit()
+            .map_err(|e| format!("rename commit: {}", e))?;
+        Ok(())
+    }
+
     /// Remove a path from the cache. Deletes its row from `known_files`
     /// (its fh becomes permanently `NFS3ERR_STALE` — AUTOINCREMENT never
     /// reuses it) and deletes the on-disk cache file if present. Used by

@@ -699,12 +699,44 @@ impl NFSFileSystem for PassthroughFs {
 
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let from_parent = self.rel_path(from_dirid)?;
+        let to_parent = self.rel_path(to_dirid)?;
+        let from_name = filename_to_string(from_filename)?;
+        let to_name = filename_to_string(to_filename)?;
+        let from_rel = join_rel(&from_parent, &from_name);
+        let to_rel = join_rel(&to_parent, &to_name);
+        let from_abs = self.absolute(&from_rel);
+        let to_abs = self.absolute(&to_rel);
+
+        // Same-path rename is a no-op (some clients do this while editors
+        // re-save files); short-circuit before hitting the NAS.
+        if from_rel == to_rel {
+            return Ok(());
+        }
+
+        // Atomic on same filesystem; SMB handles cross-dir moves. Fails if
+        // renaming over a non-empty directory (→ ENOTEMPTY), etc.
+        std::fs::rename(&from_abs, &to_abs).map_err(io_to_nfsstat)?;
+
+        // Preserve the source fh so cached client handles keep resolving.
+        if let Err(e) = self.cache.rename_path(&from_rel, &to_rel) {
+            log::error!(
+                "[nfs-server] {}: cache rename_path failed: {} (disk rename succeeded)",
+                self.domain, e
+            );
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+
+        log::debug!(
+            "[nfs-server] {}: renamed {} → {}",
+            self.domain, from_rel, to_rel
+        );
+        Ok(())
     }
 
     async fn readdir(
