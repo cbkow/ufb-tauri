@@ -39,6 +39,90 @@ use tokio::sync::mpsc;
 /// Base loopback port. Each enabled mount is assigned `BASE_PORT + offset`.
 pub const BASE_PORT: u16 = 12345;
 
+/// Registry of active NFS mount points. Populated by `start()` after a
+/// successful `mount_nfs`, drained on shutdown so we leave the machine
+/// clean. Global because mount points are process-level resources.
+static MOUNTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn mounts() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    MOUNTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Clean unmount for every NFS mount point this process set up. Called
+/// from the agent's signal handler on shutdown so we don't leave stale
+/// mounts on the machine.
+pub fn unmount_all() {
+    let paths: Vec<PathBuf> = {
+        let guard = mounts().lock().unwrap();
+        guard.clone()
+    };
+    for path in paths {
+        log::info!("[nfs-server] shutting down — unmounting {}", path.display());
+        let _ = std::process::Command::new("umount")
+            .arg(&path)
+            .status();
+    }
+}
+
+/// Local user-facing mount point for a domain.
+pub fn mount_point_for(domain: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join("ufb/vfs").join(domain)
+}
+
+/// True if `path` currently appears as a mount point in `mount(8)` output.
+fn is_mounted(path: &Path) -> bool {
+    let Ok(out) = std::process::Command::new("mount").output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle = format!(" on {} ", path.display());
+    text.contains(&needle)
+}
+
+/// Mount the loopback NFS export at `mount_point`. Pre-cleans a stale mount
+/// if the process was previously killed uncleanly. Returns the path that
+/// was mounted (same as `mount_point`) on success.
+fn mount_nfs_share(domain: &str, port: u16, mount_point: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(mount_point)
+        .map_err(|e| format!("mkdir {}: {}", mount_point.display(), e))?;
+
+    if is_mounted(mount_point) {
+        log::warn!(
+            "[nfs-server] {}: stale mount at {} — force-unmounting",
+            domain,
+            mount_point.display()
+        );
+        let _ = std::process::Command::new("umount")
+            .arg("-f")
+            .arg(mount_point)
+            .status();
+    }
+
+    let opts = format!(
+        "port={0},mountport={0},nolocks,vers=3,tcp,nobrowse,actimeo=1,rsize=1048576,wsize=1048576",
+        port
+    );
+    let out = std::process::Command::new("mount")
+        .args([
+            "-t", "nfs",
+            "-o", &opts,
+            &format!("localhost:/{}", domain),
+            &mount_point.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("spawn mount: {}", e))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("mount_nfs failed: {}", stderr.trim()));
+    }
+
+    mounts().lock().unwrap().push(mount_point.to_path_buf());
+    Ok(())
+}
+
 /// Read-only cache-backed filesystem.
 ///
 /// Metadata is served from `MacosCache` when warm. Cold folders trigger a live
@@ -967,18 +1051,39 @@ pub fn start(
         };
 
         log::info!(
-            "[nfs-server] {} listening on {} (nas_root={}) — mount with: \
-             mkdir -p ~/ufb/vfs/{} && mount -t nfs \
-             -o \"port={port},mountport={port},nolocks,vers=3,tcp,nobrowse,actimeo=1,rsize=1048576,wsize=1048576\" \
-             localhost:/{} ~/ufb/vfs/{}",
+            "[nfs-server] {} listening on {} (nas_root={})",
             domain,
             bind,
             nas_root.display(),
-            domain,
-            domain,
-            domain,
-            port = port,
         );
+
+        // Auto-mount runs in a separate blocking task. It MUST run
+        // concurrently with `handle_forever` below — `mount_nfs` performs
+        // an NFS handshake over localhost, so it blocks until our server
+        // accepts the connection. Running it inline would deadlock
+        // (handle_forever can't start until mount_nfs returns; mount_nfs
+        // can't return until handle_forever accepts it).
+        let domain_for_mount = domain.clone();
+        tokio::task::spawn_blocking(move || {
+            let mount_point = mount_point_for(&domain_for_mount);
+            match mount_nfs_share(&domain_for_mount, port, &mount_point) {
+                Ok(()) => log::info!(
+                    "[nfs-server] {} auto-mounted at {}",
+                    domain_for_mount,
+                    mount_point.display()
+                ),
+                Err(e) => log::warn!(
+                    "[nfs-server] {} auto-mount failed ({}) — mount manually with: \
+                     mount -t nfs -o \"port={p},mountport={p},nolocks,vers=3,tcp,nobrowse,actimeo=1,rsize=1048576,wsize=1048576\" \
+                     localhost:/{} {}",
+                    domain_for_mount,
+                    e,
+                    domain_for_mount,
+                    mount_point.display(),
+                    p = port,
+                ),
+            }
+        });
 
         if let Err(e) = listener.handle_forever().await {
             log::error!("[nfs-server] {} handle_forever exited: {}", domain, e);

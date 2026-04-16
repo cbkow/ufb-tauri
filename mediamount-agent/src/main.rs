@@ -451,6 +451,11 @@ async fn run_event_loop() {
                 // Ctrl+C / shutdown signal
                 _ = tokio::signal::ctrl_c() => {
                     log::info!("Shutdown signal received");
+                    // Unmount NFS loopback shares first so we don't leave the
+                    // machine with stale mount points. No-op if NFS wasn't
+                    // enabled.
+                    #[cfg(target_os = "macos")]
+                    sync::nfs_server::unmount_all();
                     mount_service.shutdown().await;
                     _tray_manager.stop();
                     break;
