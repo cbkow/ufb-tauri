@@ -316,9 +316,13 @@ All tools in the user's media workflow function correctly.
 
 ## Cross-platform outlook
 
-- **Windows:** keep Cloud Files. It's well-integrated and doesn't suffer
-  the same ceiling. If future metadata-storm pain appears, Windows ships
-  an optional NFS client feature we could activate then.
+- **Windows:** keep Cloud Files for now. If specific CF pain appears
+  (admin elevation, sync-root quirks, metadata storms), the path
+  forward is ProjFS — Microsoft's Projected FS, the architectural
+  analog of macOS NFS loopback. Full notes in
+  `docs/windows-port-notes.md`. (WinFsp evaluated + ruled out due to
+  POSIX-to-Windows semantic pain; Windows NFS client isn't viable
+  because it requires admin-gated optional-feature installation.)
 - **Linux:** current FUSE setup works; NFS loopback is trivial there too.
   Migrate at leisure, post-macOS.
 
