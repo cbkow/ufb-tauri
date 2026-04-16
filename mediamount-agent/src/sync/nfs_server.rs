@@ -32,7 +32,11 @@ use nfsserve::{
 use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 use tokio::sync::mpsc;
 
@@ -138,6 +142,9 @@ pub struct PassthroughFs {
     cache: Arc<MacosCache>,
     /// Agent → UFB channel for out-of-band events (e.g. ConflictDetected).
     ipc_tx: mpsc::Sender<AgentToUfb>,
+    /// Rolling NAS reachability state. Ops that would touch SMB consult
+    /// this first and short-circuit with JUKEBOX when offline.
+    health: Arc<NasHealth>,
 }
 
 impl PassthroughFs {
@@ -146,13 +153,27 @@ impl PassthroughFs {
         nas_root: PathBuf,
         cache: Arc<MacosCache>,
         ipc_tx: mpsc::Sender<AgentToUfb>,
+        health: Arc<NasHealth>,
     ) -> Result<Self, String> {
         let canon = nas_root
             .canonicalize()
             .map_err(|e| format!("Failed to canonicalize {}: {}", nas_root.display(), e))?;
         // Root always has an fh (seeded at schema init; ensure idempotently).
         cache.ensure_fh("");
-        Ok(Self { domain, nas_root: canon, cache, ipc_tx })
+        Ok(Self { domain, nas_root: canon, cache, ipc_tx, health })
+    }
+
+    /// Short-circuit guard for SMB-touching ops. Returns `NFS3ERR_JUKEBOX`
+    /// when the heartbeat probe has marked the NAS offline, so clients
+    /// get a fast retry signal instead of waiting for a 60-second SMB
+    /// timeout on every op.
+    #[inline]
+    fn require_online(&self) -> Result<(), nfsstat3> {
+        if self.health.is_online() {
+            Ok(())
+        } else {
+            Err(nfsstat3::NFS3ERR_JUKEBOX)
+        }
     }
 
     fn absolute(&self, rel: &str) -> PathBuf {
@@ -183,6 +204,7 @@ impl PassthroughFs {
     /// push every entry into `known_files` via `record_enumeration`. Cheap to
     /// call repeatedly (idempotent upsert).
     fn populate_folder(&self, parent_rel: &str) -> Result<(), nfsstat3> {
+        self.require_online()?;
         let abs = self.absolute(parent_rel);
         let rd = std::fs::read_dir(&abs).map_err(io_to_nfsstat)?;
         let mut entries: Vec<crate::messages::DirEntry> = Vec::new();
@@ -446,7 +468,10 @@ impl PassthroughFs {
                 }
             } else {
                 // Missing: fetch from SMB (reuse an opened file handle across
-                // multiple missing runs in this read).
+                // multiple missing runs in this read). Short-circuit if the
+                // NAS heartbeat has marked us offline — retrying from cache
+                // later is better than a 60-second SMB timeout.
+                self.require_online()?;
                 let f = match smb_file {
                     Some(ref f) => f,
                     None => {
@@ -519,6 +544,77 @@ fn bit_unset(bitmap: &mut [u8], chunk: u64) {
     let mask = !(1u8 << ((chunk % 8) as u8));
     if let Some(b) = bitmap.get_mut(byte) {
         *b &= mask;
+    }
+}
+
+/// Tracks NAS reachability for a domain. A background probe loop stats
+/// the share root every `PROBE_INTERVAL`; a configurable number of
+/// consecutive failures flips us to "offline." Handlers consult
+/// `is_online()` before touching SMB so we can short-circuit with
+/// `NFS3ERR_JUKEBOX` instead of waiting for 60-second SMB timeouts.
+pub struct NasHealth {
+    domain: String,
+    nas_root: PathBuf,
+    connected: AtomicBool,
+    consecutive_failures: AtomicU32,
+}
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const FAILURE_THRESHOLD: u32 = 2;
+
+impl NasHealth {
+    pub fn new(domain: String, nas_root: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            domain,
+            nas_root,
+            connected: AtomicBool::new(true),
+            consecutive_failures: AtomicU32::new(0),
+        })
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Spawn the background probe loop. Non-blocking.
+    pub fn spawn_probe_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                self.probe_once().await;
+                tokio::time::sleep(PROBE_INTERVAL).await;
+            }
+        });
+    }
+
+    async fn probe_once(&self) {
+        let root = self.nas_root.clone();
+        // Run the stat on the blocking pool so a hung SMB call doesn't
+        // stall the async runtime.
+        let res = tokio::task::spawn_blocking(move || std::fs::metadata(&root)).await;
+        let ok = matches!(res, Ok(Ok(_)));
+
+        if ok {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+            let was_offline = !self.connected.swap(true, Ordering::Relaxed);
+            if was_offline {
+                log::info!(
+                    "[nfs-server] {} NAS reachable again — resuming writes",
+                    self.domain
+                );
+            }
+        } else {
+            let fails = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            if fails >= FAILURE_THRESHOLD {
+                let was_online = self.connected.swap(false, Ordering::Relaxed);
+                if was_online {
+                    log::warn!(
+                        "[nfs-server] {} NAS unreachable (failed {} consecutive probes) — serving from cache only",
+                        self.domain,
+                        fails
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -698,6 +794,7 @@ impl NFSFileSystem for PassthroughFs {
         // fine-grained control we could proxy here, and NFS clients treat
         // them as advisory.
         if let set_size3::size(new_size) = setattr.size {
+            self.require_online()?;
             // Conflict detection — if the NAS file has changed since we
             // last cached it, preserve that version to a sidecar before
             // we blow it away with the truncate.
@@ -765,6 +862,7 @@ impl NFSFileSystem for PassthroughFs {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        self.require_online()?;
         let rel = self.rel_path(id)?;
         if rel.is_empty() {
             return Err(nfsstat3::NFS3ERR_ISDIR);
@@ -823,6 +921,7 @@ impl NFSFileSystem for PassthroughFs {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.require_online()?;
         let parent_rel = self.rel_path(dirid)?;
         let name = filename_to_string(filename)?;
         let child_rel = join_rel(&parent_rel, &name);
@@ -853,6 +952,7 @@ impl NFSFileSystem for PassthroughFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        self.require_online()?;
         let parent_rel = self.rel_path(dirid)?;
         let name = filename_to_string(filename)?;
         let child_rel = join_rel(&parent_rel, &name);
@@ -875,6 +975,7 @@ impl NFSFileSystem for PassthroughFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.require_online()?;
         let name_preview = filename_to_string(dirname).unwrap_or_default();
         log::debug!(
             "[nfs-server] {}: mkdir(dirid={}, name={:?})",
@@ -894,6 +995,7 @@ impl NFSFileSystem for PassthroughFs {
         // nfsserve routes both NFSPROC3_REMOVE and NFSPROC3_RMDIR to this
         // single trait method. We dispatch to remove_file vs remove_dir
         // based on the target's actual type on disk.
+        self.require_online()?;
         let parent_rel = self.rel_path(dirid)?;
         let name = filename_to_string(filename)?;
         let child_rel = join_rel(&parent_rel, &name);
@@ -937,6 +1039,7 @@ impl NFSFileSystem for PassthroughFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        self.require_online()?;
         let from_parent = self.rel_path(from_dirid)?;
         let to_parent = self.rel_path(to_dirid)?;
         let from_name = filename_to_string(from_filename)?;
@@ -1023,6 +1126,7 @@ impl NFSFileSystem for PassthroughFs {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        self.require_online()?;
         let rel = self.rel_path(id)?;
         let abs = self.absolute(&rel);
         let target = std::fs::read_link(&abs).map_err(io_to_nfsstat)?;
@@ -1088,7 +1192,16 @@ pub fn start(
     ipc_tx: mpsc::Sender<AgentToUfb>,
 ) {
     tokio::spawn(async move {
-        let fs = match PassthroughFs::new(domain.clone(), nas_root.clone(), cache, ipc_tx) {
+        let health = NasHealth::new(domain.clone(), nas_root.clone());
+        Arc::clone(&health).spawn_probe_loop();
+
+        let fs = match PassthroughFs::new(
+            domain.clone(),
+            nas_root.clone(),
+            cache,
+            ipc_tx,
+            health,
+        ) {
             Ok(fs) => fs,
             Err(e) => {
                 log::error!(
