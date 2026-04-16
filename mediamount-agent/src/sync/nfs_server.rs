@@ -384,6 +384,7 @@ fn io_to_nfsstat(e: std::io::Error) -> nfsstat3 {
         NotFound => nfsstat3::NFS3ERR_NOENT,
         PermissionDenied => nfsstat3::NFS3ERR_ACCES,
         AlreadyExists => nfsstat3::NFS3ERR_EXIST,
+        DirectoryNotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
         _ => nfsstat3::NFS3ERR_IO,
     }
 }
@@ -656,8 +657,44 @@ impl NFSFileSystem for PassthroughFs {
         self.register_new_entry(&child_rel, &name, &abs)
     }
 
-    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        // nfsserve routes both NFSPROC3_REMOVE and NFSPROC3_RMDIR to this
+        // single trait method. We dispatch to remove_file vs remove_dir
+        // based on the target's actual type on disk.
+        let parent_rel = self.rel_path(dirid)?;
+        let name = filename_to_string(filename)?;
+        let child_rel = join_rel(&parent_rel, &name);
+        let abs = self.absolute(&child_rel);
+
+        // Snapshot the fh before deletion so we can scrub the cache file.
+        let fh = self.cache.fh_for_path(&child_rel).unwrap_or(0);
+
+        let meta = std::fs::symlink_metadata(&abs).map_err(io_to_nfsstat)?;
+        let is_dir = meta.is_dir();
+
+        if is_dir {
+            // NFS3 RMDIR fails if the directory isn't empty — remove_dir
+            // surfaces that as io::Error kind=DirectoryNotEmpty (not yet
+            // stable in Rust stdlib, comes out as Other on some versions)
+            // which maps to NFS3ERR_IO. That's the best we can do without
+            // protocol-specific plumbing.
+            std::fs::remove_dir(&abs).map_err(io_to_nfsstat)?;
+        } else {
+            std::fs::remove_file(&abs).map_err(io_to_nfsstat)?;
+        }
+
+        if fh != 0 {
+            self.cache.forget_path(&child_rel, fh);
+        }
+
+        log::debug!(
+            "[nfs-server] {}: removed {} {} (fh={})",
+            self.domain,
+            if is_dir { "dir" } else { "file" },
+            child_rel,
+            fh
+        );
+        Ok(())
     }
 
     async fn rename(

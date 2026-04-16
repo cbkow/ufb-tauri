@@ -994,6 +994,21 @@ impl MacosCache {
             });
     }
 
+    /// Remove a path from the cache. Deletes its row from `known_files`
+    /// (its fh becomes permanently `NFS3ERR_STALE` — AUTOINCREMENT never
+    /// reuses it) and deletes the on-disk cache file if present. Used by
+    /// NFS REMOVE / RMDIR after the NAS-side delete succeeds.
+    pub fn forget_path(&self, path: &str, fh: u64) {
+        {
+            let conn = self.conn();
+            let _ = conn
+                .prepare_cached("DELETE FROM known_files WHERE path = ?1")
+                .map(|mut stmt| stmt.execute(params![path]));
+        }
+        let cache_path = self.cache_file_path(fh);
+        let _ = std::fs::remove_file(&cache_path);
+    }
+
     /// Invalidate the content cache for a file — clears `is_hydrated`, drops
     /// the chunk bitmap, and deletes the on-disk cache file. Metadata rows
     /// (size, mtime, fh) are left untouched; callers should follow up with
