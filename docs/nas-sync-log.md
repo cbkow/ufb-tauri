@@ -3203,6 +3203,14 @@ drives caching. If the partial-cache pattern isn't enough (e.g. user
 wants to go offline after "touching" a file to mark it), a background
 filler can layer on later.
 
+**Also not doing (added 2026-04-16):** mesh sync integration for the
+NFS/filesystem layer. See `docs/nfs-loopback-plan.md` Phase 4
+non-goal section. TL;DR — the existing mesh sync is for UI metadata
+only and isn't production-robust enough to carry filesystem state.
+Peer block fetch across the mesh would be a team-scale win on paper,
+but we'd be piling distributed-systems edge cases on top of a still-
+maturing mesh layer. Revisit only if real multi-user LAN pain appears.
+
 Full design in `docs/nfs-loopback-plan.md`. Next work item: schema
 migration + block-level read path.
 

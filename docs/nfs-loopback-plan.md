@@ -251,8 +251,28 @@ gets conflict-sidecar behavior we already have.
 - Clean shutdown: unmount NFS mount before exit (so mount doesn't linger).
 - Integration with existing freshness sweep: invalidates SQLite rows,
   triggers poll.
-- Mesh sync integration: existing protocol propagates `known_files`
-  changes; NFS server just reads local SQLite.
+
+### Explicit non-goal: mesh sync integration for the NFS layer
+
+Considered and rejected. The existing mesh sync (UI-facing metadata
+edits — subscriptions, column defs, item_metadata) is not battle-
+hardened enough to carry filesystem cache state without inviting a
+new class of crash/recovery edge cases. Propagating `known_files`
+diffs or peer-to-peer block fetches across the mesh sounds like a
+team-scale performance win on paper, but the reality is:
+
+- Solo-user scenarios gain nothing.
+- Small-team overlapping-workflow scenarios gain something (peer
+  block fetch for large files is genuinely useful there), but the
+  value doesn't justify spending weeks on a distributed-systems layer
+  atop a mesh implementation that's still finding its sea legs.
+- Every new cross-node write path is a new failure mode — partial
+  update during peer crash, conflict between mesh-propagated state
+  and local enumeration, staleness from an offline peer.
+
+If real multi-user LAN pain shows up later, revisit. For now the
+per-node cache + NAS is the source of truth and peers don't talk
+about filesystem state.
 
 **Exit criteria:** 1-week burn-in on one workstation. No crashes.
 All tools in the user's media workflow function correctly.
