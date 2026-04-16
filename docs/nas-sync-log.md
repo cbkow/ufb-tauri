@@ -3208,6 +3208,74 @@ migration + block-level read path.
 
 ---
 
+## 2026-04-16 — Phase 3 slices 1 + 2 + 2.5 + FileProvider divorce
+
+Phase 3 real-work day. Three slices landed.
+
+### Slice 1 (committed 8af1f91)
+- `SharedCaches` type: `Arc<RwLock<HashMap<String, Arc<MacosCache>>>>`
+  shared between `fileops_server` and `nfs_server` so each domain has
+  exactly one `MacosCache` on the same DB file. Fixed #40 (duplicate
+  cache files from two instances racing at startup).
+- SETATTR honors truncate (editor save pattern); other fields no-op.
+- WRITE proxies to SMB authoritatively, invalidates cache row.
+- `VFSCapabilities::ReadWrite` flipped on.
+
+### Slice 2 (committed 6077f94)
+- CREATE / CREATE_EXCLUSIVE / MKDIR write-through to SMB + register
+  entry via `record_new_entry` (single-row insert, no orphan scan).
+- Stable NFS handle encoding: override `id_to_fh` / `fh_to_id` so the
+  opaque handle doesn't include the server-startup generation. Clients
+  don't need `umount`/`mount` after an agent restart.
+
+### Slice 2.5 (this commit)
+- **Rowid-as-fh refactor.** `known_files.fh INTEGER PRIMARY KEY
+  AUTOINCREMENT` replaces the separate `nfs_handles` table + trigger.
+  `path` becomes `UNIQUE` (not `PRIMARY KEY`). All `INSERT OR REPLACE`
+  sites converted to `INSERT ... ON CONFLICT(path) DO UPDATE SET ...`
+  so the `fh` stays stable under re-enumeration (UPSERT updates in
+  place, no delete-then-insert cycle). One source of truth eliminates
+  a whole class of "why did this row vanish" questions.
+- **Self-reference orphan-scan fix.** The share root stores path='',
+  parent_path='' (it's its own parent). `record_enumeration`'s orphan
+  scan `WHERE parent_path = ?1` was matching root as a "child of root",
+  finding it not in the current enumeration, and deleting it. Added
+  `AND path != parent_path` to the scan so root can't orphan itself.
+- **FileProvider divorce for development.** With `UFB_ENABLE_NFS=1`
+  now also skip `fileops_server` startup entirely. The FP extension
+  running in parallel was hammering the shared DB from the extension
+  side — `record_enumeration` + orphan scans racing our NFS writes.
+  With FileOps off, only NFS touches the DB. Bug reproduction became
+  deterministic.
+
+### Validation
+
+On a clean DB with NFS-only mode and the mount kept live across an
+agent restart:
+- `mkdir z_CBtemp/clean_test` → appears on SMB
+- `echo "line 1" > .../notes.txt` → readable via `cat`
+- Restart agent (Ctrl-C + re-launch). No `umount`/`mount`.
+- `cat .../notes.txt` → "line 1"
+- `echo "line 3" >> .../notes.txt` → appends correctly
+- `cat` shows lines 1, 2, 3. `ls` works. No STALE warnings.
+
+### Remaining Phase 3 work
+
+- Slice 3: REMOVE / RMDIR (delete semantics — when a file deletes, its
+  `fh` row stays in known_files so clients get `NFS3ERR_STALE`, not
+  reuse of the fh for an unrelated new file).
+- Slice 4: RENAME — the fh-preserving path swap (update path, keep fh).
+- Slice 5: Conflict detection hookup on the write path.
+
+### Auto-mount / symlink repointing (not yet)
+
+Still manual `mount -t nfs -o ... localhost:/<share> ~/ufb/vfs/<share>`.
+Auto-mount on agent startup + unmount on shutdown is a Phase 3.5 item.
+The `~/ufb/mounts/<share>` symlink still points at the CloudStorage
+FileProvider path and will be repointed in Phase 5 cutover.
+
+---
+
 ## 2026-04-15 — NFS Phase 2 complete + Phase 3 slice 1
 
 Phase 2 landed as commit `740681a`. Live-tested with the 8 GB Resolve

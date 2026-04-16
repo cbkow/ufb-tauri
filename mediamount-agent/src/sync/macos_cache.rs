@@ -132,12 +132,19 @@ impl MacosCache {
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS known_files (
-                    path TEXT PRIMARY KEY,
+                    fh INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
                     name TEXT NOT NULL,
                     is_dir INTEGER NOT NULL DEFAULT 0,
                     nas_size INTEGER NOT NULL,
                     nas_mtime REAL NOT NULL,
-                    nas_created REAL NOT NULL DEFAULT 0
+                    nas_created REAL NOT NULL DEFAULT 0,
+                    is_hydrated INTEGER NOT NULL DEFAULT 0,
+                    hydrated_size INTEGER DEFAULT 0,
+                    last_accessed REAL DEFAULT 0,
+                    last_verified_at REAL DEFAULT 0,
+                    parent_path TEXT NOT NULL DEFAULT '',
+                    chunk_bitmap BLOB DEFAULT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS visited_folders (
@@ -214,24 +221,84 @@ impl MacosCache {
                  CREATE INDEX IF NOT EXISTS idx_parent_path ON known_files(parent_path);",
             );
 
-            // NFS file handles — stable 64-bit ids that never get reused.
-            // `fh` via AUTOINCREMENT (SQLite guarantees monotonically-increasing,
-            // non-reused rowids). The root directory is assigned fh=1 via the
-            // first insert. Triggers keep this table in lock-step with
-            // known_files so every cached file/dir has a handle automatically.
-            let _ = conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS nfs_handles (
-                     fh INTEGER PRIMARY KEY AUTOINCREMENT,
-                     path TEXT NOT NULL UNIQUE
-                 );
-                 INSERT OR IGNORE INTO nfs_handles (path) VALUES ('');
-                 INSERT OR IGNORE INTO nfs_handles (path) SELECT path FROM known_files;
-                 CREATE TRIGGER IF NOT EXISTS nfs_handles_insert
-                     AFTER INSERT ON known_files
-                 BEGIN
-                     INSERT OR IGNORE INTO nfs_handles (path) VALUES (NEW.path);
-                 END;",
-            );
+            // Phase 3 slice 2.5: fh lives directly on known_files instead of a
+            // separate nfs_handles table. Reasons:
+            //   - Two tables meant two places where rows could go out of sync;
+            //     repeatedly observed nfs_handles rows vanishing despite no
+            //     explicit DELETE in the code (fireworks from INSERT OR
+            //     REPLACE + trigger interactions).
+            //   - Switching the main upserts from INSERT OR REPLACE (delete +
+            //     re-insert) to INSERT ... ON CONFLICT(path) DO UPDATE (update
+            //     in place) keeps the rowid/fh stable under re-enumeration.
+            //   - One source of truth, simpler to reason about.
+            //
+            // Migration detects the old schema (path TEXT PRIMARY KEY with no
+            // fh column) and rewrites the table in one transaction. Fh values
+            // are re-assigned by AUTOINCREMENT — client-cached handles from
+            // before the migration become STALE (one final umount/remount).
+            let has_fh: bool = conn
+                .prepare("SELECT fh FROM known_files LIMIT 0")
+                .is_ok();
+            if !has_fh {
+                log::info!("[macos-cache] Migrating: known_files fh INTEGER PRIMARY KEY + drop nfs_handles");
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("migration tx failed: {}", e))?;
+                tx.execute_batch(
+                    "DROP TRIGGER IF EXISTS nfs_handles_insert;
+                     ALTER TABLE known_files RENAME TO known_files_old;
+                     CREATE TABLE known_files (
+                         fh INTEGER PRIMARY KEY AUTOINCREMENT,
+                         path TEXT NOT NULL UNIQUE,
+                         name TEXT NOT NULL,
+                         is_dir INTEGER NOT NULL DEFAULT 0,
+                         nas_size INTEGER NOT NULL,
+                         nas_mtime REAL NOT NULL,
+                         nas_created REAL NOT NULL DEFAULT 0,
+                         is_hydrated INTEGER NOT NULL DEFAULT 0,
+                         hydrated_size INTEGER DEFAULT 0,
+                         last_accessed REAL DEFAULT 0,
+                         last_verified_at REAL DEFAULT 0,
+                         parent_path TEXT NOT NULL DEFAULT '',
+                         chunk_bitmap BLOB DEFAULT NULL
+                     );
+                     -- Reserve fh=1 for the share root.
+                     INSERT INTO known_files (fh, path, name, is_dir, nas_size, nas_mtime, parent_path)
+                     VALUES (1, '', '', 1, 0, 0, '');
+                     INSERT INTO known_files
+                         (path, name, is_dir, nas_size, nas_mtime, nas_created,
+                          is_hydrated, hydrated_size, last_accessed, last_verified_at,
+                          parent_path)
+                     SELECT path, name, is_dir, nas_size, nas_mtime, nas_created,
+                            COALESCE(is_hydrated, 0),
+                            COALESCE(hydrated_size, 0),
+                            COALESCE(last_accessed, 0),
+                            COALESCE(last_verified_at, 0),
+                            COALESCE(parent_path, '')
+                     FROM known_files_old
+                     WHERE path != '';
+                     DROP TABLE known_files_old;
+                     DROP TABLE IF EXISTS nfs_handles;
+                     CREATE INDEX IF NOT EXISTS idx_hydrated ON known_files(is_hydrated);
+                     CREATE INDEX IF NOT EXISTS idx_accessed ON known_files(last_accessed);
+                     CREATE INDEX IF NOT EXISTS idx_parent_path ON known_files(parent_path);",
+                )
+                .map_err(|e| format!("migration schema rewrite failed: {}", e))?;
+                tx.commit()
+                    .map_err(|e| format!("migration commit failed: {}", e))?;
+            } else {
+                // Already-new schema on a fresh DB: make sure root row exists.
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO known_files (fh, path, name, is_dir, nas_size, nas_mtime, parent_path)
+                     VALUES (1, '', '', 1, 0, 0, '')",
+                    [],
+                );
+                // And tidy up any leftover nfs_handles from a partial upgrade.
+                let _ = conn.execute_batch(
+                    "DROP TRIGGER IF EXISTS nfs_handles_insert;
+                     DROP TABLE IF EXISTS nfs_handles;",
+                );
+            }
 
             // Block-level content cache bitmap (Phase 2).
             // One bit per 1 MiB chunk, NULL until any chunk is cached.
@@ -324,9 +391,16 @@ impl MacosCache {
                     .expect("prepare stmt_select");
                 let mut stmt_upsert = tx
                     .prepare_cached(
-                        "INSERT OR REPLACE INTO known_files
+                        "INSERT INTO known_files
                              (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(path) DO UPDATE SET
+                             name = excluded.name,
+                             is_dir = excluded.is_dir,
+                             nas_size = excluded.nas_size,
+                             nas_mtime = excluded.nas_mtime,
+                             nas_created = excluded.nas_created,
+                             parent_path = excluded.parent_path",
                     )
                     .expect("prepare stmt_upsert");
 
@@ -365,10 +439,18 @@ impl MacosCache {
                 }
             }
 
-            // Orphan detection + deletion — indexed equality lookup on parent_path.
+            // Orphan detection + deletion — indexed equality lookup on
+            // parent_path. The `path != parent_path` filter excludes the
+            // self-reference case: the share root has path='' AND
+            // parent_path='' (it's its own parent semantically), which
+            // would otherwise flag root as an orphan and delete it
+            // whenever we enumerate the share root.
             let orphans: Vec<String> = {
                 let mut stmt_scan = tx
-                    .prepare_cached("SELECT path FROM known_files WHERE parent_path = ?1")
+                    .prepare_cached(
+                        "SELECT path FROM known_files
+                         WHERE parent_path = ?1 AND path != parent_path",
+                    )
                     .expect("prepare stmt_scan");
                 stmt_scan
                     .query_map(params![relative_path], |row| row.get(0))
@@ -576,9 +658,16 @@ impl MacosCache {
             {
                 let mut upsert = tx
                     .prepare_cached(
-                        "INSERT OR REPLACE INTO known_files
+                        "INSERT INTO known_files
                              (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(path) DO UPDATE SET
+                             name = excluded.name,
+                             is_dir = excluded.is_dir,
+                             nas_size = excluded.nas_size,
+                             nas_mtime = excluded.nas_mtime,
+                             nas_created = excluded.nas_created,
+                             parent_path = excluded.parent_path",
                     )
                     .ok();
                 if let Some(stmt) = upsert.as_mut() {
@@ -637,9 +726,16 @@ impl MacosCache {
         let parent = parent_of(relative_path).to_string();
         let _ = conn
             .prepare_cached(
-                "INSERT OR REPLACE INTO known_files
+                "INSERT INTO known_files
                      (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                     name = excluded.name,
+                     is_dir = excluded.is_dir,
+                     nas_size = excluded.nas_size,
+                     nas_mtime = excluded.nas_mtime,
+                     nas_created = excluded.nas_created,
+                     parent_path = excluded.parent_path"
             )
             .map(|mut stmt| {
                 stmt.execute(params![
@@ -855,11 +951,12 @@ impl MacosCache {
             .map(|mut stmt| stmt.execute(params![bitmap, now, path]));
     }
 
-    /// Insert (or replace) a single entry into `known_files`. The AFTER
-    /// INSERT trigger mirrors the new path into `nfs_handles` and assigns
-    /// an `fh`. Used by NFS CREATE / MKDIR to register a freshly-created
-    /// file or folder without running `record_enumeration`'s orphan-scan
-    /// against the parent (which would erase sibling rows).
+    /// Insert (or update) a single entry in `known_files`. On first insert
+    /// AUTOINCREMENT assigns an `fh`; on conflict we UPDATE in place so the
+    /// `fh` stays stable (critical for NFS — client-cached handles for this
+    /// path keep working). Used by NFS CREATE / MKDIR to register a
+    /// freshly-created file or folder without running `record_enumeration`'s
+    /// orphan-scan against the parent (which would erase sibling rows).
     pub fn record_new_entry(
         &self,
         relative_path: &str,
@@ -873,9 +970,16 @@ impl MacosCache {
         let conn = self.conn();
         let _ = conn
             .prepare_cached(
-                "INSERT OR REPLACE INTO known_files
+                "INSERT INTO known_files
                      (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                     name = excluded.name,
+                     is_dir = excluded.is_dir,
+                     nas_size = excluded.nas_size,
+                     nas_mtime = excluded.nas_mtime,
+                     nas_created = excluded.nas_created,
+                     parent_path = excluded.parent_path",
             )
             .map(|mut stmt| {
                 stmt.execute(params![
@@ -953,16 +1057,16 @@ impl MacosCache {
     /// Returns `None` if the path has never been indexed.
     pub fn fh_for_path(&self, path: &str) -> Option<u64> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached("SELECT fh FROM nfs_handles WHERE path = ?1").ok()?;
+        let mut stmt = conn.prepare_cached("SELECT fh FROM known_files WHERE path = ?1").ok()?;
         stmt.query_row(params![path], |row| row.get::<_, i64>(0))
             .ok()
             .map(|v| v as u64)
     }
 
-    /// Diagnostic: total number of nfs_handles rows.
+    /// Diagnostic: total number of known_files rows (one per cached path).
     pub fn nfs_handles_count(&self) -> i64 {
         let conn = self.conn();
-        conn.prepare_cached("SELECT COUNT(*) FROM nfs_handles")
+        conn.prepare_cached("SELECT COUNT(*) FROM known_files")
             .ok()
             .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok())
             .unwrap_or(-1)
@@ -971,20 +1075,26 @@ impl MacosCache {
     /// Reverse lookup: path for an NFS file handle.
     pub fn path_for_fh(&self, fh: u64) -> Option<String> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached("SELECT path FROM nfs_handles WHERE fh = ?1").ok()?;
+        let mut stmt = conn.prepare_cached("SELECT path FROM known_files WHERE fh = ?1").ok()?;
         stmt.query_row(params![fh as i64], |row| row.get::<_, String>(0)).ok()
     }
 
-    /// Ensure a handle exists for `path`, returning its fh. Triggered on first
-    /// NFS lookup of a path we haven't recorded in `known_files` yet (e.g. the
-    /// share root itself, or a freshly cold-path-enumerated child).
+    /// Ensure a handle exists for `path`, returning its fh. On first insert
+    /// AUTOINCREMENT assigns an `fh`; on conflict the row is left untouched.
+    /// Used for the share root at server startup (so fh=1 is always reserved).
     pub fn ensure_fh(&self, path: &str) -> Option<u64> {
         {
             let conn = self.conn();
+            let parent = parent_of(path).to_string();
             let mut stmt = conn
-                .prepare_cached("INSERT OR IGNORE INTO nfs_handles (path) VALUES (?1)")
+                .prepare_cached(
+                    "INSERT INTO known_files
+                         (path, name, is_dir, nas_size, nas_mtime, parent_path)
+                     VALUES (?1, ?2, 1, 0, 0, ?3)
+                     ON CONFLICT(path) DO NOTHING",
+                )
                 .ok()?;
-            let _ = stmt.execute(params![path]);
+            let _ = stmt.execute(params![path, path, parent]);
         }
         self.fh_for_path(path)
     }
@@ -1018,11 +1128,10 @@ impl MacosCache {
     pub fn cached_children(&self, parent_path: &str) -> Vec<(u64, String, CachedAttr)> {
         let conn = self.conn();
         conn.prepare_cached(
-            "SELECT h.fh, k.name, k.is_dir, k.nas_size, k.nas_mtime, k.nas_created,
-                    k.is_hydrated, k.hydrated_size
-             FROM known_files k
-             JOIN nfs_handles h ON h.path = k.path
-             WHERE k.parent_path = ?1",
+            "SELECT fh, name, is_dir, nas_size, nas_mtime, nas_created,
+                    is_hydrated, hydrated_size
+             FROM known_files
+             WHERE parent_path = ?1 AND path != ''",
         )
         .ok()
         .and_then(|mut stmt| {

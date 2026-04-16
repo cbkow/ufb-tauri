@@ -260,13 +260,28 @@ async fn run_event_loop() {
         // Start file operations server for FileProvider extension (macOS only).
         // It uses the same agent→UFB channel to emit out-of-band events such
         // as conflict-detected notifications.
+        //
+        // When UFB_ENABLE_NFS=1 we skip fileops startup entirely — the NFS
+        // loopback is the sole user-facing surface, and keeping FileProvider
+        // active in parallel causes it to hammer the shared cache DB from
+        // the extension side, stepping on our NFS writes. (Phase 3 debug:
+        // the FP extension's record_enumeration + orphan scans were racing
+        // our NFS handler writes and producing "disappearing row" symptoms.)
         #[cfg(target_os = "macos")]
-        ipc::fileops_server::FileOpsServer::start(
-            state_tx.clone(),
-            std::sync::Arc::clone(&config_cache),
-            std::sync::Arc::clone(&canonical_bases),
-            std::sync::Arc::clone(&shared_caches),
-        );
+        let nfs_enabled = std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1");
+        #[cfg(target_os = "macos")]
+        if !nfs_enabled {
+            ipc::fileops_server::FileOpsServer::start(
+                state_tx.clone(),
+                std::sync::Arc::clone(&config_cache),
+                std::sync::Arc::clone(&canonical_bases),
+                std::sync::Arc::clone(&shared_caches),
+            );
+        } else {
+            log::info!(
+                "[FileOps] Skipped — UFB_ENABLE_NFS=1 is set; NFS loopback is the sole file-serving surface"
+            );
+        }
 
         // Tray receives a copy of state updates
         let (tray_state_tx, tray_state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(64);
@@ -280,10 +295,10 @@ async fn run_event_loop() {
         mount_service.start_from_config().await;
 
         // Start NFS loopback servers (macOS only). One per sync-enabled mount.
-        // Gated behind UFB_ENABLE_NFS=1 while we're still in Phase 1 — the
-        // FileProvider path remains the default user-facing mount.
+        // Gated behind UFB_ENABLE_NFS=1 — when set, NFS replaces FileProvider
+        // as the user-facing surface (see earlier fileops gate).
         #[cfg(target_os = "macos")]
-        if std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1") {
+        if nfs_enabled {
             let config_for_nfs = std::sync::Arc::clone(&config_cache);
             let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
             tokio::spawn(async move {
