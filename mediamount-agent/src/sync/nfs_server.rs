@@ -468,9 +468,18 @@ impl PassthroughFs {
                 if n < fetch_len {
                     buf.truncate(n);
                 }
-                cache_file
-                    .write_at(&buf, fetch_start)
-                    .map_err(io_to_nfsstat)?;
+                // Skip writing runs of zeros — the cache file was created
+                // sparse (set_len without any writes), so leaving a range
+                // unwritten means pread at that offset returns zeros too.
+                // Matters for media workflow files (ProRes, some MOV, DPX)
+                // that have large zero-padded regions; without this we'd
+                // materialize those holes and balloon the cache file's
+                // on-disk size for no benefit.
+                if !is_all_zeros(&buf) {
+                    cache_file
+                        .write_at(&buf, fetch_start)
+                        .map_err(io_to_nfsstat)?;
+                }
                 for c in chunk..=run_end {
                     macos_cache::set_bit(&mut bitmap, c);
                 }
@@ -513,6 +522,22 @@ fn bit_unset(bitmap: &mut [u8], chunk: u64) {
     }
 }
 
+/// True if every byte in `buf` is 0. Fast path for keeping the cache
+/// file sparse when the fetched chunk is all zeros (common in padded
+/// media containers).
+#[inline]
+fn is_all_zeros(buf: &[u8]) -> bool {
+    // Chunk-wise compare is faster than byte-wise in release builds —
+    // the compiler autovectorizes the `iter().all` too, but explicit
+    // 8-byte windows matches what a manual SIMD version would do and
+    // is unambiguous.
+    const STRIDE: usize = 8;
+    let chunks = buf.chunks_exact(STRIDE);
+    let remainder = chunks.remainder();
+    chunks.map(|c| u64::from_ne_bytes(c.try_into().unwrap())).all(|w| w == 0)
+        && remainder.iter().all(|&b| b == 0)
+}
+
 /// Convert a `CachedAttr` + fh into an `fattr3`. Used for all non-root entries.
 fn attr_from_cache(fh: fileid3, a: &CachedAttr) -> fattr3 {
     let ftype = if a.is_dir { ftype3::NF3DIR } else { ftype3::NF3REG };
@@ -544,6 +569,13 @@ fn attr_from_cache(fh: fileid3, a: &CachedAttr) -> fattr3 {
     }
 }
 
+/// Map a Rust `io::Error` onto the closest NFS3 status code.
+///
+/// Transient NAS errors (timeouts, refused connections, unexpected EOF)
+/// map to `NFS3ERR_JUKEBOX` — the NFS "please retry shortly" signal —
+/// rather than opaque `NFS3ERR_IO`. Clients back off and try again
+/// instead of failing the op outright, which is the right behaviour
+/// when the NAS link is flaky but probably-coming-back.
 fn io_to_nfsstat(e: std::io::Error) -> nfsstat3 {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -551,7 +583,35 @@ fn io_to_nfsstat(e: std::io::Error) -> nfsstat3 {
         PermissionDenied => nfsstat3::NFS3ERR_ACCES,
         AlreadyExists => nfsstat3::NFS3ERR_EXIST,
         DirectoryNotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
-        _ => nfsstat3::NFS3ERR_IO,
+        InvalidInput | InvalidData => nfsstat3::NFS3ERR_INVAL,
+        // Anything that looks like "NAS is flaky, try me again later."
+        // Clients interpret JUKEBOX as a transient error and retry after
+        // a short backoff — way better UX than a hard IO failure.
+        TimedOut
+        | WouldBlock
+        | ConnectionRefused
+        | ConnectionReset
+        | ConnectionAborted
+        | NotConnected
+        | BrokenPipe
+        | UnexpectedEof => nfsstat3::NFS3ERR_JUKEBOX,
+        // Disk full — NFS3 has a specific code for this.
+        Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
+        _ => {
+            // Special-case ENOSPC — its ErrorKind is `Other` in stable
+            // stdlib (the stable `StorageFull` variant isn't exposed yet),
+            // so we squint at the raw_os_error.
+            if let Some(code) = e.raw_os_error() {
+                match code {
+                    28 /* ENOSPC */ => return nfsstat3::NFS3ERR_NOSPC,
+                    30 /* EROFS */  => return nfsstat3::NFS3ERR_ROFS,
+                    63 /* ENAMETOOLONG */ => return nfsstat3::NFS3ERR_NAMETOOLONG,
+                    69 /* EDQUOT */ => return nfsstat3::NFS3ERR_DQUOT,
+                    _ => {}
+                }
+            }
+            nfsstat3::NFS3ERR_IO
+        }
     }
 }
 
