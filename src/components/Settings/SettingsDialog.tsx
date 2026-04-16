@@ -1115,9 +1115,7 @@ function MountsSection(props: {
                 </p>
                 <Show when={props.platform() === "mac"}>
                   <p class="settings-hint" style={{ "margin-top": "0", "margin-bottom": "var(--spacing-sm)", opacity: 0.7 }}>
-                    {mountStore.mode === "nfs"
-                      ? "Mounted at ~/ufb/mounts/<share> via NFS loopback. Cache managed by the agent."
-                      : 'Appears in Finder sidebar under "UFB". Cache managed by macOS FileProvider.'}
+                    Mounted at ~/ufb/mounts/&lt;share&gt; via NFS loopback. Cache managed by the agent.
                   </p>
                 </Show>
 

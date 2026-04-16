@@ -1,24 +1,22 @@
 import SwiftUI
-import FileProvider
 
 /// Minimal MenuBarExtra app that shows mount status from the mediamount-agent.
-/// Communicates with the Rust agent via Unix domain socket IPC.
-/// Also registers FileProvider domains for sync-enabled mounts.
+/// Communicates with the Rust agent via Unix domain socket IPC. Manages the
+/// Finder sidebar entries via `SidebarManager`; the FinderSync extension
+/// (separate target) paints hydration badges in Finder.
 @main
 struct MediaMountTrayApp: App {
     @StateObject private var agent = AgentConnection()
-    @StateObject private var domainManager = DomainManager()
     @StateObject private var sidebarManager = SidebarManager()
     private let agentProcess = AgentProcess()
 
     init() {
-        // In dev builds, force-reload the FileProvider extension to pick up new code.
-        // In production this isn't needed — macOS handles binary updates automatically.
-        #if DEBUG
-        reloadFileProviderExtension()
-        #endif
-
         agentProcess.start()
+
+        // One-shot: remove any FileProvider domains left over from a
+        // pre-Slice-5 install so they stop shadowing our NFS mounts in
+        // the Finder sidebar.
+        LegacyDomainCleanup.runOnce()
 
         // SidebarManager observes agent.$mounts via Combine once attached.
         // @StateObject isn't available during `init` (it's only valid inside
@@ -30,19 +28,6 @@ struct MediaMountTrayApp: App {
             sidebarRef.attach(to: agentRef)
         }
     }
-
-    #if DEBUG
-    private func reloadFileProviderExtension() {
-        let task = Process()
-        task.launchPath = "/usr/bin/killall"
-        task.arguments = ["fileproviderd"]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
-        NSLog("[MediaMountTray] Reloaded fileproviderd for dev build")
-    }
-    #endif
 
     var body: some Scene {
         MenuBarExtra {

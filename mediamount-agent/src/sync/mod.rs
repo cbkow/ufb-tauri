@@ -39,3 +39,11 @@ pub mod nfs_server;
 pub use macos_watcher::MacosNasWatcher;
 #[cfg(target_os = "macos")]
 pub use macos_cache::MacosCache;
+
+/// Per-domain cache map shared between main and the NFS server. Keyed by
+/// share name. Readers: NFS server startup, mount_service drain/stats.
+/// Writers: main, on first hydration of a new mount.
+#[cfg(target_os = "macos")]
+pub type SharedCaches = std::sync::Arc<
+    std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<MacosCache>>>,
+>;

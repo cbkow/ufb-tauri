@@ -99,6 +99,10 @@ impl Orchestrator {
                 event = self.event_rx.recv() => {
                     match event {
                         Some(MountEvent::ClearSyncCache) => {
+                            // macOS: UI now short-circuits via
+                            // mount_service::try_drain_nfs_cache before the
+                            // event reaches here. Only Windows (cloud-files
+                            // sync_root) still needs the orchestrator path.
                             #[cfg(windows)]
                             if let Some(ref sr) = self.sync_root {
                                 let (count, bytes) = sr.clear_cache();
@@ -107,11 +111,6 @@ impl Orchestrator {
                                     self.mount_id, count,
                                     bytes as f64 / (1024.0 * 1024.0)
                                 );
-                            }
-                            #[cfg(target_os = "macos")]
-                            if self.config.is_sync_mode() {
-                                log::info!("[{}] Clear cache requested — notifying extension", self.mount_id);
-                                crate::sync::macos_watcher::post_clear_cache_notification(&self.config.share_name());
                             }
                         }
                         Some(event) => {

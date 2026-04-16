@@ -5,11 +5,7 @@ import CoreServices
 
 /// Places UFB mount paths (`~/ufb/mounts/{shareName}`) in the user's Finder
 /// sidebar under Favorites. Replaces the first-class sidebar entry we lost
-/// when we stopped registering `NSFileProviderDomain` objects in NFS mode.
-///
-/// Only runs under `UFB_ENABLE_NFS=1`. When FileProvider is active the
-/// domain-registered entry under "Locations" is already there; a parallel
-/// Favorites entry would be a duplicate.
+/// when Slice 5 removed the `NSFileProviderDomain` registrations.
 ///
 /// LSSharedFileList* is formally deprecated since 10.11 but still works on
 /// Sonoma + Sequoia. No modern replacement exists for programmatic sidebar
@@ -21,15 +17,11 @@ class SidebarManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let configPath: URL
     private let mountsRoot: URL
-    /// Reconcile only under NFS mode — FileProvider's own sidebar entries
-    /// would collide otherwise.
-    private let enabled: Bool
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         configPath = home.appendingPathComponent(".local/share/ufb/mounts.json")
         mountsRoot = home.appendingPathComponent("ufb/mounts")
-        enabled = ProcessInfo.processInfo.environment["UFB_ENABLE_NFS"] == "1"
     }
 
     /// Wire up against the agent connection. Reconciles whenever the
@@ -37,10 +29,6 @@ class SidebarManager: ObservableObject {
     /// `mounts` array during a transient disconnect should not wipe our
     /// sidebar entries).
     func attach(to agent: AgentConnection) {
-        guard enabled else {
-            NSLog("[SidebarManager] Disabled (UFB_ENABLE_NFS != 1)")
-            return
-        }
         self.agent = agent
         agent.$mounts
             .combineLatest(agent.$connected)

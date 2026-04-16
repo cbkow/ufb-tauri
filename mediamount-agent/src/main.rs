@@ -238,50 +238,17 @@ async fn run_event_loop() {
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(128);
 
         // Shared config cache — loaded once at startup, refreshed when the
-        // config file changes (watcher below). FileOpsServer reads from this
-        // instead of hitting disk + JSON-parsing mounts.json on every handler.
+        // config file changes (watcher below). Reloaded into the NFS server
+        // + mount service on config change.
         let config_cache: std::sync::Arc<std::sync::RwLock<config::MountsConfig>> =
             std::sync::Arc::new(std::sync::RwLock::new(config::load_config()));
 
-        // Shared cache of canonicalized base paths per domain. Eliminates one
-        // of the two SMB `canonicalize()` round-trips per file op. Main clears
-        // this on config reload so mounts that moved are re-resolved.
-        let canonical_bases: std::sync::Arc<
-            std::sync::RwLock<std::collections::HashMap<String, std::path::PathBuf>>,
-        > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-
-        // Shared per-domain cache map — used by both the FileOps IPC server
-        // and the NFS loopback server (one MacosCache instance per DB file).
+        // Shared per-domain cache map — populated on NFS server startup,
+        // queried by mount_service for UI drain/stats.
         #[cfg(target_os = "macos")]
-        let shared_caches: ipc::fileops_server::SharedCaches = std::sync::Arc::new(
+        let shared_caches: sync::SharedCaches = std::sync::Arc::new(
             std::sync::RwLock::new(std::collections::HashMap::new()),
         );
-
-        // Start file operations server for FileProvider extension (macOS only).
-        // It uses the same agent→UFB channel to emit out-of-band events such
-        // as conflict-detected notifications.
-        //
-        // When UFB_ENABLE_NFS=1 we skip fileops startup entirely — the NFS
-        // loopback is the sole user-facing surface, and keeping FileProvider
-        // active in parallel causes it to hammer the shared cache DB from
-        // the extension side, stepping on our NFS writes. (Phase 3 debug:
-        // the FP extension's record_enumeration + orphan scans were racing
-        // our NFS handler writes and producing "disappearing row" symptoms.)
-        #[cfg(target_os = "macos")]
-        let nfs_enabled = std::env::var("UFB_ENABLE_NFS").ok().as_deref() == Some("1");
-        #[cfg(target_os = "macos")]
-        if !nfs_enabled {
-            ipc::fileops_server::FileOpsServer::start(
-                state_tx.clone(),
-                std::sync::Arc::clone(&config_cache),
-                std::sync::Arc::clone(&canonical_bases),
-                std::sync::Arc::clone(&shared_caches),
-            );
-        } else {
-            log::info!(
-                "[FileOps] Skipped — UFB_ENABLE_NFS=1 is set; NFS loopback is the sole file-serving surface"
-            );
-        }
 
         // Tray receives a copy of state updates
         let (tray_state_tx, tray_state_rx) = tokio::sync::mpsc::channel::<messages::AgentToUfb>(64);
@@ -300,10 +267,9 @@ async fn run_event_loop() {
         mount_service.start_from_config().await;
 
         // Start NFS loopback servers (macOS only). One per sync-enabled mount.
-        // Gated behind UFB_ENABLE_NFS=1 — when set, NFS replaces FileProvider
-        // as the user-facing surface (see earlier fileops gate).
+        // Unconditional on macOS after Slice 5 — no more FileProvider fallback.
         #[cfg(target_os = "macos")]
-        if nfs_enabled {
+        {
             let config_for_nfs = std::sync::Arc::clone(&config_cache);
             let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
             let ipc_tx_for_nfs = state_tx_for_nfs;
@@ -331,10 +297,10 @@ async fn run_event_loop() {
                     };
                     let share = mount.share_name();
 
-                    // Share a single MacosCache instance per domain with the
-                    // FileOps IPC server. Open on-demand and insert into the
-                    // shared map (fileops_server::ensure_cache uses the same
-                    // map, so either server populates and both see it).
+                    // One MacosCache per domain. Open on first use and share
+                    // the Arc with the UI drain/stats path (via
+                    // MountService::set_shared_caches) so only one DB
+                    // connection pool per mount lives in the process.
                     let cache = {
                         let mut caches = caches_for_nfs.write().unwrap();
                         if let Some(existing) = caches.get(&share).cloned() {
@@ -425,12 +391,7 @@ async fn run_event_loop() {
 
                 // Config file changed on disk
                 Some(()) = config_reload_rx.recv() => {
-                    // Refresh shared cache BEFORE mount_service reloads, so
-                    // any FileOpsServer handlers that race with the reload
-                    // see the new config. Also invalidate the canonical-base
-                    // cache — a mount path change would otherwise stick.
                     *config_cache.write().unwrap() = config::load_config();
-                    canonical_bases.write().unwrap().clear();
                     mount_service.reload_config().await;
                 }
 

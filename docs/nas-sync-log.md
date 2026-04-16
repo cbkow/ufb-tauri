@@ -3597,3 +3597,105 @@ sub-parts, landed together.
 **Verification.** xcodebuild clean (agent `cargo check`, src-tauri
 `cargo check`, xcodebuild Release all green). Both extensions
 embed in `UFB.app/Contents/PlugIns/`. Tracked in task #48.
+
+## 2026-04-16 — Slice 5: FileProvider removal
+
+The whole FileProvider scaffolding comes out. macOS is now NFS-only
+(as of this commit). Net deletion: ~2,500 LOC from both Swift and
+Rust. Ship target: **v0.4.1** — held shy of v0.5.0 because Windows
+still has to catch up to the NFS-loopback story (ProjFS port is on
+file but not scheduled).
+
+**Swift retired.**
+
+- `mediamount-tray/FileProviderExtension/` — entire directory, six
+  files, ~1,200 LOC: `FileProviderExtension.swift`,
+  `FileProviderEnumerator.swift`, `FileProviderItem.swift`,
+  `AgentFileOpsClient.swift`, `FileProviderExtension.entitlements`,
+  `Info.plist`.
+- `mediamount-tray/MediaMountTray/DomainManager.swift` (~150 LOC) —
+  the `NSFileProviderDomain` registrar. Its "neuter under NFS" bridge
+  code from Slice 4.5c was discarded along with it.
+- `import FileProvider` in `MediaMountTrayApp.swift`. Dev-mode
+  `killall fileproviderd` helper also gone (the extension that made
+  it necessary no longer exists).
+- `mediamount-tray/project.yml` — FileProviderExtension target block
+  removed. MediaMountTray now depends on FinderSync only.
+
+**New Swift: `LegacyDomainCleanup.swift`** (~45 LOC).
+
+Fires once per install from `MediaMountTrayApp.init`. Enumerates any
+`NSFileProviderDomain` objects previously registered by our bundle
+and removes each — `NSFileProviderManager.getDomainsWithCompletionHandler`
+is scoped by bundle id, so wholesale removal is safe. Flagged via
+`UserDefaults` so it doesn't run twice. Inherits the flag key from
+Slice 4.5c's bridge helper; users who upgrade through 4.5 have it
+already set, users who jump ≤0.4.0 → 0.4.1 directly hit it now.
+
+**Rust agent retired.**
+
+- `mediamount-agent/src/ipc/fileops_server.rs` — whole file, ~1,000
+  LOC. Deleted the `ipc::fileops_server` module declaration too.
+- `messages.rs` — `FileOpsRequest` enum + 10 request structs,
+  `FileOpsResponse` enum + 9 response structs, all gone. Kept
+  `DirEntry` (shared by NFS enumeration + cache record paths — not
+  FileProvider-specific despite its original home).
+- `macos_watcher::post_clear_cache_notification` — the Darwin-
+  notification posting helper the extension subscribed to. Deleted.
+- `orchestrator.rs::MountEvent::ClearSyncCache` macOS branch — used
+  to post the now-deleted notification. Windows branch (sync_root
+  Cloud Files `clear_cache`) retained; that code path is still live.
+- `macos_cache.rs`:
+  - `pending_evictions: Mutex<Vec<String>>` field + every call site
+    (`extend` in `record_enumeration`, `clear_all_hydrated`, and
+    `queue_eviction_if_hydrated`). Drain-time logging trimmed.
+  - `fn evict_if_over_budget` — FileProvider-era LRU scan that
+    queued path strings for the extension to drain. The NFS
+    evictor (`evict_over_budget_now`, Slice 3) fully supersedes it.
+  - `fn clear_all_hydrated` / `fn drain_pending_evictions` /
+    `fn queue_eviction_if_hydrated` / `fn hydrated_paths` — all
+    existed solely to feed FileProvider IPC responses.
+
+**Agent main.rs plumbing.**
+
+- `UFB_ENABLE_NFS` env var check + the `if !nfs_enabled { start
+  fileops }` gate — removed. NFS server starts unconditionally on
+  macOS.
+- `canonical_bases: Arc<RwLock<HashMap<...>>>` — an SMB-canonicalize
+  cache built for the fileops hot path. No remaining callers; removed.
+- `SharedCaches` type alias moved from `ipc::fileops_server::SharedCaches`
+  to `sync::SharedCaches` (where it semantically belongs now).
+
+**Frontend cleanup.**
+
+- `mountStore.getMountPath` — the `~/Library/CloudStorage/UFB-*`
+  branch for macOS sync mounts removed. Unified to
+  `~/ufb/mounts/{shareName}` regardless of `syncEnabled`. The
+  `mountStore.mode` field still exists (loaded from the agent's
+  `mount_get_mode` Tauri command) but no longer gates behavior —
+  kept for future diagnostics, low-value to tear out.
+- `SettingsDialog` — sync mode tooltip simplified to a single line
+  since there's no FileProvider path left to contrast with.
+
+**SidebarManager update.**
+
+Dropped the `UFB_ENABLE_NFS=1` gate — runs unconditionally on macOS
+now. It's the only producer of Finder sidebar entries for UFB mounts.
+
+**Signing scripts.** The `FinderSync.appex` entries added in Slice 4.5
+stay; the `FileProviderExtension.appex` signing blocks in
+`scripts/build-macos.sh` + `scripts/sign-and-notarize.sh` now match
+missing directories after the Slice 5 deletion — the `[ -d ... ]`
+guards make the blocks harmless no-ops, we can clean them up in a
+follow-up if anyone is bothered. (Scripts are gitignored, so this
+doesn't show in the commit diff.)
+
+**Version: v0.4.1.** Patch-level because Windows still needs to catch
+up to the NFS/ProjFS model before we signal a minor (v0.5.0) cutover
+to the outside world.
+
+**Verification.** Agent + src-tauri `cargo check` clean. xcodebuild
+Release succeeds with only `FinderSync.appex` embedded in
+`UFB.app/Contents/PlugIns/` (no more FileProvider). Frontend
+`tsc --noEmit` reports only the 7 pre-existing unused-import
+warnings. Tracked in task #47.

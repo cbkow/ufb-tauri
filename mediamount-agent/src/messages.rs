@@ -142,148 +142,17 @@ pub struct MountIdMsg {
     pub command_id: String,
 }
 
-// ── FileProvider Extension → Agent (file operations) ──
+// The `FileOpsRequest` / `FileOpsResponse` IPC surface (ListDir, Stat,
+// ReadFile, WriteFile, DeleteItem, RenameItem, ClearCache, EvictAll,
+// RecordEnumeration, GetChanges + their responses) existed solely to serve
+// the macOS FileProvider extension. Slice 5 retired that extension — the
+// NFS loopback server owns the macOS filesystem surface now, so these
+// types + `ipc/fileops_server.rs` + the Swift FileProviderExtension
+// target were all removed together.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FileOpsRequest {
-    ListDir(ListDirReq),
-    Stat(StatReq),
-    ReadFile(ReadFileReq),
-    WriteFile(WriteFileReq),
-    DeleteItem(DeleteItemReq),
-    RenameItem(RenameItemReq),
-    RecordEnumeration(RecordEnumerationReq),
-    GetChanges(GetChangesReq),
-    ClearCache(ClearCacheReq),
-    /// List currently-hydrated relative paths for a domain. Cheap DB query
-    /// (no NAS I/O) — used by the extension's clear-cache flow to drive
-    /// `evictItem` calls without going through `ListDir`.
-    EvictAll(EvictAllReq),
-    Ping,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListDirReq {
-    pub request_id: String,
-    /// The FileProvider domain / share name (e.g., "test1")
-    pub domain: String,
-    /// Path relative to the share root (e.g., "project/assets"). Empty string = root.
-    pub relative_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatReq {
-    pub request_id: String,
-    pub domain: String,
-    pub relative_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadFileReq {
-    pub request_id: String,
-    pub domain: String,
-    pub relative_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WriteFileReq {
-    pub request_id: String,
-    pub domain: String,
-    /// Destination path relative to share root (e.g., "project/new_file.txt")
-    pub relative_path: String,
-    /// Path to the source file in the app group container (written by the extension)
-    pub source_path: String,
-    /// True if this is a directory creation (no source file)
-    #[serde(default)]
-    pub is_dir: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteItemReq {
-    pub request_id: String,
-    pub domain: String,
-    pub relative_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenameItemReq {
-    pub request_id: String,
-    pub domain: String,
-    pub old_path: String,
-    pub new_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClearCacheReq {
-    pub request_id: String,
-    pub domain: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvictAllReq {
-    pub request_id: String,
-    pub domain: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordEnumerationReq {
-    pub request_id: String,
-    pub domain: String,
-    pub relative_path: String,
-    pub entries: Vec<DirEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetChangesReq {
-    pub request_id: String,
-    pub domain: String,
-    pub since_anchor: String,
-}
-
-// ── Agent → FileProvider Extension (file operation responses) ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FileOpsResponse {
-    DirListing(DirListingResp),
-    FileStat(FileStatResp),
-    FileReady(FileReadyResp),
-    WriteOk(WriteOkResp),
-    DeleteOk(DeleteOkResp),
-    RenameOk(RenameOkResp),
-    RecordOk(RecordOkResp),
-    Changes(ChangesResp),
-    EvictList(EvictListResp),
-    Error(FileOpsErrorResp),
-    Pong,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EvictListResp {
-    pub request_id: String,
-    /// Relative paths of currently-hydrated files in the domain.
-    pub paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirListingResp {
-    pub request_id: String,
-    pub entries: Vec<DirEntry>,
-}
-
+/// A single directory entry. Shared by NFS enumeration + cache record
+/// paths; originally lived in the FileOps IPC surface but survived the
+/// retirement because both sides of the cache/NFS boundary consume it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntry {
@@ -293,85 +162,6 @@ pub struct DirEntry {
     /// Seconds since Unix epoch
     pub modified: f64,
     /// Seconds since Unix epoch
-    pub created: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileStatResp {
-    pub request_id: String,
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: f64,
-    pub created: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileReadyResp {
-    pub request_id: String,
-    /// Path to the temp file in the app group container
-    pub temp_path: String,
-    pub size: u64,
-    pub modified: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WriteOkResp {
-    pub request_id: String,
-    pub size: u64,
-    pub modified: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteOkResp {
-    pub request_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileOpsErrorResp {
-    pub request_id: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenameOkResp {
-    pub request_id: String,
-    pub new_path: String,
-    pub size: u64,
-    pub modified: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordOkResp {
-    pub request_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChangesResp {
-    pub request_id: String,
-    pub updated: Vec<ChangedEntry>,
-    pub deleted: Vec<String>,
-    #[serde(default)]
-    pub evict: Vec<String>,
-    pub new_anchor: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChangedEntry {
-    pub relative_path: String,
-    pub name: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub modified: f64,
     pub created: f64,
 }
 

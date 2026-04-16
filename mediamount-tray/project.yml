@@ -27,28 +27,7 @@ targets:
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 5Z4S9VHV56
     dependencies:
-      - target: FileProviderExtension
       - target: FinderSync
-
-  FileProviderExtension:
-    type: app-extension
-    platform: macOS
-    sources:
-      - path: FileProviderExtension
-    settings:
-      base:
-        INFOPLIST_FILE: FileProviderExtension/Info.plist
-        CODE_SIGN_ENTITLEMENTS: FileProviderExtension/FileProviderExtension.entitlements
-        PRODUCT_BUNDLE_IDENTIFIER: com.unionfiles.mediamount-tray.FileProvider
-        PRODUCT_NAME: FileProviderExtension
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: 5Z4S9VHV56
-        LD_RUNPATH_SEARCH_PATHS:
-          - "$(inherited)"
-          - "@executable_path/../Frameworks"
-          - "@executable_path/../../../../Frameworks"
-    frameworks:
-      - sdk: FileProvider.framework
 
   FinderSync:
     type: app-extension

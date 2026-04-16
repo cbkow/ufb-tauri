@@ -328,38 +328,6 @@ pub(crate) fn post_darwin_notification(domain: &str) {
     }
 }
 
-/// Post a "clear cache" notification for a domain.
-/// The extension will evict all materialized files.
-pub fn post_clear_cache_notification(domain: &str) {
-    let name = format!("com.unionfiles.ufb.clear-cache.{}", domain);
-    log::info!("[macos-watcher] Posting clear cache notification: {}", name);
-
-    extern "C" {
-        fn CFNotificationCenterGetDistributedCenter() -> *const std::ffi::c_void;
-        fn CFNotificationCenterPostNotification(
-            center: *const std::ffi::c_void,
-            name: *const std::ffi::c_void,
-            object: *const std::ffi::c_void,
-            user_info: *const std::ffi::c_void,
-            deliver_immediately: bool,
-        );
-        fn CFStringCreateWithCString(
-            alloc: *const std::ffi::c_void,
-            c_str: *const std::ffi::c_char,
-            encoding: u32,
-        ) -> *const std::ffi::c_void;
-        fn CFRelease(cf: *const std::ffi::c_void);
-    }
-
-    let c_name = std::ffi::CString::new(name).unwrap();
-    unsafe {
-        let center = CFNotificationCenterGetDistributedCenter();
-        let cf_name = CFStringCreateWithCString(std::ptr::null(), c_name.as_ptr(), 0x08000100);
-        CFNotificationCenterPostNotification(center, cf_name, std::ptr::null(), std::ptr::null(), true);
-        CFRelease(cf_name);
-    }
-}
-
 /// Echo suppressor — prevents our own writes from triggering re-enumeration.
 /// Thread-safe HashMap of path → expiry time.
 pub struct EchoSuppressor {

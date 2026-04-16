@@ -103,10 +103,6 @@ pub struct MacosCache {
     /// BadgeUpdate messages so the FinderSync extension can scope badges
     /// to a specific share.
     domain: String,
-    /// Paths pending eviction — consumed by getChanges response.
-    /// FileProvider-era queue; `evict_over_budget_now` is the NFS-native
-    /// replacement. Kept populated until Slice 5 retires the extension.
-    pending_evictions: Mutex<Vec<String>>,
     /// Per-file-handle read/write lock registry. Readers (NFS `read()`) take a
     /// read guard for the duration of the call; the eviction worker takes a
     /// non-blocking write guard, skipping any fh whose read is in flight.
@@ -349,7 +345,6 @@ impl MacosCache {
             nas_root,
             cache_limit,
             domain: domain.to_string(),
-            pending_evictions: Mutex::new(Vec::new()),
             per_fh_locks: Mutex::new(HashMap::new()),
             badge_tx: Mutex::new(None),
         })
@@ -547,11 +542,13 @@ impl MacosCache {
 
         if !drifted.is_empty() {
             log::info!(
-                "[macos-cache] Enumeration drift: {} entries under {:?} — queued for eviction",
+                "[macos-cache] Enumeration drift: {} entries under {:?}",
                 drifted.len(),
                 relative_path
             );
-            self.pending_evictions.lock().unwrap().extend(drifted);
+            // Under NFS mode the evictor worker + invalidate_cache on write
+            // reconcile stale rows naturally — no extra queue needed.
+            let _ = drifted;
         }
     }
 
@@ -827,7 +824,8 @@ impl MacosCache {
         }
 
         self.emit_badge(relative_path, crate::messages::BadgeKind::Hydrated);
-        self.evict_if_over_budget();
+        // The NFS evictor task (spawned from nfs_server::start) enforces the
+        // budget on its own 30s tick. No synchronous trigger here.
     }
 
     /// Update last_accessed time (called on each file read).
@@ -928,62 +926,9 @@ impl MacosCache {
         .unwrap_or(0) as u64
     }
 
-    /// Check if over budget and compute eviction candidates.
-    fn evict_if_over_budget(&self) {
-        if self.cache_limit == 0 {
-            return;
-        }
-
-        let total = self.total_cached_bytes();
-        if total <= self.cache_limit {
-            return;
-        }
-
-        let target = (self.cache_limit as f64 * EVICTION_TARGET_PERCENT) as u64;
-        let mut remaining = total;
-
-        // Get LRU candidates (hydrated files, oldest accessed first)
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT path, hydrated_size FROM known_files WHERE is_hydrated=1 AND is_dir=0 ORDER BY last_accessed ASC"
-        ).unwrap();
-        let victims: Vec<(String, i64)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        drop(stmt);
-
-        let mut evict_paths = Vec::new();
-        for (path, size) in &victims {
-            if remaining <= target {
-                break;
-            }
-            evict_paths.push(path.clone());
-            // Mark as not hydrated in DB
-            conn.execute(
-                "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path=?1",
-                params![path],
-            ).ok();
-            remaining -= *size as u64;
-        }
-        drop(conn);
-
-        if !evict_paths.is_empty() {
-            let evicted_bytes = total - remaining;
-            log::info!(
-                "[macos-cache] Eviction: {} files ({:.1} MB) — cache {:.1}/{:.1} MB",
-                evict_paths.len(),
-                evicted_bytes as f64 / 1_048_576.0,
-                remaining as f64 / 1_048_576.0,
-                self.cache_limit as f64 / 1_048_576.0,
-            );
-            self.pending_evictions.lock().unwrap().extend(evict_paths);
-        }
-    }
-
-    /// NFS-native eviction: if hydrated bytes exceed `cache_limit`, delete
-    /// oldest-accessed cache files until back under `cache_limit * 0.9`.
-    /// Unlike `evict_if_over_budget` (which queues for FileProvider), this
-    /// method performs the actual `fs::remove_file` + row update inline.
+    /// Eviction: if hydrated bytes exceed `cache_limit`, delete
+    /// oldest-accessed cache files until back under `cache_limit * 0.8`.
+    /// Performs the actual `fs::remove_file` + row update inline.
     ///
     /// Uses `try_write` on the per-fh RwLock so in-flight NFS reads are never
     /// blocked; contending files are skipped this tick and revisited next
@@ -1420,62 +1365,6 @@ impl MacosCache {
             .unwrap_or(false)
     }
 
-    /// Return relative paths of currently-hydrated files. Cheap DB-only query,
-    /// no NAS I/O. Used by the extension's clear-cache flow to drive per-item
-    /// `evictItem` calls without a `list_dir` round-trip.
-    pub fn hydrated_paths(&self) -> Vec<String> {
-        let conn = self.conn();
-        conn.prepare_cached(
-            "SELECT path FROM known_files WHERE is_hydrated=1 AND is_dir=0",
-        )
-        .ok()
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default()
-    }
-
-    /// Mark ALL hydrated files for eviction. Used by "Clear Cache" button.
-    pub fn clear_all_hydrated(&self) -> (u32, u64) {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT path, hydrated_size FROM known_files WHERE is_hydrated=1 AND is_dir=0"
-        ).unwrap();
-        let files: Vec<(String, i64)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        drop(stmt);
-
-        let mut count = 0u32;
-        let mut bytes = 0u64;
-        let mut evict_paths = Vec::new();
-
-        for (path, size) in &files {
-            conn.execute(
-                "UPDATE known_files SET is_hydrated=0, hydrated_size=0 WHERE path=?1",
-                params![path],
-            ).ok();
-            evict_paths.push(path.clone());
-            count += 1;
-            bytes += *size as u64;
-        }
-        drop(conn);
-
-        if !evict_paths.is_empty() {
-            log::info!("[macos-cache] Clear cache: {} files, {:.1} MB", count, bytes as f64 / 1_048_576.0);
-            self.pending_evictions.lock().unwrap().extend(evict_paths);
-        }
-
-        (count, bytes)
-    }
-
-    /// Drain pending eviction candidates (consumed by getChanges response).
-    pub fn drain_pending_evictions(&self) -> Vec<String> {
-        std::mem::take(&mut *self.pending_evictions.lock().unwrap())
-    }
-
     /// NFS-native "drain all": delete every hydrated cache file for this
     /// share, flip their DB rows to uncached, and return (count, bytes).
     /// Uses non-blocking `try_write` on each fh — files with active readers
@@ -1558,31 +1447,6 @@ impl MacosCache {
                     .ok()
             });
         row.map(|(b, c)| (b as u64, c as u64)).unwrap_or((0, 0))
-    }
-
-    /// If this path is currently materialized (hydrated), queue it for eviction.
-    /// No-op otherwise. Used by stat-drift detection so the next FileProvider
-    /// `getChanges` call will tell the extension to drop cached bytes.
-    pub fn queue_eviction_if_hydrated(&self, relative_path: &str) {
-        let hydrated: bool = {
-            let conn = self.conn();
-            conn.prepare_cached("SELECT is_hydrated FROM known_files WHERE path = ?1")
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_row(params![relative_path], |row| {
-                        let v: i64 = row.get(0)?;
-                        Ok(v != 0)
-                    })
-                    .ok()
-                })
-                .unwrap_or(false)
-        };
-        if hydrated {
-            self.pending_evictions
-                .lock()
-                .unwrap()
-                .push(relative_path.to_string());
-        }
     }
 
     /// Get the NAS folder mtime for a relative path.

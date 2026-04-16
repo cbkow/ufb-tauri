@@ -215,17 +215,9 @@ function getMountPath(cfg: MountConfig): string {
   if (platformStore.platform === "mac") {
     if (cfg.mountPathMacos) return cfg.mountPathMacos;
     const shareName = getShareName(cfg);
-    if (cfg.syncEnabled) {
-      // Sync mounts: path depends on which backend the agent is running.
-      // NFS loopback mounts natively at the same ~/ufb/mounts/{shareName}
-      // path as non-sync mounts (unified in v0.4.0+); the legacy FileProvider
-      // extension presents under ~/Library/CloudStorage/UFB-{displayName}.
-      if (state.mode === "nfs") {
-        return `${platformStore.home}/ufb/mounts/${shareName}`;
-      }
-      const displayName = (cfg.displayName || shareName).replace(/\s+/g, "");
-      return `${platformStore.home}/Library/CloudStorage/UFB-${displayName}`;
-    }
+    // Unified path for sync + non-sync. Slice 5 retired the FileProvider
+    // ~/Library/CloudStorage/UFB-* path; NFS loopback mounts (sync) and
+    // plain-SMB symlinks (non-sync) both live under ~/ufb/mounts/.
     return `${platformStore.home}/ufb/mounts/${shareName}`;
   }
   // Linux: explicit path or auto-derived from mount ID

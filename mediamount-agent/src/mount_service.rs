@@ -17,7 +17,7 @@ pub struct MountService {
     /// Per-domain NFS caches (macOS only). Shared with the NFS loopback
     /// server so UI-triggered drain + stats commands hit the same instance.
     #[cfg(target_os = "macos")]
-    shared_caches: Option<crate::ipc::fileops_server::SharedCaches>,
+    shared_caches: Option<crate::sync::SharedCaches>,
 }
 
 struct MountInstance {
@@ -42,7 +42,7 @@ impl MountService {
     /// but before `start_from_config` so UI drain/stats commands have
     /// access from the first message in.
     #[cfg(target_os = "macos")]
-    pub fn set_shared_caches(&mut self, caches: crate::ipc::fileops_server::SharedCaches) {
+    pub fn set_shared_caches(&mut self, caches: crate::sync::SharedCaches) {
         self.shared_caches = Some(caches);
     }
 
