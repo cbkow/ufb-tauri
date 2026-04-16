@@ -17,6 +17,8 @@
 //! `mediamount-nfs-spike/`). Lifecycle integration with mount state changes
 //! comes in Phase 1.5.
 
+use crate::messages::{AgentToUfb, ConflictDetectedMsg};
+use crate::sync::conflict;
 use crate::sync::macos_cache::{self, CachedAttr, MacosCache, CHUNK_SIZE};
 use async_trait::async_trait;
 use nfsserve::{
@@ -29,9 +31,10 @@ use nfsserve::{
 };
 use std::{
     os::unix::fs::FileExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::mpsc;
 
 /// Base loopback port. Each enabled mount is assigned `BASE_PORT + offset`.
 pub const BASE_PORT: u16 = 12345;
@@ -49,6 +52,8 @@ pub struct PassthroughFs {
     domain: String,
     nas_root: PathBuf,
     cache: Arc<MacosCache>,
+    /// Agent → UFB channel for out-of-band events (e.g. ConflictDetected).
+    ipc_tx: mpsc::Sender<AgentToUfb>,
 }
 
 impl PassthroughFs {
@@ -56,13 +61,14 @@ impl PassthroughFs {
         domain: String,
         nas_root: PathBuf,
         cache: Arc<MacosCache>,
+        ipc_tx: mpsc::Sender<AgentToUfb>,
     ) -> Result<Self, String> {
         let canon = nas_root
             .canonicalize()
             .map_err(|e| format!("Failed to canonicalize {}: {}", nas_root.display(), e))?;
         // Root always has an fh (seeded at schema init; ensure idempotently).
         cache.ensure_fh("");
-        Ok(Self { domain, nas_root: canon, cache })
+        Ok(Self { domain, nas_root: canon, cache, ipc_tx })
     }
 
     fn absolute(&self, rel: &str) -> PathBuf {
@@ -127,6 +133,82 @@ impl PassthroughFs {
     fn root_attr(&self) -> Result<fattr3, nfsstat3> {
         let meta = std::fs::metadata(&self.nas_root).map_err(io_to_nfsstat)?;
         Ok(nfsserve::fs_util::metadata_to_fattr3(1, &meta))
+    }
+
+    /// Conflict-detection pre-flight for a truncate-style write. If the NAS
+    /// file has changed since we last cached it (concurrent writer), COPY
+    /// the current NAS content to a sidecar path before letting the truncate
+    /// proceed. Both versions survive: the user's write lands on the original
+    /// path, the other writer's version is preserved as `.conflict-*`.
+    /// Emits `ConflictDetected` to UFB when this fires.
+    ///
+    /// Always returns `Ok` — we don't want to block a write on conflict
+    /// logistics failing. Worst case we log + proceed (same result as
+    /// pre-conflict-detection behavior).
+    fn preserve_conflict_sidecar_if_drifted(&self, rel: &str, abs: &Path) {
+        // Live NAS stat.
+        let live_meta = match std::fs::metadata(abs) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let live_size = live_meta.len();
+        let live_mtime = live_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        // What we last saw.
+        let cached = match self.cache.cached_attr(rel) {
+            Some(c) => c,
+            None => return, // never seen — nothing to compare
+        };
+
+        // mtime granularity on Synology/SMB is ~1s; allow 2s slop.
+        let drifted =
+            live_size != cached.size || (live_mtime - cached.mtime).abs() > 2.0;
+        if !drifted {
+            return;
+        }
+
+        let conflict_abs = conflict::make_conflict_path(abs);
+        if let Err(e) = std::fs::copy(abs, &conflict_abs) {
+            log::error!(
+                "[nfs-server] {}: conflict sidecar copy failed for {} → {}: {}",
+                self.domain,
+                rel,
+                conflict_abs.display(),
+                e
+            );
+            return;
+        }
+
+        let sidecar_name = conflict_abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        log::warn!(
+            "[nfs-server] {}: conflict on write to {} — preserved remote version as {}",
+            self.domain,
+            rel,
+            sidecar_name
+        );
+
+        let detected_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let msg = AgentToUfb::ConflictDetected(ConflictDetectedMsg {
+            domain: self.domain.clone(),
+            original_path: rel.to_string(),
+            conflict_path: sidecar_name,
+            host: conflict::hostname_short(),
+            detected_at,
+        });
+        if let Err(e) = self.ipc_tx.try_send(msg) {
+            log::warn!("[nfs-server] {}: conflict event dropped: {}", self.domain, e);
+        }
     }
 
     /// Common tail for CREATE / MKDIR: stat the freshly-made entry, register
@@ -472,6 +554,13 @@ impl NFSFileSystem for PassthroughFs {
         // fine-grained control we could proxy here, and NFS clients treat
         // them as advisory.
         if let set_size3::size(new_size) = setattr.size {
+            // Conflict detection — if the NAS file has changed since we
+            // last cached it, preserve that version to a sidecar before
+            // we blow it away with the truncate.
+            if new_size == 0 {
+                self.preserve_conflict_sidecar_if_drifted(&rel, &abs);
+            }
+
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&abs)
@@ -847,9 +936,15 @@ fn join_rel(parent: &str, child: &str) -> String {
 /// the export root and using `cache` as the metadata authority. Spawns a
 /// background tokio task; returns immediately. If bind or handshake fails,
 /// logs the error and the task exits.
-pub fn start(domain: String, nas_root: PathBuf, port: u16, cache: Arc<MacosCache>) {
+pub fn start(
+    domain: String,
+    nas_root: PathBuf,
+    port: u16,
+    cache: Arc<MacosCache>,
+    ipc_tx: mpsc::Sender<AgentToUfb>,
+) {
     tokio::spawn(async move {
-        let fs = match PassthroughFs::new(domain.clone(), nas_root.clone(), cache) {
+        let fs = match PassthroughFs::new(domain.clone(), nas_root.clone(), cache, ipc_tx) {
             Ok(fs) => fs,
             Err(e) => {
                 log::error!(

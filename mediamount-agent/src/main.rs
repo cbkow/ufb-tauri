@@ -290,7 +290,10 @@ async fn run_event_loop() {
         // so TrayManager::start spawns a no-op; the real tray is started separately.
         let (mut _tray_manager, mut tray_cmd_rx) = tray::TrayManager::start(tray_state_rx);
 
-        // Start mount service
+        // Start mount service. Clone state_tx so later spawns (NFS server)
+        // can also emit agent→UFB events.
+        #[cfg(target_os = "macos")]
+        let state_tx_for_nfs = state_tx.clone();
         let mut mount_service = mount_service::MountService::new(state_tx);
         mount_service.start_from_config().await;
 
@@ -301,6 +304,7 @@ async fn run_event_loop() {
         if nfs_enabled {
             let config_for_nfs = std::sync::Arc::clone(&config_cache);
             let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
+            let ipc_tx_for_nfs = state_tx_for_nfs;
             tokio::spawn(async move {
                 // Brief delay so mount_service has time to finish initial mounts
                 // before we try to canonicalize the SMB mount paths. Lifecycle
@@ -359,7 +363,7 @@ async fn run_event_loop() {
                             }
                         }
                     };
-                    sync::nfs_server::start(share, root, port, cache);
+                    sync::nfs_server::start(share, root, port, cache, ipc_tx_for_nfs.clone());
                 }
             });
         }

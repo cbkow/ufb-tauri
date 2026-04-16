@@ -28,6 +28,8 @@ pub use sync_root::SyncRoot;
 pub use connectivity::{NasConnectivity, NasStatus};
 
 #[cfg(target_os = "macos")]
+pub mod conflict;
+#[cfg(target_os = "macos")]
 pub mod macos_watcher;
 #[cfg(target_os = "macos")]
 pub mod macos_cache;
