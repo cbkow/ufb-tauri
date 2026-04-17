@@ -19,7 +19,7 @@ use crate::sync::windows_cache::CacheIndex;
 use std::ffi::{c_void, OsStr};
 use std::fs;
 use std::os::windows::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -135,27 +135,27 @@ fn prepare_mount_point(mount_path: &std::path::Path) {
     }
 }
 
-/// Slice 1: reads and enumerations go straight to SMB every call. The
-/// `cache`, `ipc_tx`, and `health` fields are plumbed through now so
-/// Slice 2 (metadata cache authority), Slice 3 (block-level content
-/// cache), and Slice 4 (write path) can slot in without changing the
-/// start() signature or PassthroughFs shape.
+/// Slice 2: enumeration + metadata are served from `CacheIndex` when
+/// warm; cold paths fall back to live SMB and populate the cache. File
+/// content still passes through (Slice 3 adds block-level hydration).
+/// Write callbacks + ipc_tx ConflictDetected land in Slice 4.
 pub struct PassthroughFs {
     #[allow(dead_code)]
     domain: String,
     nas_root: PathBuf,
-    #[allow(dead_code)]
     cache: Arc<CacheIndex>,
     /// Agent → UFB channel for out-of-band events (e.g. ConflictDetected).
     #[allow(dead_code)]
     ipc_tx: mpsc::Sender<AgentToUfb>,
     /// Rolling NAS reachability. Handlers will consult `is_online()` in
-    /// Slices 2+ to short-circuit SMB ops when the share is unreachable.
+    /// Slices 3+ to short-circuit SMB ops when the share is unreachable.
     #[allow(dead_code)]
     health: Arc<NasHealth>,
 }
 
 impl PassthroughFs {
+    /// Convert the ProjFS-style file name (e.g. `"\\261283_Breyers\\3d"`)
+    /// to an absolute path on the NAS backing store.
     fn resolve(&self, name: &U16CStr) -> PathBuf {
         let s = name.to_string_lossy();
         let trimmed = s.trim_start_matches('\\').trim_start_matches('/');
@@ -164,6 +164,27 @@ impl PassthroughFs {
         } else {
             self.nas_root.join(trimmed.replace('/', "\\"))
         }
+    }
+
+    /// Convert the file name to a cache-normalized relative path
+    /// (forward-slash separators, no leading slash — root is the empty
+    /// string). Must be kept in sync with `CacheIndex::cached_attr_by_path`
+    /// and `cached_children_by_parent` semantics.
+    fn rel_path(name: &U16CStr) -> String {
+        let s = name.to_string_lossy();
+        s.trim_start_matches('\\')
+            .trim_start_matches('/')
+            .replace('\\', "/")
+    }
+
+    /// Cache-normalized relative path for an absolute NAS path. Used in
+    /// handlers that already have the `OpenCtx::abs` rather than a
+    /// U16CStr. Returns the empty string if `abs` is the NAS root itself.
+    fn rel_from_abs(&self, abs: &Path) -> String {
+        abs.strip_prefix(&self.nas_root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default()
     }
 }
 
@@ -194,6 +215,34 @@ fn populate_file_info(meta: &fs::Metadata, info: &mut FileInfo) {
     info.last_access_time = st_to_filetime(accessed);
 }
 
+fn f64_secs_to_filetime(secs: f64) -> u64 {
+    (secs.max(0.0) as u64)
+        .saturating_mul(10_000_000)
+        .saturating_add(FILETIME_EPOCH_OFFSET)
+}
+
+/// Populate a `FileInfo` from a cached `CachedAttr`. Mirror of
+/// `populate_file_info` but for the warm-cache path — avoids the SMB
+/// round-trip for attributes we already have.
+fn populate_file_info_from_cached(
+    attr: &crate::sync::cache_core::CachedAttr,
+    info: &mut FileInfo,
+) {
+    info.file_attributes = if attr.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    info.file_size = attr.size;
+    info.allocation_size = attr.size;
+    let ft_created = f64_secs_to_filetime(attr.created);
+    let ft_modified = f64_secs_to_filetime(attr.mtime);
+    info.creation_time = ft_created;
+    info.last_write_time = ft_modified;
+    info.change_time = ft_modified;
+    info.last_access_time = ft_modified;
+}
+
 impl FileSystemContext for PassthroughFs {
     type FileContext = Box<OpenCtx>;
 
@@ -203,15 +252,29 @@ impl FileSystemContext for PassthroughFs {
         security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let abs = self.resolve(file_name);
-        let meta = match fs::metadata(&abs) {
-            Ok(m) => m,
-            Err(_) => return Err(err_not_found()),
-        };
-        let attrs = if meta.is_dir() {
-            FILE_ATTRIBUTE_DIRECTORY
+        let rel = Self::rel_path(file_name);
+        // Warm path: cache hit → skip the SMB stat entirely.
+        let attrs = if let Some(attr) = self.cache.cached_attr_by_path(&rel) {
+            if attr.is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            }
         } else {
-            FILE_ATTRIBUTE_NORMAL
+            // Cold path: stat SMB. Caching the result is deferred to the
+            // `open` / `read_directory` flow — this callback fires for
+            // non-existence checks too and we don't want to write rows
+            // for paths that don't exist.
+            let abs = self.resolve(file_name);
+            let meta = match fs::metadata(&abs) {
+                Ok(m) => m,
+                Err(_) => return Err(err_not_found()),
+            };
+            if meta.is_dir() {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            }
         };
         let sd = permissive_sd();
         // If the caller provided a buffer, fill it (size permitting). The
@@ -291,6 +354,14 @@ impl FileSystemContext for PassthroughFs {
         ctx: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        // Warm path: serve from cache if we have the entry.
+        let rel = self.rel_from_abs(ctx.abs());
+        if let Some(attr) = self.cache.cached_attr_by_path(&rel) {
+            populate_file_info_from_cached(&attr, file_info);
+            return Ok(());
+        }
+        // Cold: stat SMB. We don't write to cache here — row creation
+        // happens via `read_directory` / `populate_folder`.
         let meta = fs::metadata(ctx.abs()).map_err(|_| err_not_found())?;
         populate_file_info(&meta, file_info);
         Ok(())
@@ -337,66 +408,115 @@ impl FileSystemContext for PassthroughFs {
             OpenCtx::Dir { abs, dir_buffer } => (abs, dir_buffer),
             OpenCtx::File { .. } => return Err(err_access_denied()),
         };
-        log::info!(
-            "[winfsp] read_directory abs={} marker_none={}",
-            abs.display(),
-            marker.is_none()
-        );
 
         if marker.is_none() {
-            let lock = dir_buffer.acquire(true, None)?;
-            let rd = match fs::read_dir(abs) {
-                Ok(r) => r,
-                Err(_) => return Err(err_not_found()),
-            };
+            let rel = self.rel_from_abs(abs);
 
-            // Windows expects directory listings to include "." (self) and
-            // ".." (parent). `fs::read_dir` doesn't emit them, so we
-            // synthesize both here. Skip ".." for the mount root.
-            let self_meta = fs::metadata(abs).ok();
-            if let Some(meta) = &self_meta {
-                let mut dir_info: DirInfo<255> = DirInfo::new();
-                populate_file_info(meta, dir_info.file_info_mut());
-                let name_os: &OsStr = ".".as_ref();
-                if dir_info.set_name(name_os).is_ok() {
-                    let _ = lock.write(&mut dir_info);
-                }
-                if abs.parent().is_some() && abs != &self.nas_root {
-                    let parent_meta = abs.parent().and_then(|p| fs::metadata(p).ok());
-                    if let Some(pm) = parent_meta {
-                        let mut dir_info: DirInfo<255> = DirInfo::new();
-                        populate_file_info(&pm, dir_info.file_info_mut());
-                        let name_os: &OsStr = "..".as_ref();
-                        if dir_info.set_name(name_os).is_ok() {
-                            let _ = lock.write(&mut dir_info);
-                        }
+            // Warm path: folder already enumerated — serve from SQLite.
+            // Cold path: live `fs::read_dir` + populate the cache, then
+            // serve from cache. Either way, everything we write into the
+            // DirBuffer comes from the cache so the two paths produce
+            // identical output.
+            if !self.cache.folder_is_enumerated_by_rel(&rel) {
+                self.cold_populate(abs, &rel);
+            }
+
+            let lock = dir_buffer.acquire(true, None)?;
+
+            // "." and ".." synthesized from cache where possible.
+            if let Some(self_attr) = self.cache.cached_attr_by_path(&rel) {
+                write_dir_entry(&lock, ".", &self_attr);
+                if !rel.is_empty() {
+                    let parent_rel = match rel.rfind('/') {
+                        Some(i) => rel[..i].to_string(),
+                        None => String::new(),
+                    };
+                    if let Some(parent_attr) = self.cache.cached_attr_by_path(&parent_rel) {
+                        write_dir_entry(&lock, "..", &parent_attr);
+                    } else {
+                        // Root has no row in the cache (it's not in known_files)
+                        // — synthesize a minimal dir attr for "..".
+                        let fake = crate::sync::cache_core::CachedAttr {
+                            is_dir: true,
+                            size: 0,
+                            mtime: 0.0,
+                            created: 0.0,
+                            is_hydrated: false,
+                            hydrated_size: 0,
+                        };
+                        write_dir_entry(&lock, "..", &fake);
                     }
                 }
             }
 
-            let mut entries: Vec<(String, fs::Metadata)> = rd
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let meta = e.metadata().ok()?;
-                    Some((name, meta))
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, meta) in &entries {
-                let mut dir_info: DirInfo<255> = DirInfo::new();
-                populate_file_info(meta, dir_info.file_info_mut());
-                let name_os: &OsStr = name.as_ref();
-                if dir_info.set_name(name_os).is_err() {
-                    continue;
-                }
-                if lock.write(&mut dir_info).is_err() {
-                    break;
-                }
+            // Real children.
+            let children = self.cache.cached_children_by_parent(&rel);
+            for (name, attr) in &children {
+                write_dir_entry(&lock, name, attr);
             }
+
             drop(lock);
         }
         Ok(dir_buffer.read(marker, buffer))
+    }
+}
+
+/// Helper: build a DirInfo from a CachedAttr + name and write it to the
+/// acquired DirBufferLock. Skips on name-too-long / buffer-full errors
+/// (the latter stops the iterator; WinFsp's client retries with a marker).
+fn write_dir_entry(
+    lock: &winfsp::filesystem::DirBufferLock<'_>,
+    name: &str,
+    attr: &crate::sync::cache_core::CachedAttr,
+) -> bool {
+    let mut dir_info: DirInfo<255> = DirInfo::new();
+    populate_file_info_from_cached(attr, dir_info.file_info_mut());
+    let name_os: &OsStr = name.as_ref();
+    if dir_info.set_name(name_os).is_err() {
+        return true; // skip this entry, continue iteration
+    }
+    lock.write(&mut dir_info).is_ok()
+}
+
+impl PassthroughFs {
+    /// Live `fs::read_dir` → populate the cache. Runs once per folder
+    /// (the first time it's enumerated). No-ops on SMB error — the
+    /// subsequent cache read will just return the empty set.
+    fn cold_populate(&self, abs: &Path, rel: &str) {
+        let rd = match fs::read_dir(abs) {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "[winfsp] cold read_dir {} failed: {}",
+                    abs.display(),
+                    e
+                );
+                return;
+            }
+        };
+        let mut entries: Vec<(String, bool, u64, i64, i64)> = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = meta.len();
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let created_secs = meta
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            entries.push((name, meta.is_dir(), size, mtime_secs, created_secs));
+        }
+        self.cache.populate_folder(rel, &entries);
     }
 }
 
