@@ -385,12 +385,56 @@ impl FileSystemContext for PassthroughFs {
             OpenCtx::File { handle, .. } => handle,
             OpenCtx::Dir { .. } => return Err(err_access_denied()),
         };
-        log::info!(
-            "[winfsp] read abs={} offset={} length={}",
-            ctx.abs().display(),
-            offset,
-            buffer.len()
-        );
+
+        let abs = ctx.abs();
+        let rel = self.rel_from_abs(abs);
+        let attr = self.cache.cached_attr_by_path(&rel);
+
+        // Fast path: fully hydrated — read straight from the cache file.
+        if let Some(a) = attr.as_ref() {
+            if a.is_hydrated {
+                if let Some(rowid) = self.cache.rowid_for_path(&rel) {
+                    let lock = self.cache.key_lock(rowid);
+                    let _guard = lock.read().unwrap();
+                    let cache_path = self.cache.cache_file_path(rowid);
+                    if let Ok(f) = fs::File::open(&cache_path) {
+                        match f.seek_read(buffer, offset) {
+                            Ok(n) => {
+                                self.cache.touch_by_rel(&rel);
+                                return Ok(n as u32);
+                            }
+                            Err(_) => {
+                                // Cache file missing/corrupt — fall through
+                                // to block-walk which will refetch.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Block-walk path: serve cached runs from disk, fetch missing runs
+        // from SMB and persist them. Only available if the file has a
+        // rowid in the cache — cold files (never enumerated) fall back to
+        // plain passthrough.
+        if let (Some(a), Some(rowid)) =
+            (attr.as_ref(), self.cache.rowid_for_path(&rel))
+        {
+            match self.read_with_bitmap(handle, abs, &rel, rowid, a.size, buffer, offset) {
+                Ok(n) => {
+                    self.cache.touch_by_rel(&rel);
+                    return Ok(n);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[winfsp] {} block-walk failed for {} — passthrough: {:?}",
+                        self.domain, rel, e
+                    );
+                }
+            }
+        }
+
+        // Plain passthrough: no cache metadata for this file yet.
         match handle.seek_read(buffer, offset) {
             Ok(n) => Ok(n as u32),
             Err(_) => Err(err_access_denied()),
@@ -517,6 +561,160 @@ impl PassthroughFs {
             entries.push((name, meta.is_dir(), size, mtime_secs, created_secs));
         }
         self.cache.populate_folder(rel, &entries);
+    }
+
+    /// Chunk-aware read: for each chunk in the requested range, serve
+    /// cached bytes from the sparse cache file if the bitmap bit is set,
+    /// else fetch from SMB (via the already-open `smb` handle) and persist
+    /// to the cache. Marks the file fully hydrated when the bitmap
+    /// completes. Mirrors `nfs_server.rs::read_with_bitmap`.
+    #[allow(clippy::too_many_arguments)]
+    fn read_with_bitmap(
+        &self,
+        smb: &fs::File,
+        abs: &Path,
+        rel: &str,
+        rowid: i64,
+        file_size: u64,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> std::io::Result<u32> {
+        use crate::sync::cache_core::{self, CHUNK_SIZE};
+
+        let len = buffer.len();
+        if len == 0 || offset >= file_size {
+            return Ok(0);
+        }
+        let effective_len = (file_size - offset).min(len as u64) as usize;
+        let first_chunk = offset / CHUNK_SIZE;
+        let last_chunk = (offset + effective_len as u64 - 1) / CHUNK_SIZE;
+        let total_chunks = cache_core::num_chunks(file_size);
+
+        let lock_arc = self.cache.key_lock(rowid);
+        let _guard = lock_arc.read().unwrap();
+        let cache_path = self.cache.cache_file_path(rowid);
+        if let Some(parent) = cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let cache_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&cache_path)?;
+        // Pre-extend to nas_size so pread near EOF doesn't short-read on
+        // a sparse hole past the current file length.
+        if cache_file.metadata().map(|m| m.len()).unwrap_or(0) < file_size {
+            cache_file.set_len(file_size)?;
+        }
+
+        let _ = abs; // abs comes from ctx; we already have `smb` open against it
+        let mut bitmap = self.cache.get_chunk_bitmap(rel);
+        let mut bitmap_dirty = false;
+
+        let mut chunk = first_chunk;
+        while chunk <= last_chunk {
+            let cached = cache_core::bit_is_set(&bitmap, chunk);
+            // Coalesce contiguous run with the same cached/missing state.
+            let mut run_end = chunk;
+            while run_end < last_chunk
+                && cache_core::bit_is_set(&bitmap, run_end + 1) == cached
+            {
+                run_end += 1;
+            }
+
+            let run_start_byte = (chunk * CHUNK_SIZE).max(offset);
+            let run_end_byte = ((run_end + 1) * CHUNK_SIZE).min(offset + effective_len as u64);
+            let run_len = (run_end_byte - run_start_byte) as usize;
+            let buf_offset = (run_start_byte - offset) as usize;
+
+            if cached {
+                let n = cache_file
+                    .seek_read(&mut buffer[buf_offset..buf_offset + run_len], run_start_byte)?;
+                if n < run_len {
+                    // Short read despite the bit being set — treat as
+                    // corruption. Unset the bits and fall through to
+                    // refetch on the next iteration.
+                    for c in chunk..=run_end {
+                        bit_unset(&mut bitmap, c);
+                    }
+                    bitmap_dirty = true;
+                    log::warn!(
+                        "[winfsp] {}: short read from cache {} chunks {}..{} — invalidating",
+                        self.domain, rel, chunk, run_end
+                    );
+                    continue;
+                }
+            } else {
+                // Missing: fetch full chunks from SMB so the bitmap stays
+                // honest (a partial chunk write would leave later reads
+                // within the same chunk unaware of the holes).
+                let fetch_start = chunk * CHUNK_SIZE;
+                let fetch_end = ((run_end + 1) * CHUNK_SIZE).min(file_size);
+                let fetch_len = (fetch_end - fetch_start) as usize;
+                let mut tmp = vec![0u8; fetch_len];
+                let n = smb.seek_read(&mut tmp, fetch_start)?;
+                if n < fetch_len {
+                    tmp.truncate(n);
+                }
+                // Skip writing runs of zeros — the cache file is sparse,
+                // so holes pread back as zeros anyway. Keeps on-disk size
+                // honest for padded media containers (ProRes, some MOV,
+                // DPX).
+                if !is_all_zeros(&tmp) {
+                    cache_file.seek_write(&tmp, fetch_start)?;
+                }
+                for c in chunk..=run_end {
+                    cache_core::set_bit(&mut bitmap, c);
+                }
+                bitmap_dirty = true;
+
+                // Copy the user-requested window out of the freshly-fetched
+                // buffer.
+                let user_start = (run_start_byte - fetch_start) as usize;
+                let user_end = user_start + run_len.min(tmp.len().saturating_sub(user_start));
+                buffer[buf_offset..buf_offset + (user_end - user_start)]
+                    .copy_from_slice(&tmp[user_start..user_end]);
+            }
+            chunk = run_end + 1;
+        }
+
+        if bitmap_dirty {
+            if cache_core::bitmap_is_complete(&bitmap, total_chunks) {
+                let _ = cache_file.sync_all();
+                self.cache.mark_fully_hydrated(rel, file_size);
+                log::info!(
+                    "[winfsp] {}: fully hydrated {}",
+                    self.domain, rel
+                );
+            } else {
+                self.cache.update_chunk_bitmap(rel, &bitmap);
+            }
+        }
+
+        Ok(effective_len as u32)
+    }
+}
+
+/// True if every byte in `buf` is 0. Fast-path check used to keep the
+/// sparse cache file from materializing runs of zero-padded data.
+#[inline]
+fn is_all_zeros(buf: &[u8]) -> bool {
+    const STRIDE: usize = 8;
+    let chunks = buf.chunks_exact(STRIDE);
+    let remainder = chunks.remainder();
+    chunks.map(|c| u64::from_ne_bytes(c.try_into().unwrap())).all(|w| w == 0)
+        && remainder.iter().all(|&b| b == 0)
+}
+
+/// Clear bit `chunk` in `bitmap` (used when a cached chunk turns out to
+/// be short/invalid and we need to refetch).
+#[inline]
+fn bit_unset(bitmap: &mut [u8], chunk: u64) {
+    let byte = (chunk / 8) as usize;
+    let mask = !(1u8 << ((chunk % 8) as u8));
+    if let Some(b) = bitmap.get_mut(byte) {
+        *b &= mask;
     }
 }
 
