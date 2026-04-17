@@ -360,10 +360,68 @@ async fn run_event_loop() {
             });
         }
 
-        // Windows sync backend (WinFsp) — wired in Slice 1 of
-        // docs/windows-winfsp-port-plan.md. Slice 0 deletes the old ProjFS
-        // startup; Slice 1 replaces it with the WinFsp equivalent of the
-        // macOS NFS loopback block above.
+        // Start WinFsp backends (Windows only). One per sync-enabled mount.
+        // Mirror of the macOS NFS block above. See
+        // docs/windows-winfsp-port-plan.md Slice 1.
+        #[cfg(windows)]
+        {
+            let config_for_winfsp = std::sync::Arc::clone(&config_cache);
+            let caches_for_winfsp = std::sync::Arc::clone(&shared_caches);
+            let ipc_tx_for_winfsp = state_tx_for_vfs;
+            tokio::spawn(async move {
+                // Brief delay to match the macOS lifecycle — lets
+                // mount_service finish its initial SMB session probes
+                // before we start spawning virtual filesystems.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                let mounts = config_for_winfsp.read().unwrap().mounts.clone();
+                let mut sync_mounts: Vec<_> = mounts
+                    .into_iter()
+                    .filter(|m| m.enabled && m.is_sync_mode())
+                    .collect();
+                sync_mounts.sort_by(|a, b| a.id.cmp(&b.id));
+
+                for mount in &sync_mounts {
+                    let share = mount.share_name();
+                    // Windows reads the UNC directly — no SMB mount path
+                    // resolution like macOS needs.
+                    let nas_root = std::path::PathBuf::from(&mount.nas_share_path);
+
+                    // One CacheIndex per domain, shared with mount_service's
+                    // drain/stats path via set_shared_caches.
+                    let cache = {
+                        let mut caches = caches_for_winfsp.write().unwrap();
+                        if let Some(existing) = caches.get(&share).cloned() {
+                            existing
+                        } else {
+                            let open_handles = std::sync::Arc::new(
+                                std::sync::Mutex::new(std::collections::HashMap::new()),
+                            );
+                            let (ci, _needs_repair) = sync::CacheIndex::open(
+                                &nas_root,
+                                &share,
+                                mount.sync_cache_limit_bytes,
+                                open_handles,
+                            );
+                            let arc = std::sync::Arc::new(ci);
+                            caches.insert(share.clone(), std::sync::Arc::clone(&arc));
+                            log::info!(
+                                "[winfsp] Cache opened (shared) for domain: {}",
+                                share
+                            );
+                            arc
+                        }
+                    };
+
+                    sync::winfsp_server::start(
+                        share,
+                        nas_root,
+                        cache,
+                        ipc_tx_for_winfsp.clone(),
+                    );
+                }
+            });
+        }
 
         // Config file watcher — polls mtime every 5 seconds
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::mpsc::channel::<()>(1);

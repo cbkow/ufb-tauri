@@ -10,6 +10,9 @@
 
 pub mod cache_core;
 
+#[cfg(any(windows, target_os = "macos"))]
+pub mod nas_health;
+
 #[cfg(windows)]
 pub mod windows_cache;
 #[cfg(windows)]

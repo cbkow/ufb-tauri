@@ -41,7 +41,12 @@ async-trait = "0.1"
 # docs/windows-winfsp-port-plan.md and docs/windows-io-backend-evaluation.md.
 winfsp = { version = "0.12", features = ["debug", "system"] }
 widestring = "1.2"
-windows-sys = { version = "0.59", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"

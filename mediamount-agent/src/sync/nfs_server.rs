@@ -21,6 +21,7 @@
 use crate::messages::{AgentToUfb, ConflictDetectedMsg};
 use crate::sync::conflict;
 use crate::sync::macos_cache::{self, CachedAttr, MacosCache, CHUNK_SIZE};
+use crate::sync::nas_health::NasHealth;
 use async_trait::async_trait;
 use nfsserve::{
     nfs::{
@@ -33,10 +34,7 @@ use nfsserve::{
 use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -565,77 +563,6 @@ fn bit_unset(bitmap: &mut [u8], chunk: u64) {
     let mask = !(1u8 << ((chunk % 8) as u8));
     if let Some(b) = bitmap.get_mut(byte) {
         *b &= mask;
-    }
-}
-
-/// Tracks NAS reachability for a domain. A background probe loop stats
-/// the share root every `PROBE_INTERVAL`; a configurable number of
-/// consecutive failures flips us to "offline." Handlers consult
-/// `is_online()` before touching SMB so we can short-circuit with
-/// `NFS3ERR_JUKEBOX` instead of waiting for 60-second SMB timeouts.
-pub struct NasHealth {
-    domain: String,
-    nas_root: PathBuf,
-    connected: AtomicBool,
-    consecutive_failures: AtomicU32,
-}
-
-const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-const FAILURE_THRESHOLD: u32 = 2;
-
-impl NasHealth {
-    pub fn new(domain: String, nas_root: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
-            domain,
-            nas_root,
-            connected: AtomicBool::new(true),
-            consecutive_failures: AtomicU32::new(0),
-        })
-    }
-
-    pub fn is_online(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
-
-    /// Spawn the background probe loop. Non-blocking.
-    pub fn spawn_probe_loop(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                self.probe_once().await;
-                tokio::time::sleep(PROBE_INTERVAL).await;
-            }
-        });
-    }
-
-    async fn probe_once(&self) {
-        let root = self.nas_root.clone();
-        // Run the stat on the blocking pool so a hung SMB call doesn't
-        // stall the async runtime.
-        let res = tokio::task::spawn_blocking(move || std::fs::metadata(&root)).await;
-        let ok = matches!(res, Ok(Ok(_)));
-
-        if ok {
-            self.consecutive_failures.store(0, Ordering::Relaxed);
-            let was_offline = !self.connected.swap(true, Ordering::Relaxed);
-            if was_offline {
-                log::info!(
-                    "[nfs-server] {} NAS reachable again — resuming writes",
-                    self.domain
-                );
-            }
-        } else {
-            let fails = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            if fails >= FAILURE_THRESHOLD {
-                let was_online = self.connected.swap(false, Ordering::Relaxed);
-                if was_online {
-                    log::warn!(
-                        "[nfs-server] {} NAS unreachable (failed {} consecutive probes) — serving from cache only",
-                        self.domain,
-                        fails
-                    );
-                }
-            }
-        }
     }
 }
 
