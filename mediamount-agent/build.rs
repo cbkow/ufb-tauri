@@ -1,6 +1,9 @@
 fn main() {
     #[cfg(windows)]
     {
+        // Delay-load winfsp-x64.dll so Windows finds it via registry at runtime.
+        winfsp::build::winfsp_link_delayload();
+
         let mut res = winres::WindowsResource::new();
         res.set_icon("../src-tauri/icons/icon.ico");
         res.compile().expect("Failed to compile Windows resources");

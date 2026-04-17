@@ -3,6 +3,7 @@ name = "mediamount-agent"
 version = "0.4.1"
 edition = "2021"
 description = "MediaMount VFS mount agent for UFB"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -32,13 +33,24 @@ nfsserve = "0.10"
 async-trait = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-cloud-filter = "0.0.6"
+# WinFsp user-mode filesystem driver, native API. Requires WinFsp 2.x runtime
+# + Developer SDK installed (headers and import lib at
+# `C:\Program Files (x86)\WinFsp\{inc,lib}\`). Build also needs LLVM libclang
+# for `winfsp-sys`'s bindgen step — set LIBCLANG_PATH or install LLVM to PATH.
+# Licensed GPL-3.0; UFB is GPL-3.0 to satisfy the FLOSS exception. See
+# docs/windows-winfsp-port-plan.md and docs/windows-io-backend-evaluation.md.
+winfsp = { version = "0.12", features = ["debug", "system"] }
+widestring = "1.2"
+windows-sys = { version = "0.59", features = ["Win32_Foundation"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+# Sets up delay-loading for winfsp-x64.dll so Windows can find it via the
+# WinFsp install registry at runtime without the DLL being in PATH.
+winfsp = { version = "0.12", features = ["delayload"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

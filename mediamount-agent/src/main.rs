@@ -243,9 +243,9 @@ async fn run_event_loop() {
         let config_cache: std::sync::Arc<std::sync::RwLock<config::MountsConfig>> =
             std::sync::Arc::new(std::sync::RwLock::new(config::load_config()));
 
-        // Shared per-domain cache map — populated on NFS server startup,
+        // Shared per-domain cache map — populated on VFS server startup,
         // queried by mount_service for UI drain/stats.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let shared_caches: sync::SharedCaches = std::sync::Arc::new(
             std::sync::RwLock::new(std::collections::HashMap::new()),
         );
@@ -259,10 +259,10 @@ async fn run_event_loop() {
 
         // Start mount service. Clone state_tx so later spawns (NFS server)
         // can also emit agent→UFB events.
-        #[cfg(target_os = "macos")]
-        let state_tx_for_nfs = state_tx.clone();
+        #[cfg(any(target_os = "macos", windows))]
+        let state_tx_for_vfs = state_tx.clone();
         let mut mount_service = mount_service::MountService::new(state_tx);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         mount_service.set_shared_caches(std::sync::Arc::clone(&shared_caches));
         mount_service.start_from_config().await;
 
@@ -272,7 +272,7 @@ async fn run_event_loop() {
         {
             let config_for_nfs = std::sync::Arc::clone(&config_cache);
             let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
-            let ipc_tx_for_nfs = state_tx_for_nfs;
+            let ipc_tx_for_nfs = state_tx_for_vfs;
             tokio::spawn(async move {
                 // Brief delay so mount_service has time to finish initial mounts
                 // before we try to canonicalize the SMB mount paths. Lifecycle
@@ -359,6 +359,11 @@ async fn run_event_loop() {
                 }
             });
         }
+
+        // Windows sync backend (WinFsp) — wired in Slice 1 of
+        // docs/windows-winfsp-port-plan.md. Slice 0 deletes the old ProjFS
+        // startup; Slice 1 replaces it with the WinFsp equivalent of the
+        // macOS NFS loopback block above.
 
         // Config file watcher — polls mtime every 5 seconds
         let (config_reload_tx, mut config_reload_rx) = tokio::sync::mpsc::channel::<()>(1);

@@ -14,9 +14,9 @@ pub struct MountService {
     connected_servers: Arc<Mutex<HashSet<String>>>,
     /// Global cache root for sync mounts.
     cache_root: std::path::PathBuf,
-    /// Per-domain NFS caches (macOS only). Shared with the NFS loopback
-    /// server so UI-triggered drain + stats commands hit the same instance.
-    #[cfg(target_os = "macos")]
+    /// Per-domain caches shared with the VFS server (NFS on macOS, ProjFS
+    /// on Windows) so UI-triggered drain + stats commands hit the same instance.
+    #[cfg(any(target_os = "macos", windows))]
     shared_caches: Option<crate::sync::SharedCaches>,
 }
 
@@ -33,15 +33,14 @@ impl MountService {
             ipc_tx,
             connected_servers: Arc::new(Mutex::new(HashSet::new())),
             cache_root: crate::config::MountConfig::default_cache_root(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             shared_caches: None,
         }
     }
 
-    /// Inject the per-domain NFS cache map (macOS only). Call after `new`
-    /// but before `start_from_config` so UI drain/stats commands have
-    /// access from the first message in.
-    #[cfg(target_os = "macos")]
+    /// Inject the per-domain VFS cache map. Call after `new` but before
+    /// `start_from_config` so UI drain/stats commands have access.
+    #[cfg(any(target_os = "macos", windows))]
     pub fn set_shared_caches(&mut self, caches: crate::sync::SharedCaches) {
         self.shared_caches = Some(caches);
     }
@@ -71,7 +70,9 @@ impl MountService {
                 .filter(|m| m.enabled && m.sync_enabled)
                 .map(|m| (m.id.clone(), m.volume_path()))
                 .collect();
-            crate::sync::SyncRoot::cleanup_stale_roots(&active_sync_mounts);
+            // ProjFS: no CF sync root registrations to clean up.
+            // crate::sync::SyncRoot::cleanup_stale_roots(&active_sync_mounts);
+            let _ = active_sync_mounts;
         }
 
         // macOS: clean up stale entries in ~/ufb/mounts/ from removed mounts.
@@ -274,15 +275,11 @@ impl MountService {
                     .await;
             }
             UfbToAgent::ClearSyncCache(msg) => {
-                #[cfg(target_os = "macos")]
-                {
-                    if self.try_drain_nfs_cache(&msg).await {
-                        return;
-                    }
+                if self.try_drain_cache(&msg).await {
+                    return;
                 }
-                // Fall-through: Windows (and macOS FileProvider while the
-                // extension is still the cache owner) — orchestrator's
-                // ClearSyncCache handler does the per-platform teardown.
+                // Fall-through: orchestrator's ClearSyncCache handler does
+                // per-platform teardown for legacy paths.
                 self.send_to_mount(&msg.mount_id, MountEvent::ClearSyncCache, &msg.command_id)
                     .await;
             }
@@ -365,21 +362,14 @@ impl MountService {
         }
     }
 
-    /// macOS-NFS branch for ClearSyncCache: if this mount has an active
-    /// NFS cache instance in the shared map, drain it inline and ack the
-    /// command. Returns `true` when handled; `false` means the caller
-    /// should fall back to the orchestrator path (Windows, or macOS-FP
-    /// while the extension is still around).
-    #[cfg(target_os = "macos")]
-    async fn try_drain_nfs_cache(&self, msg: &MountIdMsg) -> bool {
+    /// Try to drain the VFS cache for a mount inline. Returns `true` when
+    /// handled (NFS on macOS, ProjFS on Windows); `false` means the caller
+    /// should fall back to the orchestrator path.
+    #[cfg(any(target_os = "macos", windows))]
+    async fn try_drain_cache(&self, msg: &MountIdMsg) -> bool {
         let Some(ref caches) = self.shared_caches else {
             return false;
         };
-        // Accept either a mount id (sent by src-tauri via the Settings
-        // dialog) or a share name (sent by FinderSync's context menu,
-        // which only knows the folder name). Mount ids take priority; if
-        // no mount matches, fall through and try the string directly as
-        // a share name.
         let share_name = self
             .mounts
             .get(&msg.mount_id)
@@ -393,9 +383,13 @@ impl MountService {
             return false;
         };
 
+        #[cfg(target_os = "macos")]
         let (count, bytes) = cache.drain_all().await;
+        #[cfg(windows)]
+        let (count, bytes) = cache.drain_all();
+
         log::info!(
-            "[{}] Drain cache (NFS): {} files, {:.1} MB",
+            "[{}] Drain cache: {} files, {:.1} MB",
             msg.mount_id,
             count,
             bytes as f64 / 1_048_576.0,
@@ -408,7 +402,6 @@ impl MountService {
                 }))
                 .await;
         }
-        // Emit fresh stats so the UI can update without a second round-trip.
         let (hb, hc) = cache.cache_stats();
         let _ = self
             .ipc_tx
@@ -422,20 +415,16 @@ impl MountService {
         true
     }
 
-    #[cfg(not(target_os = "macos"))]
-    #[allow(dead_code)]
-    async fn try_drain_nfs_cache(&self, _msg: &MountIdMsg) -> bool {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    async fn try_drain_cache(&self, _msg: &MountIdMsg) -> bool {
         false
     }
 
     /// Respond to `UfbToAgent::GetCacheStats` with current cache size.
-    /// On macOS-NFS reads from the shared MacosCache; on Windows or macOS
-    /// without NFS there's no per-share hydration bookkeeping exposed
-    /// through this path, so we reply with zeros (the UI treats that as
-    /// "no cache to show").
+    /// Reads from the shared VFS cache on both macOS and Windows.
     async fn handle_get_cache_stats(&self, msg: MountIdMsg) {
         let (hydrated_bytes, hydrated_count) = {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             {
                 let zeros = (0u64, 0u64);
                 let share_name = self
@@ -450,7 +439,7 @@ impl MountService {
                     _ => zeros,
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             {
                 let _ = &msg;
                 (0u64, 0u64)

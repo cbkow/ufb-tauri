@@ -4,6 +4,7 @@ version = "0.4.1"
 description = "Union File Browser - Tauri Edition"
 authors = ["Chris"]
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "ufb_tauri_lib"

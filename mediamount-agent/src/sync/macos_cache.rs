@@ -1,98 +1,17 @@
-/// SQLite cache for macOS FileProvider change tracking + LRU eviction.
+/// SQLite cache for macOS NFS-loopback VFS backend.
 ///
-/// Tracks known files, visited folders, and hydration state so the agent can:
-/// - Compute deltas for the extension's `enumerateChanges` calls
-/// - Enforce cache limits via LRU eviction (extension calls `evictItem`)
+/// Tracks known files, visited folders, hydration state, and chunk-level
+/// content bitmaps. The NFS server reads from this cache for metadata
+/// and content, falling back to live SMB on cold paths.
 
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
+use crate::sync::cache_core::{self, SqliteConn, SqlitePool};
+pub use crate::sync::cache_core::{
+    bit_is_set, bitmap_is_complete, num_chunks, parent_of, set_bit, CachedAttr, CHUNK_SIZE,
+};
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-const EVICTION_TARGET_PERCENT: f64 = 0.8;
-const POOL_SIZE: u32 = 6;
-
-/// Content cache chunk size — matches the NFS `rsize` mount option (1 MiB)
-/// so each NFS READ RPC maps cleanly to one chunk.
-pub const CHUNK_SIZE: u64 = 1024 * 1024;
-
-/// How many chunks cover a file of `size` bytes.
-#[inline]
-pub fn num_chunks(size: u64) -> u64 {
-    (size + CHUNK_SIZE - 1) / CHUNK_SIZE
-}
-
-/// Bit operations on the chunk bitmap. Bits are packed LSB-first within each
-/// byte: chunk `i` lives in byte `i/8`, bit `i%8`.
-#[inline]
-pub fn bit_is_set(bitmap: &[u8], chunk: u64) -> bool {
-    let byte = (chunk / 8) as usize;
-    let mask = 1u8 << ((chunk % 8) as u8);
-    bitmap.get(byte).map(|b| b & mask != 0).unwrap_or(false)
-}
-
-#[inline]
-pub fn set_bit(bitmap: &mut Vec<u8>, chunk: u64) {
-    let byte = (chunk / 8) as usize;
-    let mask = 1u8 << ((chunk % 8) as u8);
-    if bitmap.len() <= byte {
-        bitmap.resize(byte + 1, 0);
-    }
-    bitmap[byte] |= mask;
-}
-
-/// Check if every bit in `[0, total_chunks)` is set.
-#[inline]
-pub fn bitmap_is_complete(bitmap: &[u8], total_chunks: u64) -> bool {
-    if total_chunks == 0 {
-        return true;
-    }
-    let full_bytes = (total_chunks / 8) as usize;
-    // Every full byte must be 0xFF.
-    for i in 0..full_bytes {
-        if bitmap.get(i).copied().unwrap_or(0) != 0xFF {
-            return false;
-        }
-    }
-    // Partial trailing byte: only the low `remainder` bits must be set.
-    let remainder = total_chunks % 8;
-    if remainder > 0 {
-        let mask = (1u8 << remainder) - 1;
-        if bitmap.get(full_bytes).copied().unwrap_or(0) & mask != mask {
-            return false;
-        }
-    }
-    true
-}
-
-/// Parent directory of a relative path. "a/b/c.txt" → "a/b". "foo.txt" → "".
-/// Used to populate + query the indexed `parent_path` column on `known_files`.
-#[inline]
-pub fn parent_of(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(i) => &path[..i],
-        None => "",
-    }
-}
-
-type SqlitePool = Pool<SqliteConnectionManager>;
-type SqliteConn = PooledConnection<SqliteConnectionManager>;
-
-/// Subset of `known_files` fields needed to build an NFS `fattr3`. Returned
-/// from the cache-serving accessors so callers don't have to know the schema.
-#[derive(Debug, Clone)]
-pub struct CachedAttr {
-    pub is_dir: bool,
-    pub size: u64,
-    /// Seconds since Unix epoch (NAS mtime).
-    pub mtime: f64,
-    /// Seconds since Unix epoch (NAS ctime).
-    pub created: f64,
-    pub is_hydrated: bool,
-    pub hydrated_size: u64,
-}
 
 /// Per-domain cache database.
 pub struct MacosCache {
@@ -135,11 +54,8 @@ impl MacosCache {
             let mut conn = Connection::open(&db_path)
                 .map_err(|e| format!("Failed to open cache DB: {}", e))?;
 
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL;
-                 PRAGMA synchronous=NORMAL;",
-            )
-            .map_err(|e| format!("Failed to set pragmas: {}", e))?;
+            conn.execute_batch(cache_core::INIT_PRAGMAS)
+                .map_err(|e| format!("Failed to set pragmas: {}", e))?;
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS known_files (
@@ -325,20 +241,7 @@ impl MacosCache {
             }
         }
 
-        // Build the pool. Each connection applies its own per-connection PRAGMAs on init.
-        // WAL mode is persistent on the DB file, so we only need synchronous=NORMAL +
-        // busy_timeout here — readers won't block each other, writers serialize at SQLite.
-        let manager = SqliteConnectionManager::file(&db_path).with_init(|c| {
-            c.execute_batch(
-                "PRAGMA synchronous=NORMAL;
-                 PRAGMA busy_timeout=5000;
-                 PRAGMA foreign_keys=ON;",
-            )
-        });
-        let pool = Pool::builder()
-            .max_size(POOL_SIZE)
-            .build(manager)
-            .map_err(|e| format!("Failed to build SQLite pool: {}", e))?;
+        let pool = cache_core::build_pool(&db_path)?;
 
         Ok(Self {
             pool,

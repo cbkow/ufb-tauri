@@ -1,31 +1,21 @@
-/// On-demand NAS sync via native cloud file APIs.
+/// On-demand NAS sync via native OS user-mode filesystem drivers.
 ///
-/// Windows: Cloud Files API via the `cloud-filter` crate.
-/// macOS: FileProvider (future — hosted in MediaMountTray Swift app).
+/// Windows: WinFsp via the `winfsp` crate.
+/// macOS: NFS3 loopback server via the `nfsserve` crate.
 ///
-/// The sync module presents NAS files as cloud placeholders in the local filesystem.
-/// Files appear locally but are only downloaded (hydrated) when accessed.
-/// All operations are pass-through to the NAS via SMB — the local machine is a cache.
+/// The sync module presents NAS files as virtual entries in the local filesystem.
+/// Each user-space callback (open, read, readdir, write) is answered on the fly —
+/// serve from local cache when warm, pass through to SMB otherwise. No persistent
+/// placeholder state; no reconciliation database after offline periods.
+
+pub mod cache_core;
 
 #[cfg(windows)]
-mod sync_root;
-#[cfg(windows)]
-mod filter;
-#[cfg(windows)]
-mod watcher;
-#[cfg(windows)]
-mod placeholder;
-#[cfg(windows)]
-pub mod write_through;
-#[cfg(windows)]
-pub mod cache;
+pub mod windows_cache;
 #[cfg(windows)]
 pub mod connectivity;
-
 #[cfg(windows)]
-pub use sync_root::SyncRoot;
-#[cfg(windows)]
-pub use connectivity::{NasConnectivity, NasStatus};
+pub mod winfsp_server;
 
 #[cfg(target_os = "macos")]
 pub mod conflict;
@@ -39,6 +29,10 @@ pub mod nfs_server;
 pub use macos_watcher::MacosNasWatcher;
 #[cfg(target_os = "macos")]
 pub use macos_cache::MacosCache;
+#[cfg(windows)]
+pub use windows_cache::CacheIndex;
+#[cfg(windows)]
+pub use connectivity::{NasConnectivity, NasStatus};
 
 /// Per-domain cache map shared between main and the NFS server. Keyed by
 /// share name. Readers: NFS server startup, mount_service drain/stats.
@@ -46,4 +40,10 @@ pub use macos_cache::MacosCache;
 #[cfg(target_os = "macos")]
 pub type SharedCaches = std::sync::Arc<
     std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<MacosCache>>>,
+>;
+
+/// Per-domain cache map for Windows WinFsp mounts. Same pattern as macOS.
+#[cfg(windows)]
+pub type SharedCaches = std::sync::Arc<
+    std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<CacheIndex>>>,
 >;

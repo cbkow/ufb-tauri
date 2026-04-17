@@ -300,6 +300,10 @@ begin
       Exec('netsh.exe', 'advfirewall firewall add rule name="UFB Mesh Sync (UDP)" dir=in action=allow protocol=UDP localport=4244 program="' + ExpandConstant('{app}\{#MyAppExeName}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
 
+    // WinFsp runtime install — wired in Slice 5 of
+    // docs/windows-winfsp-port-plan.md. Silent-installs the bundled
+    // winfsp-*.msi (idempotent; skips if already present and >= ours).
+
     if WizardIsTaskSelected('restartexplorer') then
       RestartExplorer();
   end;

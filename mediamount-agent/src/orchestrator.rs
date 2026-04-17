@@ -18,9 +18,10 @@ pub struct Orchestrator {
     /// Servers with active SMB sessions — shared across all orchestrators.
     /// If a server is already connected, skip credential lookup and reuse the session.
     connected_servers: Arc<Mutex<HashSet<String>>>,
-    /// On-demand sync root (Windows only). Held alive to keep the CF session active.
+    /// ProjFS provider handle (Windows only). ProjFS is started from main.rs;
+    /// the orchestrator only tracks sync state for status reporting.
     #[cfg(windows)]
-    sync_root: Option<crate::sync::SyncRoot>,
+    _projfs_active: bool,
     /// Current sync sub-state, tracked independently from MountState.
     #[cfg(windows)]
     sync_state: SyncState,
@@ -55,7 +56,7 @@ impl Orchestrator {
             ipc_tx,
             connected_servers,
             #[cfg(windows)]
-            sync_root: None,
+            _projfs_active: false,
             #[cfg(windows)]
             sync_state: SyncState::Disabled,
             #[cfg(windows)]
@@ -99,19 +100,9 @@ impl Orchestrator {
                 event = self.event_rx.recv() => {
                     match event {
                         Some(MountEvent::ClearSyncCache) => {
-                            // macOS: UI now short-circuits via
-                            // mount_service::try_drain_nfs_cache before the
-                            // event reaches here. Only Windows (cloud-files
-                            // sync_root) still needs the orchestrator path.
-                            #[cfg(windows)]
-                            if let Some(ref sr) = self.sync_root {
-                                let (count, bytes) = sr.clear_cache();
-                                log::info!(
-                                    "[{}] Cache cleared: {} files, {:.1} MB",
-                                    self.mount_id, count,
-                                    bytes as f64 / (1024.0 * 1024.0)
-                                );
-                            }
+                            // ProjFS / NFS: cache drain is handled inline by
+                            // mount_service::try_drain_cache via SharedCaches.
+                            // Nothing to do here.
                         }
                         Some(event) => {
                             self.handle_event(event).await;
@@ -137,14 +128,14 @@ impl Orchestrator {
                 // Periodic sync activity update
                 _ = sync_tick.tick() => {
                     #[cfg(windows)]
-                    if self.sync_root.is_some() {
+                    if self._projfs_active {
                         self.emit_state_update().await;
                     }
                 }
                 // NAS heartbeat — fire-and-forget with 10s timeout, result comes via hb_rx
                 _ = heartbeat_tick.tick() => {
                     #[cfg(windows)]
-                    if self.sync_root.is_some() {
+                    if self._projfs_active {
                         let nas_root = self.config.nas_share_path.clone();
                         let tx = hb_tx.clone();
                         tokio::spawn(async move {
@@ -166,7 +157,7 @@ impl Orchestrator {
                 // Heartbeat result — handle disconnect/reconnect
                 Some(reachable) = hb_rx.recv() => {
                     #[cfg(windows)]
-                    if self.sync_root.is_some() {
+                    if self._projfs_active {
                         self.handle_heartbeat_result(reachable).await;
                     }
                 }
@@ -218,7 +209,7 @@ impl Orchestrator {
             }
             Effect::DisconnectDrive => {
                 #[cfg(windows)]
-                if self.sync_root.is_some() {
+                if self._projfs_active {
                     self.stop_sync().await;
                     return;
                 }
@@ -503,7 +494,9 @@ impl Orchestrator {
         }
     }
 
-    /// Start on-demand sync: authenticate SMB session, register sync root, connect filter.
+    /// Start on-demand sync: authenticate SMB session, mark ProjFS active.
+    /// ProjFS provider startup is handled in main.rs; the orchestrator only
+    /// tracks sync state for status reporting.
     #[cfg(windows)]
     async fn start_sync(&mut self) {
         self.sync_state = SyncState::Registering;
@@ -537,99 +530,22 @@ impl Orchestrator {
             self.connected_servers.lock().unwrap().insert(host);
         }
 
-        // Register and connect sync root (blocking — CF API registration is synchronous)
-        let mid = self.mount_id.clone();
-        let display_name = self.config.display_name.clone();
-        let nas_root = std::path::PathBuf::from(&self.config.nas_share_path);
-        let client_root = self.config.sync_root_dir(&self.cache_root);
-
-        let cache_limit = self.config.sync_cache_limit_bytes;
-        let volume_path = self.config.volume_path();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::sync::SyncRoot::start(&mid, &display_name, nas_root, client_root, cache_limit, &volume_path)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("SyncRoot::start task panicked: {}", e)));
-
-        match result {
-            Ok(sync_root) => {
-                self.connectivity = Some(sync_root.connectivity());
-                self.sync_root = Some(sync_root);
-                self.sync_state = SyncState::Active;
-                log::info!("[{}] Sync root active", self.mount_id);
-
-                // Create symlink from user-facing volume path to cache dir
-                let volume_path = self.config.volume_path();
-                let cache_dir = self.config.sync_root_dir(&self.cache_root).to_string_lossy().to_string();
-                {
-                    use crate::platform::DriveMapping;
-                    let mapping = crate::platform::windows::WindowsMountMapping::new();
-                    match mapping.switch(&volume_path, &cache_dir) {
-                        Ok(()) => {
-                            log::info!(
-                                "[{}] Symlinked {} → {}",
-                                self.mount_id, volume_path, cache_dir
-                            );
-                        }
-                        Err(ref e) if e == "NEEDS_ELEVATION" => {
-                            log::warn!("[{}] Sync symlink requires elevation", self.mount_id);
-                            self.needs_elevation = true;
-                        }
-                        Err(e) => {
-                            // Non-fatal for sync — CF root is accessible directly
-                            log::warn!("[{}] Sync symlink failed (non-fatal): {}", self.mount_id, e);
-                        }
-                    }
-                }
-
-                // Run startup reconciliation (DB-driven diff of visited folders)
-                if let Some(ref sr) = self.sync_root {
-                    let mount_id = self.mount_id.clone();
-                    let (checked, changed, added, removed, updated) =
-                        sr.reconcile_startup();
-                    if changed > 0 {
-                        log::info!(
-                            "[{}] Reconciliation: {}/{} folders changed (+{} -{} ~{})",
-                            mount_id, changed, checked, added, removed, updated
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("[{}] Sync root failed: {}", self.mount_id, e);
-                self.sync_state = SyncState::Error(e.clone());
-                let _ = self
-                    .event_tx
-                    .send(MountEvent::MountFailed { reason: e })
-                    .await;
-            }
-        }
+        // Slice 0: WinFsp provider wiring comes in Slice 1 of
+        // docs/windows-winfsp-port-plan.md. For now, mark sync active so
+        // the state machine advances; the actual mount happens in main.rs
+        // once Slice 1 lands.
+        self._projfs_active = true;
+        self.sync_state = SyncState::Active;
+        log::info!("[{}] Sync active (WinFsp wiring pending Slice 1)", self.mount_id);
     }
 
-    /// Stop on-demand sync: disconnect session, unregister sync root, disconnect SMB session.
+    /// Stop on-demand sync: disconnect SMB session.
+    /// Slice 1 will add `FileSystemHost::unmount()` here.
     #[cfg(windows)]
     async fn stop_sync(&mut self) {
         self.sync_state = SyncState::Deregistering;
 
-        // Remove junction so users can't browse cache dir while agent is down
-        let volume_path = self.config.volume_path();
-        {
-            use crate::platform::DriveMapping;
-            let mapping = crate::platform::windows::WindowsMountMapping::new();
-            if let Err(e) = mapping.remove(&volume_path) {
-                log::debug!("[{}] Remove sync link failed (non-fatal): {}", self.mount_id, e);
-            }
-        }
-
-        if let Some(mut sync_root) = self.sync_root.take() {
-            let result = tokio::task::spawn_blocking(move || {
-                sync_root.stop();
-            })
-            .await;
-            if let Err(e) = result {
-                log::warn!("[{}] SyncRoot::stop task panicked: {}", self.mount_id, e);
-            }
-        }
+        self._projfs_active = false;
 
         // Disconnect the deviceless SMB session
         let share_path = self.config.nas_share_path.clone();
@@ -654,10 +570,7 @@ impl Orchestrator {
                 if let Some(ref conn) = self.connectivity {
                     conn.set_status(crate::sync::NasStatus::Offline);
                 }
-                // Stop the NAS watcher (its handle is now invalid)
-                if let Some(ref sr) = self.sync_root {
-                    sr.stop_watcher();
-                }
+                // ProjFS: watcher lifecycle managed by main.rs
                 self.emit_state_update().await;
                 // Immediately transition to reconnecting
                 self.sync_state = SyncState::Reconnecting;
@@ -692,10 +605,7 @@ impl Orchestrator {
             self.connected_servers.lock().unwrap().insert(host);
         }
 
-        // Restart NAS watcher (runs full_diff to catch up)
-        if let Some(ref sr) = self.sync_root {
-            sr.restart_watcher();
-        }
+        // ProjFS: watcher restart managed by main.rs
 
         // Set online
         self.sync_state = SyncState::Active;
@@ -804,14 +714,7 @@ impl Orchestrator {
         let (sync_state, sync_state_detail) = {
             #[cfg(windows)]
             if self.config.is_sync_mode() {
-                let detail = if self.sync_state == SyncState::Active {
-                    // Include activity summary when active
-                    self.sync_root.as_ref()
-                        .map(|sr| sr.activity_summary())
-                        .unwrap_or_else(|| self.sync_state.to_string())
-                } else {
-                    self.sync_state.to_string()
-                };
+                let detail = self.sync_state.to_string();
                 (
                     Some(self.sync_state.state_name().to_string()),
                     Some(detail),
