@@ -20,7 +20,7 @@ pub mod connectivity;
 #[cfg(windows)]
 pub mod winfsp_server;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod conflict;
 #[cfg(target_os = "macos")]
 pub mod macos_watcher;

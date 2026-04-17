@@ -13,13 +13,15 @@
 //! License: `winfsp` crate + WinFsp DLL are GPL-3.0. UFB is AGPL-3.0 /
 //! GPL-3.0-or-later in `LICENSE` — FLOSS-exception compliant.
 
-use crate::messages::AgentToUfb;
+use crate::messages::{AgentToUfb, ConflictDetectedMsg};
+use crate::sync::conflict;
 use crate::sync::nas_health::NasHealth;
 use crate::sync::windows_cache::CacheIndex;
 use std::ffi::{c_void, OsStr};
 use std::fs;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -35,10 +37,15 @@ use winfsp::{winfsp_init, FspError, U16CStr};
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
 const STATUS_BUFFER_OVERFLOW: i32 = 0x80000005u32 as i32;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC0000035u32 as i32;
+const STATUS_DISK_FULL: i32 = 0xC000007Fu32 as i32;
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 
 fn err_not_found() -> FspError { FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND) }
 fn err_access_denied() -> FspError { FspError::NTSTATUS(STATUS_ACCESS_DENIED) }
 fn err_buffer_overflow() -> FspError { FspError::NTSTATUS(STATUS_BUFFER_OVERFLOW) }
+fn err_name_collision() -> FspError { FspError::NTSTATUS(STATUS_OBJECT_NAME_COLLISION) }
+fn err_io() -> FspError { FspError::NTSTATUS(STATUS_DISK_FULL) }
 
 /// Canonical permissive security descriptor applied to every file. Protected
 /// DACL with Allow-FullAccess to Everyone ("WD" = World). Computed once at
@@ -83,15 +90,20 @@ fn permissive_sd() -> &'static [u8] {
         .as_slice()
 }
 
-/// Per-open context. Files hold a handle; dirs hold a cached DirBuffer.
+/// Per-open context. Files hold a read handle; dirs hold a cached
+/// DirBuffer. `pending_delete` is flipped by `set_delete` and honored by
+/// `cleanup` — matches the Windows "mark for deletion, apply on close"
+/// semantics.
 pub enum OpenCtx {
     File {
         abs: PathBuf,
         handle: fs::File,
+        pending_delete: AtomicBool,
     },
     Dir {
         abs: PathBuf,
         dir_buffer: DirBuffer,
+        pending_delete: AtomicBool,
     },
 }
 
@@ -100,6 +112,12 @@ impl OpenCtx {
         match self {
             OpenCtx::File { abs, .. } => abs,
             OpenCtx::Dir { abs, .. } => abs,
+        }
+    }
+    fn pending_delete(&self) -> &AtomicBool {
+        match self {
+            OpenCtx::File { pending_delete, .. } => pending_delete,
+            OpenCtx::Dir { pending_delete, .. } => pending_delete,
         }
     }
 }
@@ -337,10 +355,15 @@ impl FileSystemContext for PassthroughFs {
             OpenCtx::Dir {
                 abs,
                 dir_buffer: DirBuffer::new(),
+                pending_delete: AtomicBool::new(false),
             }
         } else {
             let h = fs::File::open(&abs).map_err(|_| err_access_denied())?;
-            OpenCtx::File { abs, handle: h }
+            OpenCtx::File {
+                abs,
+                handle: h,
+                pending_delete: AtomicBool::new(false),
+            }
         };
         Ok(Box::new(ctx))
     }
@@ -449,7 +472,7 @@ impl FileSystemContext for PassthroughFs {
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
         let (abs, dir_buffer) = match &**ctx {
-            OpenCtx::Dir { abs, dir_buffer } => (abs, dir_buffer),
+            OpenCtx::Dir { abs, dir_buffer, .. } => (abs, dir_buffer),
             OpenCtx::File { .. } => return Err(err_access_denied()),
         };
 
@@ -503,6 +526,292 @@ impl FileSystemContext for PassthroughFs {
         }
         Ok(dir_buffer.read(marker, buffer))
     }
+
+    // ── Write path (Slice 4) ──
+    //
+    // All writes go synchronously to SMB (authoritative) and invalidate
+    // any cached block-level data. No coordinator / worker queue — same
+    // pattern as sync/nfs_server.rs on macOS.
+
+    fn write(
+        &self,
+        ctx: &Self::FileContext,
+        buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        _constrained_io: bool,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<u32> {
+        let abs = ctx.abs().clone();
+        if matches!(&**ctx, OpenCtx::Dir { .. }) {
+            return Err(err_access_denied());
+        }
+
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(false)
+            .truncate(false)
+            .open(&abs)
+            .map_err(|_| err_access_denied())?;
+
+        let write_offset = if write_to_eof {
+            f.metadata().map(|m| m.len()).unwrap_or(offset)
+        } else {
+            offset
+        };
+        f.seek_write(buffer, write_offset).map_err(|_| err_io())?;
+        f.sync_all().map_err(|_| err_io())?;
+
+        let rel = self.rel_from_abs(&abs);
+        if !rel.is_empty() {
+            self.cache.invalidate_cache_by_path(&rel);
+            if let Ok(meta) = fs::metadata(&abs) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
+                populate_file_info(&meta, file_info);
+            }
+        } else if let Ok(meta) = fs::metadata(&abs) {
+            populate_file_info(&meta, file_info);
+        }
+        Ok(buffer.len() as u32)
+    }
+
+    fn create(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        _granted_access: u32,
+        file_attributes: u32,
+        _security_descriptor: Option<&[c_void]>,
+        _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        _extra_buffer_is_reparse_point: bool,
+        file_info: &mut OpenFileInfo,
+    ) -> winfsp::Result<Self::FileContext> {
+        let abs = self.resolve(file_name);
+        let rel = Self::rel_path(file_name);
+        let is_dir = (create_options & FILE_DIRECTORY_FILE) != 0
+            || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+        if is_dir {
+            fs::create_dir(&abs).map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => err_name_collision(),
+                _ => err_io(),
+            })?;
+        } else {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&abs)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => err_name_collision(),
+                    _ => err_io(),
+                })?;
+        }
+
+        let meta = fs::metadata(&abs).map_err(|_| err_io())?;
+        populate_file_info(&meta, file_info.as_mut());
+
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let created = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(mtime);
+        self.cache.record_new_entry(&rel, &name, is_dir, meta.len(), mtime, created);
+
+        let ctx = if is_dir {
+            OpenCtx::Dir {
+                abs,
+                dir_buffer: DirBuffer::new(),
+                pending_delete: AtomicBool::new(false),
+            }
+        } else {
+            let h = fs::File::open(&abs).map_err(|_| err_access_denied())?;
+            OpenCtx::File {
+                abs,
+                handle: h,
+                pending_delete: AtomicBool::new(false),
+            }
+        };
+        Ok(Box::new(ctx))
+    }
+
+    fn overwrite(
+        &self,
+        ctx: &Self::FileContext,
+        _file_attributes: u32,
+        _replace_file_attributes: bool,
+        allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let abs = ctx.abs().clone();
+        if matches!(&**ctx, OpenCtx::Dir { .. }) {
+            return Err(err_access_denied());
+        }
+        let rel = self.rel_from_abs(&abs);
+
+        // Conflict pre-check: if the NAS file drifted from our cached
+        // metadata (a concurrent writer got there first), preserve the
+        // current NAS content as a `.conflict-<host>-<ts>` sidecar so
+        // both versions survive.
+        if !rel.is_empty() {
+            self.preserve_conflict_sidecar_if_drifted(&rel, &abs);
+        }
+
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(false)
+            .truncate(true)
+            .open(&abs)
+            .map_err(|_| err_access_denied())?;
+        if allocation_size > 0 {
+            f.set_len(allocation_size).map_err(|_| err_io())?;
+        }
+        f.sync_all().map_err(|_| err_io())?;
+        drop(f);
+
+        if !rel.is_empty() {
+            self.cache.invalidate_cache_by_path(&rel);
+            if let Ok(meta) = fs::metadata(&abs) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
+                populate_file_info(&meta, file_info);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_file_size(
+        &self,
+        ctx: &Self::FileContext,
+        new_size: u64,
+        _set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let abs = ctx.abs().clone();
+        if matches!(&**ctx, OpenCtx::Dir { .. }) {
+            return Err(err_access_denied());
+        }
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&abs)
+            .map_err(|_| err_access_denied())?;
+        f.set_len(new_size).map_err(|_| err_io())?;
+        drop(f);
+        let rel = self.rel_from_abs(&abs);
+        if !rel.is_empty() {
+            self.cache.invalidate_cache_by_path(&rel);
+            if let Ok(meta) = fs::metadata(&abs) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
+                populate_file_info(&meta, file_info);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_delete(
+        &self,
+        ctx: &Self::FileContext,
+        _file_name: &U16CStr,
+        delete_file: bool,
+    ) -> winfsp::Result<()> {
+        ctx.pending_delete().store(delete_file, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn cleanup(
+        &self,
+        ctx: &Self::FileContext,
+        _file_name: Option<&U16CStr>,
+        _flags: u32,
+    ) {
+        if !ctx.pending_delete().load(Ordering::Relaxed) {
+            return;
+        }
+        let abs = ctx.abs().clone();
+        let is_dir = matches!(&**ctx, OpenCtx::Dir { .. });
+        let rel = self.rel_from_abs(&abs);
+        let result = if is_dir {
+            fs::remove_dir(&abs)
+        } else {
+            fs::remove_file(&abs)
+        };
+        if let Err(e) = result {
+            log::warn!(
+                "[winfsp] {}: cleanup delete {} failed: {}",
+                self.domain, abs.display(), e
+            );
+            return;
+        }
+        if !rel.is_empty() {
+            self.cache.invalidate_cache_by_path(&rel);
+            self.cache.remove_known_file_by_rel(&rel);
+        }
+    }
+
+    fn rename(
+        &self,
+        _ctx: &Self::FileContext,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> winfsp::Result<()> {
+        let src_abs = self.resolve(file_name);
+        let dst_abs = self.resolve(new_file_name);
+        if !replace_if_exists && dst_abs.exists() {
+            return Err(err_name_collision());
+        }
+        fs::rename(&src_abs, &dst_abs).map_err(|_| err_io())?;
+        let src_rel = Self::rel_path(file_name);
+        let dst_rel = Self::rel_path(new_file_name);
+        if !src_rel.is_empty() && !dst_rel.is_empty() {
+            self.cache.rename_entry_by_rel(&src_rel, &dst_rel);
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        ctx: Option<&Self::FileContext>,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let Some(ctx) = ctx else { return Ok(()) };
+        if let OpenCtx::File { abs, .. } = &**ctx {
+            if let Ok(meta) = fs::metadata(abs) {
+                populate_file_info(&meta, file_info);
+            }
+        }
+        Ok(())
+    }
+
 }
 
 /// Helper: build a DirInfo from a CachedAttr + name and write it to the
@@ -523,6 +832,72 @@ fn write_dir_entry(
 }
 
 impl PassthroughFs {
+    /// Conflict pre-flight for a truncate-style write. If the NAS file
+    /// drifted from our cached metadata (a concurrent writer got there
+    /// first), COPY the current NAS content to a sidecar path before the
+    /// truncate proceeds. Both versions survive: the user's write lands
+    /// on the original path, the other writer's version is preserved as
+    /// `.conflict-<host>-<YYYYMMDD-HHMMSS>.<ext>`. Emits a
+    /// `ConflictDetected` IPC message to UFB.
+    ///
+    /// Always returns without error — we never block a write on conflict
+    /// logistics failing. Worst case: log + proceed.
+    fn preserve_conflict_sidecar_if_drifted(&self, rel: &str, abs: &Path) {
+        let live_meta = match fs::metadata(abs) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let live_size = live_meta.len();
+        let live_mtime = live_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as f64)
+            .unwrap_or(0.0);
+
+        let cached = match self.cache.cached_attr_by_path(rel) {
+            Some(c) => c,
+            None => return,
+        };
+
+        // mtime granularity on SMB is ~1 s; allow 2 s slop.
+        let drifted = live_size != cached.size || (live_mtime - cached.mtime).abs() > 2.0;
+        if !drifted {
+            return;
+        }
+
+        let conflict_abs = conflict::make_conflict_path(abs);
+        if let Err(e) = fs::copy(abs, &conflict_abs) {
+            log::error!(
+                "[winfsp] {}: conflict sidecar copy failed for {} -> {}: {}",
+                self.domain, rel, conflict_abs.display(), e
+            );
+            return;
+        }
+        let sidecar_name = conflict_abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        log::warn!(
+            "[winfsp] {}: conflict on write to {} — preserved remote version as {}",
+            self.domain, rel, sidecar_name
+        );
+        let detected_at = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let msg = AgentToUfb::ConflictDetected(ConflictDetectedMsg {
+            domain: self.domain.clone(),
+            original_path: rel.to_string(),
+            conflict_path: sidecar_name,
+            host: conflict::hostname_short(),
+            detected_at,
+        });
+        if let Err(e) = self.ipc_tx.try_send(msg) {
+            log::warn!("[winfsp] {}: conflict event dropped: {}", self.domain, e);
+        }
+    }
+
     /// Live `fs::read_dir` → populate the cache. Runs once per folder
     /// (the first time it's enumerated). No-ops on SMB error — the
     /// subsequent cache read will just return the empty set.
@@ -790,7 +1165,8 @@ pub fn start(
             .case_sensitive_search(false)
             .unicode_on_disk(true)
             .persistent_acls(false)
-            .read_only_volume(true) // Slice 1: read-only. Slice 4 flips this.
+            // Slice 4 enables writes — Notepad save, Explorer rename/delete,
+            // Premiere project save all rely on a writable volume.
             .post_cleanup_when_modified_only(true)
             .file_info_timeout(1000)
             .volume_info_timeout(1000);

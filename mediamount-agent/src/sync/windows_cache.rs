@@ -617,6 +617,62 @@ impl CacheIndex {
             .map(|mut stmt| stmt.execute(params![new_rel, new_name, new_parent, old_rel]));
     }
 
+    /// Insert a single new entry after a `create` / `mkdir` on the NAS.
+    /// Upserts so callers can retry idempotently. `relative_path` /
+    /// `parent_path` use forward-slash form (no leading slash). Mirrors
+    /// `macos_cache::record_new_entry`.
+    pub fn record_new_entry(
+        &self,
+        relative_path: &str,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+        mtime: i64,
+        created: i64,
+    ) {
+        let parent = cache_core::parent_of(relative_path).to_string();
+        let db = self.db();
+        let _ = db
+            .prepare_cached(
+                "INSERT INTO known_files
+                     (path, name, is_dir, nas_size, nas_mtime, nas_created, parent_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                     name = excluded.name,
+                     is_dir = excluded.is_dir,
+                     nas_size = excluded.nas_size,
+                     nas_mtime = excluded.nas_mtime,
+                     nas_created = excluded.nas_created,
+                     parent_path = excluded.parent_path",
+            )
+            .map(|mut stmt| {
+                stmt.execute(params![
+                    relative_path,
+                    name,
+                    is_dir as i32,
+                    size as i64,
+                    mtime,
+                    created,
+                    parent,
+                ])
+            });
+    }
+
+    /// Update post-write NAS metadata for a single file. Called by the
+    /// write / overwrite / set_file_size callbacks to keep the cache
+    /// coherent with SMB after authoritative writes.
+    pub fn update_metadata_by_rel(&self, rel: &str, size: u64, mtime: i64) {
+        let now = Self::unix_now();
+        let db = self.db();
+        let _ = db
+            .prepare_cached(
+                "UPDATE known_files
+                 SET nas_size = ?1, nas_mtime = ?2, last_verified_at = ?3
+                 WHERE path = ?4",
+            )
+            .map(|mut stmt| stmt.execute(params![size as i64, mtime, now, rel]));
+    }
+
     /// Invalidate cache for a file (write-through path).
     pub fn invalidate_cache_by_path(&self, rel: &str) {
         let db = self.db();
