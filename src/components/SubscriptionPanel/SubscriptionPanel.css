@@ -225,6 +225,22 @@
   background: transparent;
 }
 
+/* Reachability probe says the mount's path can't be stat'd — VPN down,
+   NAS offline, probe returned stale, etc. The item stays fully
+   clickable; the visual is a HINT, not a lock. Users can still try
+   to open, and the click re-probes so stale state self-heals. */
+.panel-item-unavailable {
+  opacity: 0.55;
+}
+.panel-item-unavailable:hover {
+  opacity: 0.75;
+}
+.panel-item-unavailable .item-label {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--text-disabled);
+}
+
 .ctx-menu-disabled {
   opacity: 0.6;
   pointer-events: none;

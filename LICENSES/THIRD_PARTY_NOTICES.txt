@@ -47,26 +47,38 @@ individual LICENSE files in this directory.
    Shipped as pdfium.dll (Windows) / libpdfium (macOS)
    https://pdfium.googlesource.com/pdfium/
 
-9. cloud-filter (Rust crate - Windows Cloud Files API wrapper)
-   Copyright (c) 2022 ok-nick
-   License: MIT
-   https://github.com/ho-229/cloud-filter-rs
+9. WinFsp (Windows File System Proxy — user-mode filesystem driver)
+   Copyright (C) Bill Zissimopoulos
+   License: GPL-3.0 with FLOSS exception (see WinFsp-LICENSE.txt)
+   File: WinFsp-LICENSE.txt
+   Shipped as bundled installer component; linked via the `winfsp` Rust crate.
+   https://github.com/winfsp/winfsp
 
-10. notify (Rust crate - cross-platform filesystem watcher, used for FSEvents on macOS)
+10. nfsserve (Rust crate — NFS3 server library, used for macOS NFS loopback VFS)
+    Copyright (c) 2023 Xethub, Inc. / Hugging Face
+    License: BSD-3-Clause
+    https://github.com/xetdata/nfsserve
+
+11. notify (Rust crate — cross-platform filesystem watcher, used for FSEvents on macOS)
     License: CC0-1.0
     https://github.com/notify-rs/notify
 
-11. rusqlite (Rust crate - SQLite bindings, used for sync cache index)
+12. rusqlite (Rust crate — SQLite bindings, used for app DB + sync cache index)
     Copyright (c) The rusqlite developers
     License: MIT
     https://github.com/rusqlite/rusqlite
 
-12. pdfium-render (Rust crate - high-level wrapper around PDFium)
+13. pdfium-render (Rust crate — high-level wrapper around PDFium)
     Copyright (c) Alastair Carey
     License: MIT OR Apache-2.0
     https://github.com/ajrcarey/pdfium-render
 
 ===============================================================================
+
+UFB is distributed under GPL-3.0-or-later to satisfy the WinFsp FLOSS
+exception, which requires the distributing application itself to be
+Free/Libre Open Source Software. See the root LICENSE file for the full
+GPL-3.0 text.
 
 All Rust dependencies are managed via Cargo and subject to their respective
 licenses. Run `cargo license` in the src-tauri directory for a complete list.

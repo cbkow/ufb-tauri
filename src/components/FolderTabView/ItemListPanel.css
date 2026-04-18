@@ -70,8 +70,9 @@
 }
 
 .item-col-header.col-name {
-  flex: 1;
-  min-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .item-col-header.col-meta {
@@ -81,7 +82,7 @@
 }
 
 .item-col-header.col-date {
-  width: 70px;
+  /* width applied inline from the dateW signal */
 }
 
 .sort-arrow {
@@ -146,8 +147,7 @@
 }
 
 .item-row-name {
-  flex: 1;
-  min-width: 100px;
+  flex-shrink: 0;
   font-size: 13px;
   color: var(--text-primary);
   overflow: hidden;
@@ -173,7 +173,9 @@
   color: var(--text-secondary);
   font-size: 11px;
   white-space: nowrap;
-  width: 70px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* width applied inline from the dateW signal */
   flex-shrink: 0;
   padding: 4px 8px;
   text-align: right;

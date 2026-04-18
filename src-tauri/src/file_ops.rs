@@ -12,13 +12,56 @@ pub struct FileEntry {
     pub extension: String,
 }
 
+/// Windows `ERROR_UNTRUSTED_MOUNT_POINT`. Raised by the NT FS filter when
+/// a process tries to traverse a reparse point (symlink/junction/WinFsp
+/// mount) and SmartScreen's first-run reputation check is still running
+/// on the calling EXE. The restriction lifts within a few seconds once
+/// the scan completes — the only fix without a code-signing cert is to
+/// retry. We retry only on this exact errno to avoid masking real
+/// permission or not-found errors.
+#[cfg(windows)]
+const ERROR_UNTRUSTED_MOUNT_POINT: i32 = 448;
+
+/// Wrapper around `read_dir` that transparently retries on the Windows
+/// SmartScreen first-launch 448 error. Up to 4 attempts over ~1.5s total.
+fn read_dir_with_448_retry(path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(windows)]
+    {
+        let mut delay_ms = 200;
+        for attempt in 0..4 {
+            match std::fs::read_dir(path) {
+                Ok(rd) => return Ok(rd),
+                Err(e) => {
+                    if e.raw_os_error() == Some(ERROR_UNTRUSTED_MOUNT_POINT) && attempt < 3 {
+                        log::warn!(
+                            "[file_ops] 448 UNTRUSTED_MOUNT_POINT on {:?}, retry {} in {}ms",
+                            path, attempt + 1, delay_ms
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        delay_ms *= 2;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        unreachable!()
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_dir(path)
+    }
+}
+
 /// List directory contents, returning file entries sorted (dirs first, then by name).
 pub fn list_directory(path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = Path::new(path);
 
     let mut entries = Vec::new();
-    let read_dir =
-        std::fs::read_dir(dir_path).map_err(|e| format!("Not a directory or cannot read: {}", e))?;
+    let read_dir = match read_dir_with_448_retry(dir_path) {
+        Ok(rd) => rd,
+        Err(e) => return Err(format!("Not a directory or cannot read: {}", e)),
+    };
 
     for entry in read_dir {
         let entry = match entry {

@@ -1,14 +1,45 @@
 import { createSignal, onCleanup } from "solid-js";
-import { createStore } from "solid-js/store";
+import { createStore, reconcile } from "solid-js/store";
 import type { FileEntry } from "../lib/types";
 import { listDirectory } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 
 export type SortField = "name" | "size" | "modified" | "extension";
 export type SortDirection = "asc" | "desc";
-export type ViewMode = "list" | "grid";
+export type ViewMode = "list" | "grid" | "tree";
+
+/// Row in the tree-mode flat list. Produced by `BrowserStore.treeList()` —
+/// one entry per visible row across all expanded levels. `depth` drives the
+/// leading indent; `isLoading` shows a spinner while children fetch.
+export interface TreeRow {
+  entry: FileEntry;
+  depth: number;
+  isExpanded: boolean;
+  isLoading: boolean;
+}
 
 let browserIdCounter = 0;
+
+/// Shallow content comparison of two entry arrays. Returns true iff the
+/// lists are the same length and each corresponding entry matches on the
+/// fields that actually matter for rendering (path, size, mtime, isDir).
+/// Used to short-circuit refresh-loops when the folder hasn't changed.
+function entriesEqual(a: readonly FileEntry[], b: readonly FileEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.path !== y.path ||
+      x.size !== y.size ||
+      x.modified !== y.modified ||
+      x.isDir !== y.isDir
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export interface BrowserStore {
   /** Unique identifier for this browser instance */
@@ -28,6 +59,11 @@ export interface BrowserStore {
   entries: FileEntry[];
   selection: Set<string>;
   sortedEntries: () => FileEntry[];
+
+  // Tree-view state (viewMode === "tree")
+  treeList: () => TreeRow[];
+  isPathExpanded: (path: string) => boolean;
+  toggleTreeExpand: (path: string) => void;
 
   // Actions
   navigateTo: (path: string, addToHistory?: boolean) => Promise<void>;
@@ -76,18 +112,58 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
 
   async function navigateTo(path: string, addToHistory = true) {
     setIsLoading(true);
-    // Cancel pending thumbnail requests from previous directory
-    const { clearThumbnailQueue } = await import("../components/FileBrowser/ThumbnailImage");
-    clearThumbnailQueue();
+    const isRefresh = path === currentPath() && !addToHistory;
+    // Cancel pending thumbnail requests from previous directory. Only on
+    // a FRESH navigation — on refresh (agent's 2s sync heartbeat), the
+    // current folder's ThumbnailImage components are preserved, so
+    // resolving their pending requests with `null` would pollute
+    // `noThumbPaths` permanently for files whose thumbnails hadn't
+    // finished generating yet.
+    if (!isRefresh) {
+      const { clearThumbnailQueue } = await import("../components/FileBrowser/ThumbnailImage");
+      clearThumbnailQueue();
+    }
     try {
-      const isRefresh = path === currentPath() && !addToHistory;
       const entries = await listDirectory(path);
-      setState("entries", entries);
+
+      // If this is a refresh and the entries are content-identical to
+      // the current list (same paths, sizes, mtimes in the same order),
+      // SKIP setState entirely. The mount-state heartbeat fires every 2s
+      // and each state-update used to cascade into a full grid re-render
+      // (even with reconcile, any in-flight thumbnail request got
+      // interrupted by the setState pass), which was the "loads 2, pause,
+      // 2 more, pause" pattern users saw.
+      if (isRefresh && entriesEqual(state.entries, entries)) {
+        setIsLoading(false);
+        return;
+      }
+      if (isRefresh) {
+        // Stable merge keyed by path: unchanged entries keep the SAME
+        // object reference, so <For> doesn't unmount+remount grid rows
+        // (and their ThumbnailImage children) every time the agent's 2s
+        // sync heartbeat fires. Without this, every state-update poisons
+        // the thumbnail cache via the backend's in-flight dedup and kills
+        // thumbnail rendering entirely.
+        setState("entries", reconcile(entries, { key: "path" }));
+      } else {
+        setState("entries", entries);
+      }
 
       if (isRefresh) {
         // Preserve selection on same-directory refresh, but prune paths
-        // that no longer exist (e.g. deleted files)
-        const validPaths = new Set(entries.map((e) => e.path));
+        // that no longer exist (e.g. deleted files).
+        //
+        // Tree view: the selection can include paths several levels deep
+        // (inside expanded subfolders), so we must include cached children
+        // in the valid-path set. Without this, the 1-second mount-state
+        // refresh tick wipes every selection that isn't at root level —
+        // "selects then unselects fast" from the user's perspective.
+        const validPaths = new Set<string>(entries.map((e) => e.path));
+        for (const children of childrenCache().values()) {
+          for (const child of children) {
+            validPaths.add(child.path);
+          }
+        }
         const pruned = new Set(
           [...state.selection].filter((p) => validPaths.has(p))
         );
@@ -98,6 +174,12 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
       } else {
         setState("selection", new Set());
         setState("lastSelectedPath", null);
+        // Fresh navigation — drop tree state from the previous root.
+        // Refreshes (addToHistory=false, same path) keep tree state so
+        // the user's expanded subtree survives a refresh tick.
+        setExpandedPaths(new Set<string>());
+        setChildrenCache(new Map<string, FileEntry[]>());
+        setLoadingPaths(new Set<string>());
       }
       setCurrentPath(path);
 
@@ -151,13 +233,22 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
       const newSelection = new Set(multi ? prev.selection : []);
 
       if (range && prev.lastSelectedPath) {
-        const entries = prev.entries;
-        const lastIdx = entries.findIndex((e) => e.path === prev.lastSelectedPath);
-        const curIdx = entries.findIndex((e) => e.path === path);
+        // Shift-range walks the ORDERED SEQUENCE of rows currently visible
+        // to the user. In list/grid that's `sortedEntries` (root only). In
+        // tree view it's the flat `treeList` which also includes expanded
+        // children — so shift-clicks that span across expanded subfolders
+        // select every row in between, not just root-level items.
+        const orderedPaths: string[] =
+          viewMode() === "tree"
+            ? treeList().map((r) => r.entry.path)
+            : getSortedEntries().map((e) => e.path);
+
+        const lastIdx = orderedPaths.indexOf(prev.lastSelectedPath);
+        const curIdx = orderedPaths.indexOf(path);
         if (lastIdx !== -1 && curIdx !== -1) {
           const [start, end] = lastIdx < curIdx ? [lastIdx, curIdx] : [curIdx, lastIdx];
           for (let i = start; i <= end; i++) {
-            newSelection.add(entries[i].path);
+            newSelection.add(orderedPaths[i]);
           }
         }
       } else if (multi && newSelection.has(path)) {
@@ -195,26 +286,158 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
     }
   }
 
-  function getSortedEntries(): FileEntry[] {
-    const entries = [...state.entries];
-    const field = sortField();
+  /// Compare two entries per the browser's current sort state. Folders
+  /// always come before files regardless of field. Used by list/grid and
+  /// by each expansion level in tree view.
+  function compareBySort(a: FileEntry, b: FileEntry): number {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
     const dir = sortDirection() === "asc" ? 1 : -1;
+    switch (sortField()) {
+      case "name":
+        return dir * a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      case "size":
+        return dir * (a.size - b.size);
+      case "modified":
+        return dir * ((a.modified ?? 0) - (b.modified ?? 0));
+      case "extension":
+        return dir * a.extension.toLowerCase().localeCompare(b.extension.toLowerCase());
+      default:
+        return 0;
+    }
+  }
 
-    return entries.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      switch (field) {
-        case "name":
-          return dir * a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-        case "size":
-          return dir * (a.size - b.size);
-        case "modified":
-          return dir * ((a.modified ?? 0) - (b.modified ?? 0));
-        case "extension":
-          return dir * a.extension.toLowerCase().localeCompare(b.extension.toLowerCase());
-        default:
-          return 0;
+  function getSortedEntries(): FileEntry[] {
+    return [...state.entries].sort(compareBySort);
+  }
+
+  // ── Tree view state ──────────────────────────────────────────────────
+  //
+  // In-memory, session-scoped: expansion set + per-path children cache +
+  // loading set. Lives for the lifetime of this BrowserStore instance.
+  // Closing the tab / reloading the app discards it — matches "flat initial
+  // load" behavior the user asked for. Each Set/Map is updated by replacing
+  // the whole container so signal equality triggers re-render.
+
+  const [expandedPaths, setExpandedPaths] = createSignal<Set<string>>(new Set());
+  const [childrenCache, setChildrenCache] = createSignal<Map<string, FileEntry[]>>(new Map());
+  const [loadingPaths, setLoadingPaths] = createSignal<Set<string>>(new Set());
+
+  function isPathExpanded(path: string): boolean {
+    return expandedPaths().has(path);
+  }
+
+  async function loadChildren(path: string) {
+    // Delay the spinner by 150ms so fast loads don't flash. If the
+    // listDirectory call finishes before that, we clear the timer and
+    // never add the path to loadingPaths — no flicker for empty folders
+    // or cached SMB paths.
+    const spinnerTimer = setTimeout(() => {
+      setLoadingPaths((prev) => {
+        const next = new Set(prev);
+        next.add(path);
+        return next;
+      });
+    }, 150);
+    try {
+      const entries = await listDirectory(path);
+      clearTimeout(spinnerTimer);
+      setChildrenCache((prev) => {
+        const next = new Map(prev);
+        next.set(path, entries);
+        return next;
+      });
+    } catch (err) {
+      clearTimeout(spinnerTimer);
+      console.error(`[tree] failed to load children of ${path}:`, err);
+      // Leave the path expanded-but-empty; user can collapse/retry.
+      setChildrenCache((prev) => {
+        const next = new Map(prev);
+        next.set(path, []);
+        return next;
+      });
+    } finally {
+      // Always clean loadingPaths in case the spinner already showed.
+      setLoadingPaths((prev) => {
+        if (!prev.has(path)) return prev;
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+    }
+  }
+
+  function toggleTreeExpand(path: string) {
+    setExpandedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+        // First-time expand: fetch children asynchronously.
+        if (!childrenCache().has(path)) {
+          void loadChildren(path);
+        }
       }
+      return next;
     });
+  }
+
+  /// Compiled flat list for tree view — walks root entries and recursively
+  /// inlines children of expanded paths. Per-level sort.
+  ///
+  /// Row identity is stable across calls: same path + same (entry, depth,
+  /// isExpanded, isLoading) tuple returns the SAME TreeRow reference. Solid's
+  /// `<For>` reconciles by reference, so stable identity prevents every row
+  /// from unmounting+remounting on each toggle (which was resetting scroll
+  /// position to the top of the tree).
+  const rowCache = new Map<string, TreeRow>();
+  function treeList(): TreeRow[] {
+    const out: TreeRow[] = [];
+    const expanded = expandedPaths();
+    const cache = childrenCache();
+    const loading = loadingPaths();
+    const seen = new Set<string>();
+
+    function rowFor(entry: FileEntry, depth: number, isExp: boolean, isLoad: boolean): TreeRow {
+      const existing = rowCache.get(entry.path);
+      if (
+        existing &&
+        existing.entry === entry &&
+        existing.depth === depth &&
+        existing.isExpanded === isExp &&
+        existing.isLoading === isLoad
+      ) {
+        return existing;
+      }
+      const row: TreeRow = { entry, depth, isExpanded: isExp, isLoading: isLoad };
+      rowCache.set(entry.path, row);
+      return row;
+    }
+
+    function visit(entries: FileEntry[], depth: number) {
+      const sorted = [...entries].sort(compareBySort);
+      for (const entry of sorted) {
+        const isExp = expanded.has(entry.path);
+        out.push(rowFor(entry, depth, isExp, loading.has(entry.path)));
+        seen.add(entry.path);
+        if (entry.isDir && isExp) {
+          const children = cache.get(entry.path);
+          if (children) {
+            visit(children, depth + 1);
+          }
+          // else: loading — spinner row is rendered in the view from
+          // `isLoading` on the parent entry; no placeholder row here.
+        }
+      }
+    }
+
+    visit(state.entries, 0);
+    // Evict rows that no longer appear (folder collapsed, tree truncated).
+    // Without this, the cache grows unbounded across heavy expand/collapse.
+    for (const key of rowCache.keys()) {
+      if (!seen.has(key)) rowCache.delete(key);
+    }
+    return out;
   }
 
   // Auto-refresh when mount state changes (e.g. symlink created/switched)
@@ -271,6 +494,9 @@ export function createBrowserStore(initialPath?: string): BrowserStore {
       return state.selection;
     },
     sortedEntries: getSortedEntries,
+    treeList,
+    isPathExpanded,
+    toggleTreeExpand,
     navigateTo,
     goBack,
     goForward,

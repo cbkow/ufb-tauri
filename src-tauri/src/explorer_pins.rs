@@ -12,15 +12,17 @@ use std::os::windows::process::CommandExt;
 pub fn collect_nav_pins(state: &crate::app_state::AppState) -> Vec<NavPinEntry> {
     let mut entries = Vec::new();
 
-    // 1. Mount configs — volume paths (C:\Volumes\ufb\{shareName})
+    // 1. Mount configs — volume paths (C:\Volumes\ufb\{shareName}).
+    //
+    // Both sync and non-sync mounts get a nav pin. Before the WinFsp
+    // cutover, sync mounts registered themselves via the Cloud Files
+    // shell extension (with a redirect to the junction path), so this
+    // loop skipped them. Post-cutover the WinFsp mount point is just a
+    // regular directory — identical to the symlink path used by plain-
+    // SMB mounts — so the same nav-pin path covers both.
     let mount_cfg = crate::mount_client::load_mount_config();
     for m in &mount_cfg.mounts {
         if !m.enabled {
-            continue;
-        }
-        // Sync mounts get their Explorer entry from the CF API registration,
-        // redirected to point at the junction path. No nav pin needed.
-        if m.sync_enabled {
             continue;
         }
         // Use volume path: derive share name from NAS path (last component)

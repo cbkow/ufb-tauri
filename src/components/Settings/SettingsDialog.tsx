@@ -1,6 +1,6 @@
 import { createSignal, createResource, createMemo, createEffect, For, Show, onCleanup, onMount } from "solid-js";
 import { settingsStore, ACCENT_COLORS } from "../../stores/settingsStore";
-import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare } from "../../lib/tauri";
+import { getMeshStatus, setMeshEnabled, triggerFlushEdits, triggerSnapshot, reinitMeshSync, pickFolder, relaunchApp, mountStoreCredentials, mountHasCredentials, mountDeleteCredentials, mountListCredentialKeys, mountHideDrives, mountUnhideDrives, getPlatform, mountSmbShare, revealInFileManager } from "../../lib/tauri";
 import type { CredentialInfo } from "../../lib/tauri";
 import { mountStore, type MountStateUpdate, type MountConfig, type MountsConfig } from "../../stores/mountStore";
 import type { MeshSyncStatus, PathMapping } from "../../lib/types";
@@ -959,18 +959,34 @@ function MountsSection(props: {
         </div>
       </Show>
 
-      {/* Sync cache location — global setting for all sync mounts (not macOS — FileProvider controls cache) */}
-      <Show when={props.platform() !== "mac" && props.mountConfig().mounts.some((m) => m.syncEnabled)}>
+      {/* Sync cache location — global setting for all sync mounts.
+          Shown whenever at least one mount has sync enabled; applies to
+          both the macOS NFS loopback cache and the Windows WinFsp cache. */}
+      <Show when={props.mountConfig().mounts.some((m) => m.syncEnabled)}>
         <h3>Sync Cache</h3>
         <label class="settings-field">
           <div class="settings-field-header">
             <span>Cache Location</span>
-            <span class="settings-help" title="Local folder where sync mount data is cached. Changing this will disconnect all sync mounts and re-sync from scratch.">?</span>
+            <span class="settings-help" title="Local folder where sync mount metadata and block-cached content is stored. Changing this will tear down all sync mounts, drop cached data, and rebuild at the new location.">?</span>
           </div>
           <div style={{ display: "flex", gap: "var(--spacing-xs)", "align-items": "center" }}>
             <div class="settings-value-display" style={{ flex: 1 }}>
               {props.mountConfig().syncCacheRoot || mountStore.defaultCacheRoot}
             </div>
+            <button
+              class="settings-btn"
+              title="Reveal cache folder in file manager"
+              onClick={async () => {
+                const path = props.mountConfig().syncCacheRoot || mountStore.defaultCacheRoot;
+                if (path) {
+                  try {
+                    await revealInFileManager(path);
+                  } catch (err) {
+                    console.error("Failed to open cache folder:", err);
+                  }
+                }
+              }}
+            >Open</button>
             <button
               class="settings-btn"
               onClick={async () => {

@@ -1,4 +1,4 @@
-import { createSignal, createMemo, Show, onMount, onCleanup } from "solid-js";
+import { createSignal, createMemo, Show, Switch, Match, onMount, onCleanup } from "solid-js";
 import type { BrowserStore } from "../../stores/fileStore";
 import type { FileEntry } from "../../lib/types";
 import { subscriptionStore } from "../../stores/subscriptionStore";
@@ -25,6 +25,7 @@ import { adjustMenuPosition } from "../../lib/contextMenuPosition";
 import { NavigationBar } from "./NavigationBar";
 import { FileListView } from "./FileListView";
 import { FileGridView } from "./FileGridView";
+import { FileTreeView } from "./FileTreeView";
 import { useRubberBandSelect } from "../../lib/useRubberBandSelect";
 import "./FileBrowser.css";
 
@@ -603,9 +604,17 @@ export function FileBrowser(props: FileBrowserProps) {
         onContextMenu={onBackgroundContextMenu}
         onMouseDown={rubberBand.onMouseDown}
       >
-        <Show
-          when={props.store.viewMode() === "list"}
-          fallback={
+        <Switch>
+          <Match when={props.store.viewMode() === "tree"}>
+            <FileTreeView
+              store={props.store}
+              isProjectFolder={isProjectFolder()}
+              isSubscribed={isSubscribed}
+              onItemContextMenu={onItemContextMenu}
+              onItemDoubleClick={onItemDoubleClick}
+            />
+          </Match>
+          <Match when={props.store.viewMode() === "grid"}>
             <FileGridView
               store={props.store}
               isProjectFolder={isProjectFolder()}
@@ -613,16 +622,17 @@ export function FileBrowser(props: FileBrowserProps) {
               onItemContextMenu={onItemContextMenu}
               onItemDoubleClick={onItemDoubleClick}
             />
-          }
-        >
-          <FileListView
-            store={props.store}
-            isProjectFolder={isProjectFolder()}
-            isSubscribed={isSubscribed}
-            onItemContextMenu={onItemContextMenu}
-            onItemDoubleClick={onItemDoubleClick}
-          />
-        </Show>
+          </Match>
+          <Match when={props.store.viewMode() === "list"}>
+            <FileListView
+              store={props.store}
+              isProjectFolder={isProjectFolder()}
+              isSubscribed={isSubscribed}
+              onItemContextMenu={onItemContextMenu}
+              onItemDoubleClick={onItemDoubleClick}
+            />
+          </Match>
+        </Switch>
         <Show when={rubberBand.rect()}>
           {(r) => (
             <div

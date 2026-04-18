@@ -1,6 +1,6 @@
 [package]
 name = "mediamount-agent"
-version = "0.4.1"
+version = "0.5.1"
 edition = "2021"
 description = "MediaMount VFS mount agent for UFB"
 license = "GPL-3.0-or-later"
@@ -39,7 +39,13 @@ async-trait = "0.1"
 # for `winfsp-sys`'s bindgen step — set LIBCLANG_PATH or install LLVM to PATH.
 # Licensed GPL-3.0; UFB is GPL-3.0 to satisfy the FLOSS exception. See
 # docs/windows-winfsp-port-plan.md and docs/windows-io-backend-evaluation.md.
-winfsp = { version = "0.12", features = ["debug", "system"] }
+# DO NOT enable the "debug" feature. It routes FspDebugLog output to
+# stderr via `GetStdHandle(STD_ERROR_HANDLE).unwrap()` — which panics
+# when the agent runs without a console attached (i.e., every install
+# scenario where Windows launches mediamount-agent.exe from the Run
+# registry key). The panic tears down `FileSystemHost::new()` before
+# the dispatcher starts → no sync. Leave `debug` off in release.
+winfsp = { version = "0.12", features = ["system"] }
 widestring = "1.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

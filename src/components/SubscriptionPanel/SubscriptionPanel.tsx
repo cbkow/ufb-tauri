@@ -310,7 +310,12 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
               {(cfg) => {
                 const ms = () => mountStore.states[cfg.id];
                 const isSync = () => cfg.syncEnabled;
+                // Reachability probing is disabled (see mountStore
+                // `startReachabilityProbe`). Always return false so the
+                // Unavailable visual never shows.
+                const isUnreachable = () => false;
                 const stateClass = () => {
+                  if (isUnreachable()) return "mount-warn";
                   if (isSync()) {
                     const ss = ms()?.syncState;
                     if (ss === "active") return "mount-healthy";
@@ -327,6 +332,7 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                   return "mount-error";
                 };
                 const stateLabel = () => {
+                  if (isUnreachable()) return "Unavailable";
                   if (isSync()) {
                     const ss = ms()?.syncState;
                     if (ss === "active") {
@@ -355,11 +361,33 @@ export function SubscriptionPanel(props: SubscriptionPanelProps) {
                 };
                 return (
                   <div
-                    class="panel-item"
-                    onClick={() => navigate(mountStore.getMountPath(cfg))}
-                    onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); navigateRight(mountStore.getMountPath(cfg)); } }}
+                    class={`panel-item ${isUnreachable() ? "panel-item-unavailable" : ""}`}
+                    onClick={() => {
+                      // Always try to navigate. "Unavailable" is a hint,
+                      // not a lock — the probe can go stale (VPN just
+                      // reconnected, mount still settling) and users have
+                      // the right to try anyway. Re-probe on click so the
+                      // visual state catches up next pass.
+                      if (isUnreachable()) {
+                        void mountStore.probeReachabilityNow();
+                      }
+                      navigate(mountStore.getMountPath(cfg));
+                    }}
+                    onMouseDown={(e) => {
+                      if (e.button === 1) {
+                        e.preventDefault();
+                        if (isUnreachable()) {
+                          void mountStore.probeReachabilityNow();
+                        }
+                        navigateRight(mountStore.getMountPath(cfg));
+                      }
+                    }}
                     onContextMenu={(e) => onMountContextMenu(e, cfg.id)}
-                    title={ms()?.syncStateDetail ?? ms()?.stateDetail ?? mountStore.getMountPath(cfg)}
+                    title={
+                      isUnreachable()
+                        ? `Marked Unavailable — last reachability probe failed. Click to try anyway; retries will re-probe.`
+                        : ms()?.syncStateDetail ?? ms()?.stateDetail ?? mountStore.getMountPath(cfg)
+                    }
                   >
                     <span class={`mount-status-dot ${stateClass()}`} />
                     <span class="item-label truncate">{cfg.displayName}</span>

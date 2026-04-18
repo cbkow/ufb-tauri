@@ -18,6 +18,11 @@ pub struct MacosCache {
     pool: SqlitePool,
     nas_root: PathBuf,
     cache_limit: u64,
+    /// Root directory for this cache instance — DB files live directly
+    /// under this path, block-level content blobs under `{cache_dir}/by_handle/`.
+    /// User-configurable via `syncCacheRoot` in `mounts.json`; defaults to
+    /// `MountConfig::default_cache_root()`.
+    cache_dir: PathBuf,
     /// Domain/share name this cache belongs to — used when emitting
     /// BadgeUpdate messages so the FinderSync extension can scope badges
     /// to a specific share.
@@ -35,13 +40,17 @@ pub struct MacosCache {
 
 impl MacosCache {
     /// Open or create the cache DB for a domain.
-    pub fn open(domain: &str, nas_root: PathBuf, cache_limit: u64) -> Result<Self, String> {
-        let cache_dir = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".local/share/ufb/cache")
-        } else {
-            PathBuf::from("/tmp/ufb-cache")
-        };
-        std::fs::create_dir_all(&cache_dir)
+    ///
+    /// `cache_dir` is the effective cache root (`MountsConfig::cache_root()`) —
+    /// the DB lives at `{cache_dir}/{domain}.db`, and block-level content
+    /// blobs under `{cache_dir}/by_handle/`.
+    pub fn open(
+        domain: &str,
+        nas_root: PathBuf,
+        cache_limit: u64,
+        cache_dir: &Path,
+    ) -> Result<Self, String> {
+        std::fs::create_dir_all(cache_dir)
             .map_err(|e| format!("Failed to create cache dir: {}", e))?;
 
         let db_path = cache_dir.join(format!("{}.db", domain));
@@ -247,6 +256,7 @@ impl MacosCache {
             pool,
             nas_root,
             cache_limit,
+            cache_dir: cache_dir.to_path_buf(),
             domain: domain.to_string(),
             per_fh_locks: Mutex::new(HashMap::new()),
             badge_tx: Mutex::new(None),
@@ -1140,18 +1150,15 @@ impl MacosCache {
     /// Cache-file path for a given NFS handle. Directory is created on first
     /// call; callers can assume the parent exists.
     pub fn cache_file_path(&self, fh: u64) -> PathBuf {
-        let dir = Self::cache_file_dir();
+        let dir = self.cache_file_dir();
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{:016x}", fh))
     }
 
-    /// Root of the content-cache filesystem layout (shared by all domains).
-    fn cache_file_dir() -> PathBuf {
-        if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".local/share/ufb/cache/by_handle")
-        } else {
-            PathBuf::from("/tmp/ufb-cache/by_handle")
-        }
+    /// Root of the content-cache filesystem layout for this domain. Rooted
+    /// under the user-configurable `cache_dir` passed into `open()`.
+    fn cache_file_dir(&self) -> PathBuf {
+        self.cache_dir.join("by_handle")
     }
 
     // ── NFS handle / metadata serving (Phase 1) ──

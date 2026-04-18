@@ -39,7 +39,11 @@ export default function App() {
 
     // Initialize mount store — launch agent + tray on macOS
     mountStore.launchAgent();
-    mountStore.loadStates();
+    await mountStore.loadStates();
+    // Kick off reachability probe loop once configs are known, so the
+    // Bookmarks panel can show "Unavailable" when a VPN is down / NAS
+    // offline without waiting for a user click to discover it.
+    mountStore.startReachabilityProbe();
 
     setReady(true);
 

@@ -100,6 +100,14 @@ export const removeBookmark = (path: string) =>
 export const listDirectory = (path: string) =>
   invoke<FileEntry[]>("list_directory", { path });
 
+/**
+ * Lightweight reachability probe — `true` if the path stat's successfully.
+ * For unreachable UNC paths under a dropped VPN, may block for ~30s
+ * (Windows SMB timeout). Caller should debounce / cap concurrency.
+ */
+export const probePathReachable = (path: string) =>
+  invoke<boolean>("probe_path_reachable", { path });
+
 export const createDirectory = (path: string) =>
   invoke<void>("create_directory", { path });
 

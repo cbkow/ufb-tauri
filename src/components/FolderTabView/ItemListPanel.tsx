@@ -68,6 +68,20 @@ function saveVisibility(jobPath: string, folderName: string, vis: Record<string,
   } catch { /* ignore */ }
 }
 
+// Name and Modified widths are shared across every ItemListPanel instance
+// (unlike per-folder metadata columns, which persist to SQLite).
+// localStorage keeps them simple and global — matches FileListView.
+function loadItemColWidth(colId: string, fallback: number): number {
+  try {
+    const v = localStorage.getItem(`ufb-item-col:${colId}`);
+    return v ? Number(v) : fallback;
+  } catch { return fallback; }
+}
+
+function saveItemColWidth(colId: string, w: number) {
+  try { localStorage.setItem(`ufb-item-col:${colId}`, String(Math.round(w))); } catch { /* */ }
+}
+
 export function ItemListPanel(props: ItemListPanelProps) {
   const [items, setItems] = createSignal<FileEntry[]>([]);
   const [columns, setColumns] = createSignal<ColumnDefinition[]>([]);
@@ -80,7 +94,18 @@ export function ItemListPanel(props: ItemListPanelProps) {
   const [editingCell, setEditingCell] = createSignal<{ itemPath: string; colName: string } | null>(null);
   const [showColumnManager, setShowColumnManager] = createSignal(false);
   const [overrideWidths, setOverrideWidths] = createSignal<Record<number, number>>({});
+  const [nameW, setNameW] = createSignal(loadItemColWidth("name", 240));
+  const [dateW, setDateW] = createSignal(loadItemColWidth("date", 70));
   const [saveError, setSaveError] = createSignal<string | null>(null);
+
+  const nameResizer = makeColumnResizer({
+    getWidth: nameW, setWidth: setNameW,
+    onDone: (w) => saveItemColWidth("name", w),
+  });
+  const dateResizer = makeColumnResizer({
+    getWidth: dateW, setWidth: setDateW,
+    onDone: (w) => saveItemColWidth("date", w),
+  });
 
   let panelRef: HTMLDivElement | undefined;
 
@@ -445,10 +470,15 @@ export function ItemListPanel(props: ItemListPanelProps) {
         <div class="item-col-header col-track" title="Tracked">
           <span class="icon" style={{ "font-size": "14px" }}>star</span>
         </div>
-        <div class="item-col-header col-name" onClick={() => toggleSort("name")}>
+        <div
+          class="item-col-header col-name"
+          style={{ width: `${nameW()}px` }}
+          onClick={() => toggleSort("name")}
+        >
           Name
           {sortField() === "name" && <span class="sort-arrow">{sortDir() === "asc" ? "\u25B2" : "\u25BC"}</span>}
         </div>
+        <div class="col-resize-handle" onPointerDown={nameResizer.onPointerDown} />
         <For each={visibleColumns()}>
           {(col) => {
             const resizer = makeMetaResizer(col);
@@ -467,10 +497,15 @@ export function ItemListPanel(props: ItemListPanelProps) {
             );
           }}
         </For>
-        <div class="item-col-header col-date" onClick={() => toggleSort("modified")}>
+        <div
+          class="item-col-header col-date"
+          style={{ width: `${dateW()}px` }}
+          onClick={() => toggleSort("modified")}
+        >
           Modified
           {sortField() === "modified" && <span class="sort-arrow">{sortDir() === "asc" ? "\u25B2" : "\u25BC"}</span>}
         </div>
+        <div class="col-resize-handle" onPointerDown={dateResizer.onPointerDown} />
       </div>
 
       {/* Rows */}
@@ -496,7 +531,7 @@ export function ItemListPanel(props: ItemListPanelProps) {
                   >
                     <span class="icon">{isTracked() ? "star" : "star_border"}</span>
                   </span>
-                  <span class="item-row-name">{item.name}</span>
+                  <span class="item-row-name" style={{ width: `${nameW()}px` }}>{item.name}</span>
                   <For each={visibleColumns()}>
                     {(col) => (
                       <span
@@ -507,7 +542,7 @@ export function ItemListPanel(props: ItemListPanelProps) {
                       </span>
                     )}
                   </For>
-                  <span class="item-row-date">{formatDate(item.modified)}</span>
+                  <span class="item-row-date" style={{ width: `${dateW()}px` }}>{formatDate(item.modified)}</span>
                 </div>
               );
             }}

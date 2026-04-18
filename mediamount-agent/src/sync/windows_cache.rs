@@ -3,7 +3,8 @@
 /// Tracks hydrated files, NAS metadata, and chunk-level content bitmaps
 /// for LRU eviction and block-level partial hydration.
 ///
-/// DB location: `%LOCALAPPDATA%\ufb\cache\{mount_id}.db`
+/// DB location: `{cache_dir}/{mount_id}.db`, where `cache_dir` comes from
+/// `MountsConfig::cache_root()` (user-configurable via `syncCacheRoot`).
 ///
 /// Eviction: after each hydration, check budget → evict LRU to 80% of limit.
 use crate::sync::cache_core::{self, SqliteConn, SqlitePool};
@@ -20,6 +21,9 @@ pub struct CacheIndex {
     pool: SqlitePool,
     cache_limit: u64,
     client_root: PathBuf,
+    /// Cache root (`MountsConfig::cache_root()`). DB lives at
+    /// `{cache_dir}/{domain}.db`; block blobs under `{cache_dir}/by_key/`.
+    cache_dir: PathBuf,
     /// Shared with NasSyncFilter — files with refcount > 0 can't be evicted.
     open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
     /// Per-file read/write lock registry for ProjFS content cache. Readers
@@ -37,15 +41,10 @@ impl CacheIndex {
         mount_id: &str,
         cache_limit: u64,
         open_handles: Arc<Mutex<HashMap<PathBuf, u32>>>,
+        cache_dir: &Path,
     ) -> (Self, bool) {
-        // Store DB outside the sync root — CF API intercepts file ops inside it.
-        // %LOCALAPPDATA%\ufb\cache\{mount_id}.db
-        let cache_dir = if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            PathBuf::from(local).join("ufb").join("cache")
-        } else {
-            PathBuf::from(r"C:\ufb\cache")
-        };
-        let _ = std::fs::create_dir_all(&cache_dir);
+        // DB + block blobs live under the user-configurable cache root.
+        let _ = std::fs::create_dir_all(cache_dir);
         let db_path = cache_dir.join(format!("{}.db", mount_id));
 
         // Run schema init / repair on a single serial connection before the pool opens.
@@ -58,6 +57,7 @@ impl CacheIndex {
             pool,
             cache_limit,
             client_root: client_root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
             open_handles,
             per_key_locks: Mutex::new(HashMap::new()),
             domain: mount_id.to_string(),
@@ -692,17 +692,13 @@ impl CacheIndex {
 
     /// Cache-file path for a given rowid. Directory is created on first call.
     pub fn cache_file_path(&self, rowid: i64) -> PathBuf {
-        let dir = Self::cache_file_dir();
+        let dir = self.cache_file_dir();
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{:016x}", rowid))
     }
 
-    fn cache_file_dir() -> PathBuf {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            PathBuf::from(local).join("ufb").join("cache").join("by_key")
-        } else {
-            PathBuf::from(r"C:\ufb\cache\by_key")
-        }
+    fn cache_file_dir(&self) -> PathBuf {
+        self.cache_dir.join("by_key")
     }
 
     /// LRU eviction for the block-level content cache. Deletes oldest-accessed
@@ -900,7 +896,7 @@ impl CacheIndex {
 
         if reset_all {
             // Delete all cache files.
-            let dir = Self::cache_file_dir();
+            let dir = self.cache_file_dir();
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for entry in rd.flatten() {
                     let _ = std::fs::remove_file(entry.path());
@@ -920,7 +916,7 @@ impl CacheIndex {
         // ProjFS: cache files live in by_key/ keyed by rowid. Scan the cache
         // directory and reconcile against known_files. Any cache file without
         // a matching known_files row is orphaned and deleted.
-        let cache_dir = Self::cache_file_dir();
+        let cache_dir = self.cache_file_dir();
         if let Ok(rd) = std::fs::read_dir(&cache_dir) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();

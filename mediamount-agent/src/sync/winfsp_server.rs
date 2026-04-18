@@ -207,8 +207,30 @@ impl PassthroughFs {
 }
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 const FILETIME_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+/// Stable 64-bit ID for a relative path. `FSP_FSCTL_FILE_INFO.IndexNumber`
+/// must be unique and non-zero for .NET's recursive enumerator to avoid
+/// treating every entry as the same file and short-circuiting. We hash the
+/// cache-normalized relative path (which is already our stable key across
+/// restarts) with FNV-1a and force the MSB clear to keep the value below
+/// Windows's reserved ranges.
+fn path_to_index_number(rel: &str) -> u64 {
+    // FNV-1a 64-bit — cheap, no dependency, deterministic across runs.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in rel.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Non-zero guarantee (hashing the empty string "" yields the FNV offset
+    // basis itself, which is non-zero, but be explicit).
+    if h == 0 {
+        1
+    } else {
+        h & 0x7FFF_FFFF_FFFF_FFFF
+    }
+}
 
 fn st_to_filetime(t: std::time::SystemTime) -> u64 {
     let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -216,11 +238,11 @@ fn st_to_filetime(t: std::time::SystemTime) -> u64 {
         .saturating_add(FILETIME_EPOCH_OFFSET)
 }
 
-fn populate_file_info(meta: &fs::Metadata, info: &mut FileInfo) {
+fn populate_file_info(meta: &fs::Metadata, info: &mut FileInfo, rel: &str) {
     info.file_attributes = if meta.is_dir() {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
-        FILE_ATTRIBUTE_NORMAL
+        FILE_ATTRIBUTE_ARCHIVE
     };
     info.file_size = meta.len();
     info.allocation_size = meta.len();
@@ -231,6 +253,7 @@ fn populate_file_info(meta: &fs::Metadata, info: &mut FileInfo) {
     info.last_write_time = st_to_filetime(modified);
     info.change_time = st_to_filetime(modified);
     info.last_access_time = st_to_filetime(accessed);
+    info.index_number = path_to_index_number(rel);
 }
 
 fn f64_secs_to_filetime(secs: f64) -> u64 {
@@ -245,11 +268,12 @@ fn f64_secs_to_filetime(secs: f64) -> u64 {
 fn populate_file_info_from_cached(
     attr: &crate::sync::cache_core::CachedAttr,
     info: &mut FileInfo,
+    rel: &str,
 ) {
     info.file_attributes = if attr.is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
-        FILE_ATTRIBUTE_NORMAL
+        FILE_ATTRIBUTE_ARCHIVE
     };
     info.file_size = attr.size;
     info.allocation_size = attr.size;
@@ -259,6 +283,7 @@ fn populate_file_info_from_cached(
     info.last_write_time = ft_modified;
     info.change_time = ft_modified;
     info.last_access_time = ft_modified;
+    info.index_number = path_to_index_number(rel);
 }
 
 impl FileSystemContext for PassthroughFs {
@@ -276,7 +301,7 @@ impl FileSystemContext for PassthroughFs {
             if attr.is_dir {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
-                FILE_ATTRIBUTE_NORMAL
+                FILE_ATTRIBUTE_ARCHIVE
             }
         } else {
             // Cold path: stat SMB. Caching the result is deferred to the
@@ -291,7 +316,7 @@ impl FileSystemContext for PassthroughFs {
             if meta.is_dir() {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
-                FILE_ATTRIBUTE_NORMAL
+                FILE_ATTRIBUTE_ARCHIVE
             }
         };
         let sd = permissive_sd();
@@ -349,8 +374,9 @@ impl FileSystemContext for PassthroughFs {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let abs = self.resolve(file_name);
+        let rel = Self::rel_path(file_name);
         let meta = fs::metadata(&abs).map_err(|_| err_not_found())?;
-        populate_file_info(&meta, file_info.as_mut());
+        populate_file_info(&meta, file_info.as_mut(), &rel);
         let ctx = if meta.is_dir() {
             OpenCtx::Dir {
                 abs,
@@ -377,16 +403,13 @@ impl FileSystemContext for PassthroughFs {
         ctx: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        // Warm path: serve from cache if we have the entry.
         let rel = self.rel_from_abs(ctx.abs());
         if let Some(attr) = self.cache.cached_attr_by_path(&rel) {
-            populate_file_info_from_cached(&attr, file_info);
+            populate_file_info_from_cached(&attr, file_info, &rel);
             return Ok(());
         }
-        // Cold: stat SMB. We don't write to cache here — row creation
-        // happens via `read_directory` / `populate_folder`.
         let meta = fs::metadata(ctx.abs()).map_err(|_| err_not_found())?;
-        populate_file_info(&meta, file_info);
+        populate_file_info(&meta, file_info, &rel);
         Ok(())
     }
 
@@ -492,14 +515,14 @@ impl FileSystemContext for PassthroughFs {
 
             // "." and ".." synthesized from cache where possible.
             if let Some(self_attr) = self.cache.cached_attr_by_path(&rel) {
-                write_dir_entry(&lock, ".", &self_attr);
+                write_dir_entry(&lock, ".", &rel, &self_attr);
                 if !rel.is_empty() {
                     let parent_rel = match rel.rfind('/') {
                         Some(i) => rel[..i].to_string(),
                         None => String::new(),
                     };
                     if let Some(parent_attr) = self.cache.cached_attr_by_path(&parent_rel) {
-                        write_dir_entry(&lock, "..", &parent_attr);
+                        write_dir_entry(&lock, "..", &parent_rel, &parent_attr);
                     } else {
                         // Root has no row in the cache (it's not in known_files)
                         // — synthesize a minimal dir attr for "..".
@@ -511,7 +534,7 @@ impl FileSystemContext for PassthroughFs {
                             is_hydrated: false,
                             hydrated_size: 0,
                         };
-                        write_dir_entry(&lock, "..", &fake);
+                        write_dir_entry(&lock, "..", &parent_rel, &fake);
                     }
                 }
             }
@@ -519,7 +542,12 @@ impl FileSystemContext for PassthroughFs {
             // Real children.
             let children = self.cache.cached_children_by_parent(&rel);
             for (name, attr) in &children {
-                write_dir_entry(&lock, name, attr);
+                let child_rel = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", rel, name)
+                };
+                write_dir_entry(&lock, name, &child_rel, attr);
             }
 
             drop(lock);
@@ -573,10 +601,10 @@ impl FileSystemContext for PassthroughFs {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
-                populate_file_info(&meta, file_info);
+                populate_file_info(&meta, file_info, &rel);
             }
         } else if let Ok(meta) = fs::metadata(&abs) {
-            populate_file_info(&meta, file_info);
+            populate_file_info(&meta, file_info, &rel);
         }
         Ok(buffer.len() as u32)
     }
@@ -615,7 +643,7 @@ impl FileSystemContext for PassthroughFs {
         }
 
         let meta = fs::metadata(&abs).map_err(|_| err_io())?;
-        populate_file_info(&meta, file_info.as_mut());
+        populate_file_info(&meta, file_info.as_mut(), &rel);
 
         let name = abs
             .file_name()
@@ -697,7 +725,7 @@ impl FileSystemContext for PassthroughFs {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
-                populate_file_info(&meta, file_info);
+                populate_file_info(&meta, file_info, &rel);
             }
         }
         Ok(())
@@ -731,7 +759,7 @@ impl FileSystemContext for PassthroughFs {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 self.cache.update_metadata_by_rel(&rel, meta.len(), mtime);
-                populate_file_info(&meta, file_info);
+                populate_file_info(&meta, file_info, &rel);
             }
         }
         Ok(())
@@ -806,7 +834,8 @@ impl FileSystemContext for PassthroughFs {
         let Some(ctx) = ctx else { return Ok(()) };
         if let OpenCtx::File { abs, .. } = &**ctx {
             if let Ok(meta) = fs::metadata(abs) {
-                populate_file_info(&meta, file_info);
+                let rel = self.rel_from_abs(abs);
+                populate_file_info(&meta, file_info, &rel);
             }
         }
         Ok(())
@@ -820,10 +849,11 @@ impl FileSystemContext for PassthroughFs {
 fn write_dir_entry(
     lock: &winfsp::filesystem::DirBufferLock<'_>,
     name: &str,
+    rel: &str,
     attr: &crate::sync::cache_core::CachedAttr,
 ) -> bool {
     let mut dir_info: DirInfo<255> = DirInfo::new();
-    populate_file_info_from_cached(attr, dir_info.file_info_mut());
+    populate_file_info_from_cached(attr, dir_info.file_info_mut(), rel);
     let name_os: &OsStr = name.as_ref();
     if dir_info.set_name(name_os).is_err() {
         return true; // skip this entry, continue iteration
@@ -1100,19 +1130,28 @@ fn bit_unset(bitmap: &mut [u8], chunk: u64) {
 ///
 /// Mount point is derived via `mount_point_for(domain)`. Must be called
 /// from within a tokio runtime.
+///
+/// Returns a `SyncServerHandle` whose `shutdown_and_wait()` fires the
+/// shutdown signal, drops the `FileSystemHost` (unmounts), and joins the
+/// dispatcher thread. Callers should hold the handle for the server's
+/// lifetime or explicitly call `shutdown_and_wait` when tearing down
+/// (e.g. on cache-root change). Dropping the handle alone does NOT
+/// shut the server down — the signal must be sent explicitly.
 pub fn start(
     domain: String,
     nas_root: PathBuf,
     cache: Arc<CacheIndex>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
-) {
+) -> crate::sync::SyncServerHandle {
     // (a) NAS health probe — tokio task.
     let health = NasHealth::new(domain.clone(), nas_root.clone());
     Arc::clone(&health).spawn_probe_loop();
 
-    // (b) Eviction tick — tokio task, skipped if no budget is set.
-    //     Evictor is a sync function; wrap in spawn_blocking so the tokio
-    //     worker doesn't stall.
+    // (b) Eviction tick — tokio task, skipped if no budget is set. We wire
+    //     it to a CancellationToken derived from the same shutdown trigger
+    //     as the dispatcher thread so the tick exits cleanly on teardown.
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let (evict_shutdown_tx, mut evict_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     if cache.cache_limit() > 0 {
         let cache_for_evict = Arc::clone(&cache);
         let domain_for_evict = domain.clone();
@@ -1120,28 +1159,39 @@ pub fn start(
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             tick.tick().await; // skip immediate tick
             loop {
-                tick.tick().await;
-                let cache = Arc::clone(&cache_for_evict);
-                let (files, bytes) = tokio::task::spawn_blocking(move || {
-                    cache.evict_over_budget_now()
-                })
-                .await
-                .unwrap_or((0, 0));
-                if files > 0 {
-                    log::debug!(
-                        "[winfsp] {} evictor freed {} files / {} bytes",
-                        domain_for_evict, files, bytes,
-                    );
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let cache = Arc::clone(&cache_for_evict);
+                        let (files, bytes) = tokio::task::spawn_blocking(move || {
+                            cache.evict_over_budget_now()
+                        })
+                        .await
+                        .unwrap_or((0, 0));
+                        if files > 0 {
+                            log::debug!(
+                                "[winfsp] {} evictor freed {} files / {} bytes",
+                                domain_for_evict, files, bytes,
+                            );
+                        }
+                    }
+                    _ = &mut evict_shutdown_rx => {
+                        log::debug!("[winfsp] {} evictor exiting", domain_for_evict);
+                        break;
+                    }
                 }
             }
         });
     }
 
     // (c) WinFsp dispatcher — OS thread. FileSystemHost keeps the mount
-    //     alive until drop; parking the thread keeps the host alive for
-    //     the life of the process.
+    //     alive until drop; blocking-recv on `shutdown_rx` holds it open
+    //     until the caller signals teardown. When signalled, we drop
+    //     `host` (which unmounts C:\Volumes\ufb\{share}), fire the
+    //     evict shutdown, and return — joining the thread is safe.
     let mount_path = mount_point_for(&domain);
-    std::thread::spawn(move || {
+    let domain_for_thread = domain.clone();
+    let thread_handle = std::thread::spawn(move || {
+        let domain = domain_for_thread;
         log::info!(
             "[winfsp] {} starting: mount_path={}, nas_root={}",
             domain,
@@ -1154,6 +1204,7 @@ pub fn start(
                 "[winfsp] {} winfsp_init failed — is WinFsp runtime installed?",
                 domain
             );
+            let _ = evict_shutdown_tx.send(());
             return;
         }
 
@@ -1164,12 +1215,28 @@ pub fn start(
             .case_preserved_names(true)
             .case_sensitive_search(false)
             .unicode_on_disk(true)
-            .persistent_acls(false)
-            // Slice 4 enables writes — Notepad save, Explorer rename/delete,
-            // Premiere project save all rely on a writable volume.
+            // Required for PowerShell / .NET `Get-ChildItem -Recurse`.
+            // Without this WinFsp handles pattern matching itself on every
+            // enum, which drops entries when the client iterates with a
+            // filter and exploded recursion in the spike.
+            .pass_query_directory_pattern(true)
+            // Permissive SDDL is served via `get_security_by_name`; tell
+            // Windows those SDs actually mean something so ACL checks take
+            // our value instead of synthesizing defaults that mis-route.
+            .persistent_acls(true)
+            .reparse_points(true)
+            .named_streams(true)
             .post_cleanup_when_modified_only(true)
-            .file_info_timeout(1000)
-            .volume_info_timeout(1000);
+            .flush_and_purge_on_cleanup(true)
+            .allow_open_in_kernel_mode(true)
+            .supports_posix_unlink_rename(true)
+            .post_disposition_only_when_necessary(true)
+            // Metadata cache is authoritative; let WinFsp hold it long
+            // enough that recursive enumeration doesn't re-enter us for
+            // every path under a subtree. Eviction invalidates rows
+            // explicitly on write; reads stay consistent.
+            .file_info_timeout(10_000)
+            .volume_info_timeout(10_000);
 
         let provider = PassthroughFs {
             domain: domain.clone(),
@@ -1186,6 +1253,7 @@ pub fn start(
                     "[winfsp] {} FileSystemHost::new failed: {:?}",
                     domain, e
                 );
+                let _ = evict_shutdown_tx.send(());
                 return;
             }
         };
@@ -1198,21 +1266,34 @@ pub fn start(
                 mount_path.display(),
                 e
             );
+            let _ = evict_shutdown_tx.send(());
             return;
         }
 
         if let Err(e) = host.start() {
             log::error!("[winfsp] {} dispatcher start() failed: {:?}", domain, e);
+            let _ = evict_shutdown_tx.send(());
             return;
         }
 
         log::info!("[winfsp] {} running at {}", domain, mount_path.display());
 
-        // Keep thread alive so `host` (and its owned FSP_FILE_SYSTEM) lives
-        // for the life of the process. Agent shutdown drops the process,
-        // which unmounts automatically.
-        loop {
-            std::thread::park();
-        }
+        // Block until a shutdown signal arrives. Recv returns Err only
+        // when the sender side is dropped — treat that identically to a
+        // deliberate signal (both mean "tear this server down cleanly").
+        let _ = shutdown_rx.recv();
+        log::info!("[winfsp] {} shutdown requested — unmounting", domain);
+
+        // Dropping `host` runs FileSystemHost::drop which calls
+        // FspFileSystemRemoveMountPoint + FspFileSystemStopDispatcher in
+        // the right order; no need to do it manually.
+        drop(host);
+        // Also signal the evictor to exit — otherwise it keeps a clone
+        // of the cache Arc alive after the server is gone.
+        let _ = evict_shutdown_tx.send(());
+
+        log::info!("[winfsp] {} stopped", domain);
     });
+
+    crate::sync::SyncServerHandle::new_windows(domain, shutdown_tx, thread_handle)
 }

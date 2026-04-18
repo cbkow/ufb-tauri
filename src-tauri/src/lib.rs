@@ -183,6 +183,7 @@ pub fn run() {
             commands::remove_bookmark,
             // File operations
             commands::list_directory,
+            commands::probe_path_reachable,
             commands::create_directory,
             commands::rename_path,
             commands::delete_to_trash,

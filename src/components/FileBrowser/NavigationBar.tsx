@@ -171,6 +171,13 @@ export function NavigationBar(props: NavigationBarProps) {
           >
             <span class="icon">grid_view</span>
           </button>
+          <button
+            class={`nav-btn ${store().viewMode() === "tree" ? "active" : ""}`}
+            onClick={() => store().setViewMode("tree")}
+            title="Tree view"
+          >
+            <span class="icon">account_tree</span>
+          </button>
         </div>
 
         <button

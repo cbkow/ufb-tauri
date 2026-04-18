@@ -14,6 +14,7 @@ import {
   mountCreateSymlinks,
   mountGetCacheStats,
   mountDrainShareCache,
+  probePathReachable,
   type MountMode,
   type CacheStats,
 } from "../lib/tauri";
@@ -58,6 +59,10 @@ interface MountStoreState {
   /// and refreshed asynchronously when the agent emits `mount:cache-stats`
   /// (e.g., after a drain).
   cacheStats: Record<string, CacheStats>;
+  /// Per-mount reachability. `true` = last probe succeeded; `false` = last
+  /// probe failed (VPN down, NAS offline, etc.); `undefined` = not yet
+  /// probed. Drives the "Unavailable" state in the bookmarks panel.
+  reachability: Record<string, boolean>;
 }
 
 const [state, setState] = createStore<MountStoreState>({
@@ -66,6 +71,7 @@ const [state, setState] = createStore<MountStoreState>({
   configs: [],
   mode: "fileprovider",
   cacheStats: {},
+  reachability: {},
 });
 
 let listenersSetUp = false;
@@ -83,13 +89,53 @@ function setupListeners(): Promise<void> {
   listenerSetupPromise = (async () => {
     await listen<MountStateUpdate>("mount:state-update", (e) => {
       const update = e.payload;
+      const prev = state.states[update.mountId];
       console.log("[mountStore] state-update:", update.mountId, update.state, update);
       setState("states", update.mountId, reconcile(update));
+      // When a mount SETTLES into `mounted` (transition from a non-mounted
+      // prior state), re-probe reachability. Without this, a probe that
+      // ran during the initial mounting phase (returning false because
+      // the symlink or WinFsp mount didn't exist yet) stays stale until
+      // the 30s tick — which surfaces as "Unavailable" + blocked clicks.
+      if (update.state === "mounted" && prev?.state !== "mounted") {
+        const cfg = state.configs.find((c) => c.id === update.mountId);
+        if (cfg) {
+          setTimeout(() => { void probeOne(cfg); }, 800);
+        }
+      }
     });
 
     await listen<boolean>("mount:connection", (e) => {
       console.log("[mountStore] connection:", e.payload);
+      const wasConnected = state.connected;
       setState("connected", e.payload);
+      // Race fix: at cold startup (esp. in the installed app, where the
+      // agent is launched by the Run-key just as the UFB window opens),
+      // `loadStates()` often runs BEFORE the agent's IPC pipe is ready.
+      // `mountGetConfig` / `mountGetStates` return empty, and we'd be
+      // stuck with an empty Bookmarks panel forever. When the connection
+      // transitions false→true, re-fetch so the UI catches up, then kick
+      // the reachability probe so we don't wait the full 30s interval
+      // before Bookmarks get proper Connected/Unavailable state.
+      if (e.payload && !wasConnected) {
+        console.log("[mountStore] connection established — refetching state");
+        void (async () => {
+          try {
+            const states = await mountGetStates();
+            setState("states", reconcile(states));
+            const cfg = await mountGetConfig();
+            setState("configs", (cfg.mounts ?? []).filter((m) => m.enabled));
+            const mode = await mountGetMode();
+            setState("mode", mode);
+            // Kick the probe now that we have configs. Small delay so
+            // agent-side mounts have a moment to settle past their
+            // initial Mounting → Mounted transition.
+            setTimeout(() => { void probeReachabilityNow(); }, 1500);
+          } catch (err) {
+            console.error("post-connect refetch failed:", err);
+          }
+        })();
+      }
     });
 
     await listen<CacheStats>("mount:cache-stats", (e) => {
@@ -265,6 +311,101 @@ async function drainShareCache(mountId: string) {
   }
 }
 
+// ── Reachability probe ──────────────────────────────────────────────────
+//
+// Background probe that keeps `state.reachability[mountId]` fresh so the
+// Bookmarks panel can render an "Unavailable" state when a mount's
+// destination is genuinely offline (VPN dropped, NAS down, etc.).
+//
+// **Debounce**: a single failed probe does NOT mark unreachable — cold
+// starts regularly miss the first probe because the symlink or WinFsp
+// mount hasn't settled yet. We require FAILURE_THRESHOLD consecutive
+// failures before flipping to unreachable. Any single success clears
+// the counter and sets reachable. This trades a bit of detection
+// latency (~30-60s for a real outage) against false positives on
+// startup — which were the real problem for users.
+//
+// Probes run every PROBE_INTERVAL_MS + on `probeReachabilityNow()`
+// (called post-connection, on window focus, on state-settled events).
+
+const PROBE_INTERVAL_MS = 30_000;
+const FAILURE_THRESHOLD = 2;
+
+let probeTimer: ReturnType<typeof setInterval> | null = null;
+const probeInFlight = new Set<string>();
+const probeFailureCount = new Map<string, number>();
+
+async function probeOne(cfg: MountConfig) {
+  if (probeInFlight.has(cfg.id)) return;
+  probeInFlight.add(cfg.id);
+  try {
+    const path = getMountPath(cfg);
+    if (!path) {
+      // No mount path → nothing to probe. Treat as reachable.
+      probeFailureCount.delete(cfg.id);
+      setState("reachability", cfg.id, true);
+      return;
+    }
+    const reachable = await probePathReachable(path);
+    if (reachable) {
+      // Any single success immediately clears. No lingering stale
+      // "unavailable" after the VPN reconnects or the mount settles.
+      probeFailureCount.delete(cfg.id);
+      setState("reachability", cfg.id, true);
+    } else {
+      const n = (probeFailureCount.get(cfg.id) ?? 0) + 1;
+      probeFailureCount.set(cfg.id, n);
+      if (n >= FAILURE_THRESHOLD) {
+        setState("reachability", cfg.id, false);
+      }
+      // If under the threshold, leave reachability undefined (the UI
+      // treats that as "not yet known", which is correct on cold start).
+    }
+  } catch (e) {
+    // Probe command itself failed (unlikely) — count it toward the
+    // threshold but don't immediately flip to unreachable; a transient
+    // IPC glitch shouldn't trip the UI into Unavailable.
+    console.error("probePathReachable failed:", e);
+    const n = (probeFailureCount.get(cfg.id) ?? 0) + 1;
+    probeFailureCount.set(cfg.id, n);
+    if (n >= FAILURE_THRESHOLD) {
+      setState("reachability", cfg.id, false);
+    }
+  } finally {
+    probeInFlight.delete(cfg.id);
+  }
+}
+
+async function probeReachabilityNow() {
+  const cfgs = state.configs;
+  // Kick off all probes in parallel. `probeOne` dedups per-mount so
+  // overlapping tick + focus refresh is safe.
+  await Promise.all(cfgs.map(probeOne));
+}
+
+function startReachabilityProbe() {
+  // Disabled. `fs::metadata` on Windows UNC symlinks and WinFsp reparse
+  // points is not a reliable liveness signal — it routinely fails for
+  // mounts that are perfectly accessible (cold SMB session cache, stat
+  // under load, etc.), causing false "Unavailable" state. Since we
+  // can't flag reachability reliably from the frontend, we don't flag
+  // it at all. The agent already surfaces genuine offline state via
+  // `syncState` on sync mounts; non-sync mounts stay "Connected" and
+  // discover reachability at click time via the normal listDirectory
+  // flow.
+  //
+  // Plumbing (command, store field, probeOne) is intentionally left
+  // in place so we can re-enable with a smarter implementation later
+  // (e.g., agent-side probes shared with NasHealth).
+  if (probeTimer) return;
+  void probeTimer; // silence unused var in this disabled path
+}
+
+/** Stale-aware reachability getter. Returns undefined before first probe. */
+function isMountReachable(mountId: string): boolean | undefined {
+  return state.reachability[mountId];
+}
+
 /** Default cache root display — matches agent's default_cache_root(). */
 const defaultCacheRoot = platformStore.platform === "win"
   ? "%LOCALAPPDATA%\\ufb\\sync"
@@ -286,6 +427,9 @@ export const mountStore = {
   get cacheStats() {
     return state.cacheStats;
   },
+  get reachability() {
+    return state.reachability;
+  },
   get needsElevation() {
     return needsElevation();
   },
@@ -304,4 +448,7 @@ export const mountStore = {
   loadConfig,
   refreshCacheStats,
   drainShareCache,
+  isMountReachable,
+  probeReachabilityNow,
+  startReachabilityProbe,
 };

@@ -15,6 +15,12 @@ src-tauri/gen/
 # Inno Setup output
 installer/*.exe
 
+# Vendored WinFsp MSI — large binary, licensed independently (see
+# LICENSES/WinFsp-LICENSE.txt). Developers building the installer from
+# source download it from https://winfsp.dev/rel/ and drop it into
+# installer/vendor/ themselves. See docs/windows-build-prereqs.md.
+installer/vendor/*.msi
+
 # Sidecar binaries (copied by build.rs, not checked in)
 src-tauri/binaries/
 

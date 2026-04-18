@@ -313,6 +313,22 @@ pub async fn create_directory(path: String) -> Result<(), String> {
         .map_err(|e| format!("create_directory task failed: {}", e))?
 }
 
+/// Lightweight reachability probe. Returns true iff `path` can be stat'd
+/// (exists + accessible). Used by the bookmarks panel to detect VPN/NAS
+/// outages and surface an "Unavailable" state without waiting for a
+/// user click to discover the dangling symlink.
+///
+/// Returns Ok(false) rather than Err on stat failure — "unreachable" is
+/// not an error from the caller's perspective, just data. Off the async
+/// runtime because stat on an unreachable UNC path can block for the
+/// full SMB timeout (~30s on Windows).
+#[tauri::command]
+pub async fn probe_path_reachable(path: String) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || std::fs::metadata(&path).is_ok())
+        .await
+        .map_err(|e| format!("probe_path_reachable task failed: {}", e))
+}
+
 #[tauri::command]
 pub async fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || crate::file_ops::rename_path(&old_path, &new_path))

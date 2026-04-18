@@ -5,16 +5,24 @@
 ; Then compile this with Inno Setup 6.
 
 #define MyAppName "Union File Browser"
-#define MyAppVersion "0.3.3"
+#define MyAppVersion "0.5.1"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/ufb"
 #define MyAppExeName "ufb-tauri.exe"
 #define AgentExeName "mediamount-agent.exe"
+; WinFsp runtime MSI bundled under installer/vendor/. MediaMount Agent
+; links against winfsp-x64.dll and cannot start without this installed.
+#define WinFspMsi "winfsp-2.1.25156.msi"
 
 ; Paths relative to this .iss file
 #define SrcTauri "..\src-tauri"
 #define ReleaseDir SrcTauri + "\target\release"
-#define AgentReleaseDir "..\mediamount-agent\target\release"
+; `cargo build --release --target x86_64-pc-windows-msvc` puts output under
+; `target/x86_64-pc-windows-msvc/release/`, not `target/release/`. Use the
+; explicit triple so a MSVC-targeted build is unambiguous; otherwise a
+; plain `cargo build --release` output at `target/release/` will shadow it
+; silently and the installer ships the wrong (often stale) agent binary.
+#define AgentReleaseDir "..\mediamount-agent\target\x86_64-pc-windows-msvc\release"
 
 [Setup]
 AppId={{B3C9D5E7-4F8A-6B2C-9D1E-7A3F5C8E2D4B}
@@ -64,6 +72,7 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 [Components]
 Name: "core"; Description: "Core application files"; Types: full custom; Flags: fixed
 Name: "mediamount"; Description: "MediaMount Agent (SMB mount manager)"; Types: full
+Name: "winfsp"; Description: "WinFsp runtime (required for MediaMount sync mounts)"; Types: full
 Name: "uri_protocol"; Description: "Register ufb:/// URI protocol for project links"; Types: full
 Name: "union_protocol"; Description: "Register union:/// URI protocol for Union links"; Types: full
 Name: "firewall"; Description: "Add Windows Firewall rules for Mesh Sync (TCP 49200, UDP 4244)"; Types: full
@@ -97,6 +106,11 @@ Source: "{#ReleaseDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsour
 
 ; MediaMount Agent
 Source: "{#AgentReleaseDir}\{#AgentExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: mediamount
+
+; WinFsp runtime MSI — extracted to {tmp} and installed via msiexec by
+; CurStepChanged. `dontcopy` keeps it out of the app install dir; Inno
+; cleans {tmp} after setup finishes.
+Source: "vendor\{#WinFspMsi}"; Flags: dontcopy; Components: winfsp
 
 ; Assets - scripts
 Source: "{#SrcTauri}\assets\scripts\*"; DestDir: "{app}\assets\scripts"; Flags: ignoreversion recursesubdirs; Components: core
@@ -143,6 +157,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Code]
 var
   DataCleanupPage: TInputOptionWizardPage;
+  WinFspRebootRequired: Boolean;
 
 procedure InitializeWizard();
 begin
@@ -172,6 +187,72 @@ begin
   Exec('taskkill.exe', '/f /im explorer.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(500);
   Exec(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
+end;
+
+// True if a WinFsp runtime is already present on the system. We probe the
+// canonical registry key written by the WinFsp MSI rather than looking for
+// the DLL on disk, because the DLL path is version-pinned under SxS and
+// moves between releases.
+function WinFspIsInstalled(): Boolean;
+var
+  InstallDir: String;
+begin
+  Result := RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\WinFsp',
+                                'InstallDir', InstallDir)
+            and (InstallDir <> '')
+            and DirExists(InstallDir);
+end;
+
+// Silent-install bundled WinFsp MSI. Idempotent: skips if the same or a
+// newer runtime is already present. Handles 3010 (reboot required) by
+// setting the global restart flag. Non-fatal on failure — logs a warning
+// and lets install continue; user can retry or install WinFsp manually.
+procedure InstallWinFsp();
+var
+  MsiPath: String;
+  ResultCode: Integer;
+begin
+  if WinFspIsInstalled() then
+  begin
+    Log('WinFsp already installed — skipping bundled MSI');
+    Exit;
+  end;
+
+  Log('Extracting bundled WinFsp MSI...');
+  ExtractTemporaryFile('{#WinFspMsi}');
+  MsiPath := ExpandConstant('{tmp}\{#WinFspMsi}');
+  if not FileExists(MsiPath) then
+  begin
+    Log('WinFsp MSI not found at ' + MsiPath + ' — cannot install sync backend');
+    Exit;
+  end;
+
+  Log('Installing WinFsp (silent): ' + MsiPath);
+  if not Exec('msiexec.exe',
+              '/i "' + MsiPath + '" /quiet /norestart',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Log('WinFsp MSI launch failed (msiexec not runnable)');
+    Exit;
+  end;
+
+  // msiexec exit codes: 0 = OK, 3010 = OK but reboot required.
+  if ResultCode = 0 then
+    Log('WinFsp installed successfully')
+  else if ResultCode = 3010 then
+  begin
+    Log('WinFsp installed — reboot required');
+    WinFspRebootRequired := True;
+  end
+  else
+    Log('WinFsp MSI returned non-zero exit code: ' + IntToStr(ResultCode));
+end;
+
+// Hook into Inno's restart-decision callback. Returns True to ask the user
+// to reboot once setup finishes.
+function NeedRestart(): Boolean;
+begin
+  Result := WinFspRebootRequired;
 end;
 
 // Replace placeholder strings in a file
@@ -300,9 +381,10 @@ begin
       Exec('netsh.exe', 'advfirewall firewall add rule name="UFB Mesh Sync (UDP)" dir=in action=allow protocol=UDP localport=4244 program="' + ExpandConstant('{app}\{#MyAppExeName}') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
 
-    // WinFsp runtime install — wired in Slice 5 of
-    // docs/windows-winfsp-port-plan.md. Silent-installs the bundled
-    // winfsp-*.msi (idempotent; skips if already present and >= ours).
+    // WinFsp runtime — required by mediamount-agent's sync mounts.
+    // Idempotent MSI install; sets WinFspRebootRequired on 3010.
+    if WizardIsComponentSelected('winfsp') then
+      InstallWinFsp();
 
     if WizardIsTaskSelected('restartexplorer') then
       RestartExplorer();

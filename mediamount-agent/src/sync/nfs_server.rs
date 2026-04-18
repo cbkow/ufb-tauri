@@ -620,6 +620,58 @@ fn attr_from_cache(fh: fileid3, a: &CachedAttr) -> fattr3 {
 /// rather than opaque `NFS3ERR_IO`. Clients back off and try again
 /// instead of failing the op outright, which is the right behaviour
 /// when the NAS link is flaky but probably-coming-back.
+/// True iff `e` is the portable spelling of ENOTEMPTY. `DirectoryNotEmpty`
+/// is unstable on older Rust stdlibs and surfaces as `Other` there, so we
+/// also squint at the raw OS errno — 66 on macOS, 39 on Linux.
+fn is_dir_not_empty(e: &std::io::Error) -> bool {
+    if matches!(e.kind(), std::io::ErrorKind::DirectoryNotEmpty) {
+        return true;
+    }
+    matches!(e.raw_os_error(), Some(66) | Some(39))
+}
+
+/// Recovery path for the `remove_dir → ENOTEMPTY` case. Enumerates the
+/// directory, deletes every entry whose name starts with `.`, `@`, or `#`
+/// (the same filter `populate_folder` applies when building the NFS view
+/// of the folder) recursively, then retries `remove_dir`.
+///
+/// Returns the original `NOTEMPTY` error untouched if any user-visible
+/// entry remains — that's a real "not empty" and NFS3 should report it.
+fn sweep_hidden_children_then_remove(abs: &std::path::Path) -> Result<(), nfsstat3> {
+    let rd = std::fs::read_dir(abs).map_err(io_to_nfsstat)?;
+    let mut hidden: Vec<std::path::PathBuf> = Vec::new();
+    let mut has_visible = false;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('@') || name.starts_with('#') {
+            hidden.push(e.path());
+        } else {
+            has_visible = true;
+        }
+    }
+    if has_visible {
+        return Err(nfsstat3::NFS3ERR_NOTEMPTY);
+    }
+    for p in hidden {
+        let meta = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let res = if meta.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        if let Err(e) = res {
+            log::warn!(
+                "[nfs-server] sweep hidden child {} failed: {} — RMDIR will fail",
+                p.display(), e
+            );
+        }
+    }
+    std::fs::remove_dir(abs).map_err(io_to_nfsstat)
+}
+
 fn io_to_nfsstat(e: std::io::Error) -> nfsstat3 {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -963,12 +1015,25 @@ impl NFSFileSystem for PassthroughFs {
         let is_dir = meta.is_dir();
 
         if is_dir {
-            // NFS3 RMDIR fails if the directory isn't empty — remove_dir
-            // surfaces that as io::Error kind=DirectoryNotEmpty (not yet
-            // stable in Rust stdlib, comes out as Other on some versions)
-            // which maps to NFS3ERR_IO. That's the best we can do without
-            // protocol-specific plumbing.
-            std::fs::remove_dir(&abs).map_err(io_to_nfsstat)?;
+            // NFS3 RMDIR fails if the directory isn't empty. Try the strict
+            // path first, then handle the "filtered-junk only" case: our
+            // `populate_folder` hides entries prefixed with `.`, `@`, or `#`
+            // (`.DS_Store`, Synology's `@eaDir`/`#recycle`, etc.) so Finder
+            // never sees them and never tries to delete them. Finder then
+            // thinks the folder is empty, issues RMDIR, and the underlying
+            // SMB path still has those hidden entries — classic ENOTEMPTY.
+            //
+            // When that happens, sweep the hidden junk and retry. If there
+            // are also user-visible entries still present, return NOTEMPTY
+            // honestly: that's a different situation (race with another
+            // client) that we must not paper over by nuking user data.
+            match std::fs::remove_dir(&abs) {
+                Ok(()) => {}
+                Err(e) if is_dir_not_empty(&e) => {
+                    sweep_hidden_children_then_remove(&abs)?;
+                }
+                Err(e) => return Err(io_to_nfsstat(e)),
+            }
         } else {
             std::fs::remove_file(&abs).map_err(io_to_nfsstat)?;
         }
@@ -1139,14 +1204,26 @@ fn join_rel(parent: &str, child: &str) -> String {
 /// the export root and using `cache` as the metadata authority. Spawns a
 /// background tokio task; returns immediately. If bind or handshake fails,
 /// logs the error and the task exits.
+///
+/// Returns a `SyncServerHandle`. Calling `shutdown_and_wait()` on it fires
+/// the shutdown signal; the task unmounts the NFS loopback, drops the
+/// listener, and exits. Dropping the handle alone does NOT shut the server
+/// down — the signal must be sent explicitly (matches Windows behavior).
 pub fn start(
     domain: String,
     nas_root: PathBuf,
     port: u16,
     cache: Arc<MacosCache>,
     ipc_tx: mpsc::Sender<AgentToUfb>,
-) {
-    tokio::spawn(async move {
+) -> crate::sync::SyncServerHandle {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Child shutdown for the evictor — separate oneshot so we can signal
+    // it from inside the server task's cleanup path.
+    let (evict_shutdown_tx, mut evict_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let domain_for_task = domain.clone();
+    let task_handle = tokio::spawn(async move {
+        let domain = domain_for_task;
         let health = NasHealth::new(domain.clone(), nas_root.clone());
         Arc::clone(&health).spawn_probe_loop();
 
@@ -1163,13 +1240,20 @@ pub fn start(
                 // against the initial mount-up window.
                 tick.tick().await;
                 loop {
-                    tick.tick().await;
-                    let (files, bytes) = cache_for_evict.evict_over_budget_now().await;
-                    if files > 0 {
-                        log::debug!(
-                            "[nfs-server] {} evictor freed {} files / {} bytes",
-                            domain_for_evict, files, bytes,
-                        );
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let (files, bytes) = cache_for_evict.evict_over_budget_now().await;
+                            if files > 0 {
+                                log::debug!(
+                                    "[nfs-server] {} evictor freed {} files / {} bytes",
+                                    domain_for_evict, files, bytes,
+                                );
+                            }
+                        }
+                        _ = &mut evict_shutdown_rx => {
+                            log::debug!("[nfs-server] {} evictor exiting", domain_for_evict);
+                            break;
+                        }
                     }
                 }
             });
@@ -1190,6 +1274,7 @@ pub fn start(
                     nas_root.display(),
                     e
                 );
+                let _ = evict_shutdown_tx.send(());
                 return;
             }
         };
@@ -1199,6 +1284,7 @@ pub fn start(
             Ok(l) => l,
             Err(e) => {
                 log::error!("[nfs-server] {} failed to bind {}: {}", domain, bind, e);
+                let _ = evict_shutdown_tx.send(());
                 return;
             }
         };
@@ -1238,8 +1324,49 @@ pub fn start(
             }
         });
 
-        if let Err(e) = listener.handle_forever().await {
-            log::error!("[nfs-server] {} handle_forever exited: {}", domain, e);
+        // Run the NFS listener under a shutdown watch. `handle_forever`
+        // returns only on fatal error, so the select lets us cleanly
+        // unwind on cache-root change / agent quit.
+        tokio::select! {
+            res = listener.handle_forever() => {
+                if let Err(e) = res {
+                    log::error!("[nfs-server] {} handle_forever exited: {}", domain, e);
+                }
+            }
+            _ = &mut shutdown_rx => {
+                log::info!("[nfs-server] {} shutdown requested — unmounting", domain);
+            }
         }
+
+        // Unmount the NFS loopback point. Blocking call — use spawn_blocking
+        // so we don't stall the tokio worker while umount(8) waits for the
+        // kernel to release any in-flight references.
+        let mount_point = mount_point_for(&domain);
+        let domain_for_umount = domain.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if is_mounted(&mount_point) {
+                let _ = std::process::Command::new("umount").arg(&mount_point).status();
+                if is_mounted(&mount_point) {
+                    let _ = std::process::Command::new("umount")
+                        .arg("-f")
+                        .arg(&mount_point)
+                        .status();
+                }
+                log::info!(
+                    "[nfs-server] {} unmounted {}",
+                    domain_for_umount,
+                    mount_point.display()
+                );
+            }
+        })
+        .await;
+
+        // Signal the evictor so it drops its cache Arc clone. If the evictor
+        // never started (cache_limit == 0) this is a no-op.
+        let _ = evict_shutdown_tx.send(());
+
+        log::info!("[nfs-server] {} stopped", domain);
     });
+
+    crate::sync::SyncServerHandle::new_macos(domain, shutdown_tx, task_handle)
 }

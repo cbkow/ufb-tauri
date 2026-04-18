@@ -1,6 +1,6 @@
 [package]
 name = "ufb-tauri"
-version = "0.4.1"
+version = "0.5.1"
 description = "Union File Browser - Tauri Edition"
 authors = ["Chris"]
 edition = "2021"
@@ -140,6 +140,7 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_UI_Shell",
   "Win32_UI_Shell_Common",
+  "Win32_UI_Controls",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Gdi",
@@ -152,3 +153,13 @@ windows = { version = "0.58", features = [
   "Win32_Security_Credentials",
 ] }
 windows-core = "0.58"
+
+# In `cargo tauri dev`, Rust defaults to `opt-level = 0` which makes
+# CPU-bound dependencies like `image` / `jpeg-decoder` / `resvg` 10-50×
+# slower than release. That was the root of "thumbnails load 2 at a
+# time with long pauses" in dev — a JPEG decode that takes ~10ms in
+# release takes ~500ms in opt-0. Compiling DEPS at opt-level=2 while
+# keeping our own crate unoptimized gives fast thumbnails + quick
+# incremental rebuilds + good debugging for our code.
+[profile.dev.package."*"]
+opt-level = 2

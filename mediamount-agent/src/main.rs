@@ -264,25 +264,56 @@ async fn run_event_loop() {
         let mut mount_service = mount_service::MountService::new(state_tx);
         #[cfg(any(target_os = "macos", windows))]
         mount_service.set_shared_caches(std::sync::Arc::clone(&shared_caches));
+
+        // Registry of live sync server handles + respawn channel. MountService
+        // tears these down on cache-root change and fires the respawn signal;
+        // the task spawned below listens for that signal and rebuilds.
+        #[cfg(any(target_os = "macos", windows))]
+        let sync_servers: sync::SyncServersRegistry = std::sync::Arc::new(
+            tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        let (sync_respawn_tx, mut sync_respawn_rx) =
+            tokio::sync::mpsc::channel::<Option<String>>(8);
+        #[cfg(any(target_os = "macos", windows))]
+        mount_service.set_sync_servers(std::sync::Arc::clone(&sync_servers), sync_respawn_tx);
+
         mount_service.start_from_config().await;
 
         // Start NFS loopback servers (macOS only). One per sync-enabled mount.
         // Unconditional on macOS after Slice 5 — no more FileProvider fallback.
+        //
+        // Wrapped in a spawner closure so it can be re-run on cache-root
+        // change (see `sync_respawn_rx` listener below).
         #[cfg(target_os = "macos")]
-        {
-            let config_for_nfs = std::sync::Arc::clone(&config_cache);
-            let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
-            let ipc_tx_for_nfs = state_tx_for_vfs;
-            tokio::spawn(async move {
-                // Brief delay so mount_service has time to finish initial mounts
-                // before we try to canonicalize the SMB mount paths. Lifecycle
-                // wiring (start on MountSucceeded event) is Phase 1.5.
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let spawn_nfs_servers = {
+            let config_cache = std::sync::Arc::clone(&config_cache);
+            let shared_caches = std::sync::Arc::clone(&shared_caches);
+            let ipc_tx = state_tx_for_vfs.clone();
+            let sync_servers = std::sync::Arc::clone(&sync_servers);
+            // `only` filters to a single domain (tray Start/Restart on one
+            // mount) or None = every sync-enabled mount (startup + cache-root
+            // change). When filtering, skip the 5s SMB-settle delay — the
+            // session is already known-good from the initial spawn cycle.
+            move |only: Option<String>| {
+                let config_for_nfs = std::sync::Arc::clone(&config_cache);
+                let caches_for_nfs = std::sync::Arc::clone(&shared_caches);
+                let ipc_tx_for_nfs = ipc_tx.clone();
+                let sync_servers = std::sync::Arc::clone(&sync_servers);
+                let only = only.clone();
+                tokio::spawn(async move {
+                if only.is_none() {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
 
-                let mounts = config_for_nfs.read().unwrap().mounts.clone();
+                let (mounts, cache_root) = {
+                    let cfg = config_for_nfs.read().unwrap();
+                    (cfg.mounts.clone(), cfg.cache_root())
+                };
                 let mut sync_mounts: Vec<_> = mounts
                     .into_iter()
                     .filter(|m| m.enabled && m.is_sync_mode())
+                    .filter(|m| only.as_ref().map_or(true, |d| d == &m.share_name()))
                     .collect();
                 sync_mounts.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -329,6 +360,7 @@ async fn run_event_loop() {
                                 &share,
                                 root.clone(),
                                 mount.sync_cache_limit_bytes,
+                                &cache_root,
                             ) {
                                 Ok(c) => {
                                     let arc = std::sync::Arc::new(c);
@@ -355,29 +387,64 @@ async fn run_event_loop() {
                             }
                         }
                     };
-                    sync::nfs_server::start(share, root, port, cache, ipc_tx_for_nfs.clone());
+                    {
+                        let guard = sync_servers.lock().await;
+                        if guard.contains_key(&share) {
+                            log::info!(
+                                "[nfs-server] {} already running — skip respawn",
+                                share
+                            );
+                            continue;
+                        }
+                    }
+                    let handle = sync::nfs_server::start(
+                        share.clone(),
+                        root,
+                        port,
+                        cache,
+                        ipc_tx_for_nfs.clone(),
+                    );
+                    sync_servers.lock().await.insert(share, handle);
                 }
-            });
-        }
+                });
+            }
+        };
+        #[cfg(target_os = "macos")]
+        spawn_nfs_servers(None);
 
         // Start WinFsp backends (Windows only). One per sync-enabled mount.
         // Mirror of the macOS NFS block above. See
         // docs/windows-winfsp-port-plan.md Slice 1.
+        //
+        // Same spawner-closure pattern as the macOS side so it can be
+        // re-run on cache-root change.
         #[cfg(windows)]
-        {
-            let config_for_winfsp = std::sync::Arc::clone(&config_cache);
-            let caches_for_winfsp = std::sync::Arc::clone(&shared_caches);
-            let ipc_tx_for_winfsp = state_tx_for_vfs;
-            tokio::spawn(async move {
-                // Brief delay to match the macOS lifecycle — lets
-                // mount_service finish its initial SMB session probes
-                // before we start spawning virtual filesystems.
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let spawn_winfsp_servers = {
+            let config_cache = std::sync::Arc::clone(&config_cache);
+            let shared_caches = std::sync::Arc::clone(&shared_caches);
+            let ipc_tx = state_tx_for_vfs.clone();
+            let sync_servers = std::sync::Arc::clone(&sync_servers);
+            // `only` filters to a single domain (tray Start/Restart) or None
+            // = every sync-enabled mount (startup / cache-root change).
+            move |only: Option<String>| {
+                let config_for_winfsp = std::sync::Arc::clone(&config_cache);
+                let caches_for_winfsp = std::sync::Arc::clone(&shared_caches);
+                let ipc_tx_for_winfsp = ipc_tx.clone();
+                let sync_servers = std::sync::Arc::clone(&sync_servers);
+                let only = only.clone();
+                tokio::spawn(async move {
+                if only.is_none() {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
 
-                let mounts = config_for_winfsp.read().unwrap().mounts.clone();
+                let (mounts, cache_root) = {
+                    let cfg = config_for_winfsp.read().unwrap();
+                    (cfg.mounts.clone(), cfg.cache_root())
+                };
                 let mut sync_mounts: Vec<_> = mounts
                     .into_iter()
                     .filter(|m| m.enabled && m.is_sync_mode())
+                    .filter(|m| only.as_ref().map_or(true, |d| d == &m.share_name()))
                     .collect();
                 sync_mounts.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -402,6 +469,7 @@ async fn run_event_loop() {
                                 &share,
                                 mount.sync_cache_limit_bytes,
                                 open_handles,
+                                &cache_root,
                             );
                             let arc = std::sync::Arc::new(ci);
                             caches.insert(share.clone(), std::sync::Arc::clone(&arc));
@@ -413,12 +481,50 @@ async fn run_event_loop() {
                         }
                     };
 
-                    sync::winfsp_server::start(
-                        share,
+                    {
+                        let guard = sync_servers.lock().await;
+                        if guard.contains_key(&share) {
+                            log::info!(
+                                "[winfsp] {} already running — skip respawn",
+                                share
+                            );
+                            continue;
+                        }
+                    }
+                    let handle = sync::winfsp_server::start(
+                        share.clone(),
                         nas_root,
                         cache,
                         ipc_tx_for_winfsp.clone(),
                     );
+                    sync_servers.lock().await.insert(share, handle);
+                }
+                });
+            }
+        };
+        #[cfg(windows)]
+        spawn_winfsp_servers(None);
+
+        // Respawn listener — fired by MountService when a sync server
+        // needs to come back up. Payload:
+        //   None         = rebuild all (cache-root change)
+        //   Some(domain) = rebuild just that one (tray Start/Restart)
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            tokio::spawn(async move {
+                while let Some(only) = sync_respawn_rx.recv().await {
+                    match &only {
+                        Some(d) => log::info!(
+                            "[sync] respawn signal — rebuilding domain {}", d
+                        ),
+                        None => log::info!(
+                            "[sync] respawn signal — rebuilding all servers"
+                        ),
+                    }
+                    #[cfg(target_os = "macos")]
+                    spawn_nfs_servers(only.clone());
+                    #[cfg(windows)]
+                    spawn_winfsp_servers(only.clone());
                 }
             });
         }

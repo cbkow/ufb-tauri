@@ -494,34 +494,57 @@ impl Orchestrator {
         }
     }
 
-    /// Start on-demand sync: authenticate SMB session, mark ProjFS active.
-    /// ProjFS provider startup is handled in main.rs; the orchestrator only
-    /// tracks sync state for status reporting.
+    /// Start on-demand sync: ensure the SMB share is reachable, then let
+    /// main.rs start the WinFsp backend. The orchestrator only tracks
+    /// sync state for status reporting.
+    ///
+    /// Prefers Windows' existing cached SMB session when available. We
+    /// only call `WNetAddConnection2W` if the share isn't already
+    /// accessible — otherwise our explicit auth races with any cached
+    /// session (Windows returns `ERROR_LOGON_FAILURE` even with correct
+    /// creds if a different-credentialed session is already live),
+    /// leaving syncState stuck in Error while WinFsp works fine.
     #[cfg(windows)]
     async fn start_sync(&mut self) {
         self.sync_state = SyncState::Registering;
 
-        let (username, password) = self.retrieve_credentials().await;
-
-        // Establish deviceless SMB session for UNC path access
         let share_path = self.config.nas_share_path.clone();
-        let u = username.clone();
-        let p = password.clone();
         let mount_id = self.mount_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::platform::windows::fallback::establish_smb_session(&share_path, &u, &p)
+
+        // Probe: can we already list the share? If so, an existing session
+        // (ours from a previous attempt, or Windows' cached one) works.
+        let probe_path = share_path.clone();
+        let already_reachable = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&probe_path).is_ok()
         })
         .await
-        .unwrap_or_else(|e| Err(format!("SMB session task panicked: {}", e)));
+        .unwrap_or(false);
 
-        if let Err(e) = result {
-            log::error!("[{}] SMB session failed: {}", mount_id, e);
-            self.sync_state = SyncState::Error(e.clone());
-            let _ = self
-                .event_tx
-                .send(MountEvent::MountFailed { reason: e })
-                .await;
-            return;
+        if !already_reachable {
+            let (username, password) = self.retrieve_credentials().await;
+            let u = username.clone();
+            let p = password.clone();
+            let sp = share_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::platform::windows::fallback::establish_smb_session(&sp, &u, &p)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("SMB session task panicked: {}", e)));
+
+            if let Err(e) = result {
+                log::error!("[{}] SMB session failed: {}", mount_id, e);
+                self.sync_state = SyncState::Error(e.clone());
+                let _ = self
+                    .event_tx
+                    .send(MountEvent::MountFailed { reason: e })
+                    .await;
+                return;
+            }
+        } else {
+            log::info!(
+                "[{}] SMB session already established (using Windows cached creds)",
+                mount_id
+            );
         }
 
         // Mark server as connected so other mounts skip credential lookup
@@ -530,13 +553,9 @@ impl Orchestrator {
             self.connected_servers.lock().unwrap().insert(host);
         }
 
-        // Slice 0: WinFsp provider wiring comes in Slice 1 of
-        // docs/windows-winfsp-port-plan.md. For now, mark sync active so
-        // the state machine advances; the actual mount happens in main.rs
-        // once Slice 1 lands.
         self._projfs_active = true;
         self.sync_state = SyncState::Active;
-        log::info!("[{}] Sync active (WinFsp wiring pending Slice 1)", self.mount_id);
+        log::info!("[{}] Sync active", self.mount_id);
     }
 
     /// Stop on-demand sync: disconnect SMB session.

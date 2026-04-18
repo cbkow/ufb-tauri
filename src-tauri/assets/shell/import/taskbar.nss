@@ -9,11 +9,6 @@
 }
 menu(where=@(this.count == 0) type='taskbar' image=icon.settings expanded=true)
 {
-	menu(title="Union Apps" image=\uE254)
-	{
-		item(title='ump' image cmd='C:\Program Files\ump\ump.exe')
-		item(title='ufb' image cmd='{{INSTDIR}}\{{EXENAME}}')
-	}
 	menu(title=title.windows image=\uE1FB)
 	{
 		item(title=title.cascade_windows cmd=command.cascade_windows)

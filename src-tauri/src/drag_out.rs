@@ -252,6 +252,28 @@ struct HDropDataObject {
     hmem: windows::Win32::Foundation::HGLOBAL,
 }
 
+// IDataObject is wrapped in a COM refcount by `#[implement]`; when the
+// refcount hits zero the inner struct is dropped and this runs. Without
+// this impl, the HGLOBAL from `build_cf_hdrop` leaked every drag — and
+// because some drop targets (Explorer, WebView2, etc.) `AddRef` the data
+// object past our function return, a leaked HGLOBAL also kept the COM
+// object alive in the OLE drag chain, contributing to the system-wide
+// drag-drop freeze users observed after a successful drop.
+#[cfg(target_os = "windows")]
+impl Drop for HDropDataObject {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::GlobalFree;
+        unsafe {
+            // On success `GlobalFree` returns a null HGLOBAL; on failure
+            // it returns the original handle. We don't care — there's
+            // nothing useful to do in a Drop if the free fails.
+            if !self.hmem.is_invalid() {
+                let _ = GlobalFree(self.hmem);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 impl IDataObject_Impl for HDropDataObject_Impl {
     fn GetData(
