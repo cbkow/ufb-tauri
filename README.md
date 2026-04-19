@@ -154,16 +154,6 @@ Compile with Inno Setup 6's `ISCC.exe`. Output: `installer/ufb-tauri-setup-{vers
 - **Settings**: JSON at `%LOCALAPPDATA%\ufb\settings.json` (Windows) / `~/Library/Application Support/ufb/settings.json` (macOS)
 - **Sync cache**: SQLite index + sparse content blobs, configurable root
 
-### Related docs in `docs/`
-
-- `windows-build-prereqs.md` — full Windows build environment setup
-- `windows-winfsp-port-plan.md` — ProjFS → WinFsp port history + design
-- `windows-io-backend-evaluation.md` — why WinFsp over ProjFS (decision record)
-- `windows-drag-out-notes.md` — HGLOBAL leak diagnosis for future OLE drag-out work
-- `windows-smartscreen-448.md` — first-launch `ERROR_UNTRUSTED_MOUNT_POINT` diagnosis + workaround
-- `v0.5.1-release-notes.md` — changelog + carryover items for this release
-- `nas-sync-plan.md`, `nas-sync-log.md`, `nfs-loopback-plan.md` — sync backend history
-
 ## Licensing
 
 UFB itself is licensed under [GPL-3.0-or-later](LICENSE). The GPL choice is required by the **WinFsp FLOSS exception** — apps linking the WinFsp DLL must be distributed under an OSI/FSF-approved license, and GPL-3.0 satisfies that while keeping UFB copyleft.
