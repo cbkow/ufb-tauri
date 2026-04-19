@@ -7,6 +7,7 @@
 use crate::sync::cache_core::{self, SqliteConn, SqlitePool};
 pub use crate::sync::cache_core::{
     bit_is_set, bitmap_is_complete, num_chunks, parent_of, set_bit, CachedAttr, CHUNK_SIZE,
+    EVICTION_TARGET_PERCENT,
 };
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
